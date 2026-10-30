@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-multica-bridge"
+version = "0.1.0"
+description = "Hermes plugin for secure Standard or Isolated task delivery to Multica with result tracking"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "LicenseRef-Omsk-Open-License-Basic-Attribution"
+license-files = ["LICENSE-RU.md"]
+dependencies = ["websockets>=13,<16"]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["bridge", "bridge.*"]
+
+[tool.setuptools.data-files]
+"share/hermes/plugins/hermes-multica-bridge" = ["plugin.yaml", "__init__.py", "MANIFEST.sha256"]
+"share/hermes/plugins/hermes-multica-bridge/bridge" = ["bridge/*.py"]
+"share/hermes/plugins/hermes-multica-bridge/dashboard" = ["dashboard/manifest.json", "dashboard/plugin_api.py"]
+"share/hermes/plugins/hermes-multica-bridge/dashboard/dist" = ["dashboard/dist/index.js", "dashboard/dist/style.css"]
+"share/hermes/plugins/hermes-multica-bridge/desktop" = ["desktop/*.js", "desktop/*.mjs"]
+"share/hermes/plugins/hermes-multica-bridge/config" = ["config/*.toml", "config/*.json"]
+"share/hermes/plugins/hermes-multica-bridge/deploy" = ["deploy/*.py", "deploy/README.md"]
+"share/hermes/plugins/hermes-multica-bridge/deploy/systemd" = ["deploy/systemd/*.service", "deploy/systemd/*.socket"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["N999"]
+"bridge/__init__.py" = ["N999"]
+"tests/__init__.py" = ["N999"]
+# Standalone/plugin entrypoints bootstrap the installed project root before bridge imports.
+"dashboard/plugin_api.py" = ["E402"]
+"deploy/*.py" = ["E402"]
+
+[tool.ruff]
+exclude = [".agents"]

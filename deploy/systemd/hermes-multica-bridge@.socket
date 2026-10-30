@@ -1,0 +1,14 @@
+[Unit]
+Description=Hermes Multica Bridge Isolated socket (%i)
+
+[Socket]
+ListenStream=/run/hermes-multica-bridge/%i.sock
+DirectoryMode=0755
+SocketMode=0600
+Accept=no
+Backlog=16
+RemoveOnStop=yes
+Service=hermes-multica-bridge@%i.service
+
+[Install]
+WantedBy=sockets.target

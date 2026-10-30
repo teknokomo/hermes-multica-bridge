@@ -1,0 +1,65 @@
+# Redacted watcher example. Replace every placeholder with operator-approved values.
+# Credentials are loaded by systemd and are never stored in this TOML file.
+
+[watcher]
+socket_path = "/run/hermes-multica-watcher/ipc.sock"
+socket_gid = 12345 # Replace with the GID of the restricted Hermes-to-watcher IPC group.
+poll_seconds = 45
+request_timeout_seconds = 15
+max_message_chars = 3500
+
+[profiles.om73]
+state_path = "/var/lib/hermes-multica-watcher/om73.sqlite3"
+multica_pat_credential = "om73-multica-pat"
+max_token_credential = "om73-max-token"
+telegram_token_credential = "om73-telegram-token"
+own_multica_user_id = "REPLACE_WITH_HERMES_MULTICA_USER_ID"
+allowed_peer_uids = [1000] # Replace with the UID of the Hermes process allowed to register mappings.
+
+[[profiles.om73.routes]]
+route_id = "REPLACE_WITH_WORKSPACE_ROUTE_ID_1"
+name = "Пространство 1"
+multica_origin = "https://multica.example.org"
+workspace_id = "REPLACE_WITH_WORKSPACE_ID_1"
+project_id = "REPLACE_WITH_PROJECT_ID_1"
+source_platforms = ["max", "telegram"]
+allowed_user_ids = ["REPLACE_WITH_USER_ID"]
+allowed_chat_ids = ["REPLACE_WITH_CHAT_ID"]
+allow_groups = false
+allowed_statuses = ["todo", "in_progress", "done"]
+
+[[profiles.om73.routes]]
+route_id = "REPLACE_WITH_WORKSPACE_ROUTE_ID_2"
+name = "Пространство 2"
+multica_origin = "https://multica.example.org"
+workspace_id = "REPLACE_WITH_WORKSPACE_ID_2"
+project_id = "REPLACE_WITH_PROJECT_ID_2"
+source_platforms = ["max", "telegram"]
+allowed_user_ids = ["REPLACE_WITH_USER_ID"]
+allowed_chat_ids = ["REPLACE_WITH_CHAT_ID"]
+allow_groups = false
+allowed_statuses = ["todo", "in_progress", "done"]
+
+[[profiles.om73.routes]]
+route_id = "REPLACE_WITH_WORKSPACE_ROUTE_ID_3"
+name = "Пространство 3"
+multica_origin = "https://multica.example.org"
+workspace_id = "REPLACE_WITH_WORKSPACE_ID_3"
+project_id = "REPLACE_WITH_PROJECT_ID_3"
+source_platforms = ["max", "telegram"]
+allowed_user_ids = ["REPLACE_WITH_USER_ID"]
+allowed_chat_ids = ["REPLACE_WITH_CHAT_ID"]
+allow_groups = false
+allowed_statuses = ["todo", "in_progress", "done"]
+
+[[profiles.om73.routes]]
+route_id = "REPLACE_WITH_WORKSPACE_ROUTE_ID_4"
+name = "Пространство 4"
+multica_origin = "https://multica.example.org"
+workspace_id = "REPLACE_WITH_WORKSPACE_ID_4"
+project_id = "REPLACE_WITH_PROJECT_ID_4"
+source_platforms = ["max", "telegram"]
+allowed_user_ids = ["REPLACE_WITH_USER_ID"]
+allowed_chat_ids = ["REPLACE_WITH_CHAT_ID"]
+allow_groups = false
+allowed_statuses = ["todo", "in_progress", "done"]
