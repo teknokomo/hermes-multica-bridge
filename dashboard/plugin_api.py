@@ -376,17 +376,24 @@ def update_registry(payload: Annotated[dict[str, Any], Body(...)]) -> dict[str, 
             for route in new_registry.routes:
                 if not route.enabled or route.tombstoned:
                     continue
-                connection = new_registry.route_config(route)
-                secrets = _route_secret_presence(route) if connection.security_mode == "standard" else {}
-                isolated_status = (
-                    _isolated_sender_status(
-                        connection,
-                        route_policy_fingerprint(new_registry, route),
+                if route.route_type == "workspace":
+                    readiness = tuple(
+                        error
+                        for error in _route_status(new_registry, route)["readiness_errors"]
+                        if error not in {"disabled", "connection_disabled"}
                     )
-                    if connection.security_mode == "isolated"
-                    else None
-                )
-                readiness = _enable_readiness(connection, secrets, isolated_status=isolated_status)
+                else:
+                    connection = new_registry.route_config(route)
+                    secrets = _route_secret_presence(route) if connection.security_mode == "standard" else {}
+                    isolated_status = (
+                        _isolated_sender_status(
+                            connection,
+                            route_policy_fingerprint(new_registry, route),
+                        )
+                        if connection.security_mode == "isolated"
+                        else None
+                    )
+                    readiness = _enable_readiness(connection, secrets, isolated_status=isolated_status)
                 if readiness:
                     raise BridgeError(
                         "configuration_incomplete",

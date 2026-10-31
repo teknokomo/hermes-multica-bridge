@@ -13,6 +13,7 @@
 - Isolated требует Linux 6.5+, `SO_PEERPIDFD` и unified cgroup v2; cgroup v1/hybrid layout отклоняется fail closed.
 - Добавлены Workspace routes для чатов, четыре инструмента работы с issues, комментариями и статусами, проверка source/workspace/project и прикрепление handles текущего сообщения.
 - Добавлен отдельный watcher для событий Multica, polling reconciliation и at-most-once MAX/Telegram уведомлений.
+- Watcher повторяет только подтверждённые HTTP 429, ограничивает Telegram по чату и сохраняет прогресс issue/comment до успешной или терминальной доставки; Workspace повторяет IPC mapping из сохранённого источника.
 - Hermes dispatch API передаёт opted-in tools доверенный per-message context и открывает текущие вложения через ограниченный public broker.
 - Workspace operations используют профильный ledger; подтверждённые операции кэшируются, а неизвестный результат записи не повторяется автоматически.
 - Утверждена clean-start модель конфигурации и state stores: прежние development state/config не читаются и не мигрируются; внутреннее API versioning не вводится.

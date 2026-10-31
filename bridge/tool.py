@@ -235,6 +235,8 @@ class PluginRuntime:
             connection = registry.route_config(route)
             if connection.security_mode != "isolated":
                 continue
+            if not connection.enabled:
+                continue
             response = self._isolated_client(connection).has_delivery(request)
             if response.get("ok") is not True:
                 raise BridgeError(

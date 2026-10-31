@@ -30,6 +30,11 @@ export function connectionForRoute(registry, route) {
   return (registry?.connections || []).find(item => item.connection_id === route?.connection_id) || null
 }
 
+export function connectionLabel(connection) {
+  const mode = connection?.security_mode === 'isolated' ? 'Isolated' : 'Standard'
+  return `${mode} · ${connection?.name || ''}`
+}
+
 export function workspacesForConnection(registry, connectionId) {
   return (registry?.workspaces || []).filter(item => item.connection_id === connectionId)
 }

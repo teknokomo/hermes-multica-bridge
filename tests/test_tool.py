@@ -393,6 +393,67 @@ class ToolTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["route_id"], expected_route)
 
+    def test_delivery_history_skips_inactive_isolated_routes_but_keeps_local_records(self) -> None:
+        raw = registry_payload(route_count=2, security_mode="isolated")
+        for route in raw["routes"]:
+            route["allowed_profiles"] = ["example"]
+            route["allowed_assignees"] = ["example"]
+        inactive_route_id = raw["routes"][0]["route_id"]
+        raw["routes"][0]["enabled"] = False
+        raw["routes"][0]["tombstoned"] = True
+        registry = PluginRuntime(FakeContext({"registry": raw}))._registry()
+        runtime = PluginRuntime(FakeContext({"registry": raw}))
+
+        class ProfileStore:
+            def __init__(self, _path):
+                pass
+
+            def routes_for_task(self, **_kwargs):
+                return (inactive_route_id,)
+
+        with patch("bridge.tool._profile_state_path", return_value=Path("/tmp/unused-state")), \
+                patch("bridge.tool.DeliveryStore", ProfileStore), \
+                patch.object(
+                    runtime, "_isolated_client",
+                    return_value=types.SimpleNamespace(has_delivery=lambda _request: {
+                        "ok": True, "has_delivery": False,
+                    }),
+                ) as client:
+            routes = runtime._delivered_routes(
+                registry, list(registry.routes), sample_request(), self.current().trusted,
+            )
+
+        self.assertEqual([route.route_id for route in routes], [inactive_route_id])
+        client.assert_called_once()
+
+    def test_active_isolated_delivery_probe_preserves_retryable_failure(self) -> None:
+        raw = registry_payload(route_count=1, security_mode="isolated")
+        raw["routes"][0]["allowed_profiles"] = ["example"]
+        raw["routes"][0]["allowed_assignees"] = ["example"]
+        registry = PluginRuntime(FakeContext({"registry": raw}))._registry()
+        runtime = PluginRuntime(FakeContext({"registry": raw}))
+
+        class EmptyStore:
+            def __init__(self, _path):
+                pass
+
+            def routes_for_task(self, **_kwargs):
+                return ()
+
+        failure = BridgeError("sender_unavailable", "sender unavailable", retryable=True)
+        with (
+            patch("bridge.tool._profile_state_path", return_value=Path("/tmp/unused-state")),
+            patch("bridge.tool.DeliveryStore", EmptyStore),
+            patch.object(runtime, "_isolated_client", side_effect=failure),
+            self.assertRaises(BridgeError) as raised,
+        ):
+            runtime._delivered_routes(
+                registry, list(registry.routes), sample_request(), self.current().trusted,
+            )
+
+        self.assertIs(raised.exception, failure)
+        self.assertTrue(raised.exception.retryable)
+
 
 if __name__ == "__main__":
     unittest.main()

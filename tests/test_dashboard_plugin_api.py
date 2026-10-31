@@ -139,6 +139,61 @@ class DashboardPluginApiTests(unittest.TestCase):
         self.assertFalse(row["secrets"]["multica_pat"])
         self.assertIn("multica_pat", row["readiness_errors"])
 
+    def test_registry_update_uses_workspace_readiness_contract(self) -> None:
+        current = workspace_registry_payload()
+        current["routes"][0]["enabled"] = False
+        current["routes"][0]["destination_locked"] = False
+        requested = copy.deepcopy(current)
+        requested["routes"][0]["enabled"] = True
+        fields = [{"key": "registry", "type": "json", "value": current}]
+        settings = Mock()
+        settings.save_plugin_settings.return_value = ["registry"]
+
+        with (
+            patch.object(PLUGIN_API, "_fields", return_value=fields),
+            patch.object(PLUGIN_API, "_settings_module", return_value=settings),
+            patch.object(PLUGIN_API, "_used_route_ids", return_value=frozenset()),
+            patch.object(
+                PLUGIN_API,
+                "_route_secret_presence",
+                return_value={"webhook_url": False, "hmac_signing_secret": False, "multica_pat": True},
+            ),
+            patch("bridge.watcher_ipc.WatcherIpcClient") as watcher_client,
+        ):
+            watcher_client.return_value.readiness.return_value = {"ready": True}
+            result = PLUGIN_API.update_registry({"registry": requested})
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["registry"]["routes"][0]["enabled"])
+        self.assertTrue(result["registry"]["routes"][0]["destination_locked"])
+
+    def test_registry_update_rejects_workspace_route_when_workspace_readiness_fails(self) -> None:
+        current = workspace_registry_payload()
+        current["routes"][0]["enabled"] = False
+        current["routes"][0]["destination_locked"] = False
+        requested = copy.deepcopy(current)
+        requested["routes"][0]["enabled"] = True
+        fields = [{"key": "registry", "type": "json", "value": current}]
+        settings = Mock()
+        with (
+            patch.object(PLUGIN_API, "_fields", return_value=fields),
+            patch.object(PLUGIN_API, "_settings_module", return_value=settings),
+            patch.object(PLUGIN_API, "_used_route_ids", return_value=frozenset()),
+            patch.object(
+                PLUGIN_API,
+                "_route_secret_presence",
+                return_value={"webhook_url": False, "hmac_signing_secret": False, "multica_pat": False},
+            ),
+            patch("bridge.watcher_ipc.WatcherIpcClient") as watcher_client,
+        ):
+            watcher_client.return_value.readiness.return_value = {"ready": True}
+            with self.assertRaises(PLUGIN_API.HTTPException) as raised:
+                PLUGIN_API.update_registry({"registry": requested})
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertIn("multica_pat", raised.exception.detail)
+        settings.save_plugin_settings.assert_not_called()
+
     def test_isolated_sender_status_requires_live_matching_sender_policy(self) -> None:
         registry = registry_from_mapping(registry_payload(route_count=1, security_mode="isolated"))
         route = registry.routes[0]

@@ -172,11 +172,18 @@ class Watcher:
         status = issue.get("status")
         if previous is None:
             if initial and type(revision) is int and revision > 1 and status in route.allowed_statuses:
-                self._notify_issue(profile, route, mapping, issue, "reconciled")
+                snapshot_ready = self._notify_issue(profile, route, mapping, issue, "reconciled")
+            else:
+                snapshot_ready = True
         elif next_fingerprint != previous["content_hash"] and status in route.allowed_statuses:
             revision_tag = str(revision) if type(revision) is int else "revisionless"
-            self._notify_issue(profile, route, mapping, issue, f"{revision_tag}:{next_fingerprint}")
-        state.save_snapshot(issue_id, issue)
+            snapshot_ready = self._notify_issue(
+                profile, route, mapping, issue, f"{revision_tag}:{next_fingerprint}"
+            )
+        else:
+            snapshot_ready = True
+        if snapshot_ready:
+            state.save_snapshot(issue_id, issue)
 
         registered_at_ns = mapping.get("registered_at_ns")
         for comment in comments:
@@ -197,41 +204,53 @@ class Watcher:
                 continue
             author = comment.get("author_type")
             label = "Комментарий Multica" + (f" ({author})" if isinstance(author, str) and author else "")
-            self._deliver(profile, route, mapping, f"comment:{comment_id}", f"{label}: {content.strip()}")
-            state.mark_comment_seen(issue_id, comment_id)
+            delivered = self._deliver(
+                profile, route, mapping, f"comment:{comment_id}", f"{label}: {content.strip()}"
+            )
+            if delivered:
+                state.mark_comment_seen(issue_id, comment_id)
 
     def _notify_issue(
         self, profile: WatcherProfile, route: WatcherRoute, mapping: dict[str, Any], issue: dict[str, Any], suffix: str,
-    ) -> None:
+    ) -> bool:
         title = issue.get("title") if isinstance(issue.get("title"), str) else "Задача Multica"
         status = issue.get("status") if isinstance(issue.get("status"), str) else "неизвестен"
         revision = issue.get("revision")
         detail = f"Multica: {title}\nСтатус: {status}"
         if type(revision) is int:
             detail += f"\nИзменение #{revision}"
-        self._deliver(profile, route, mapping, f"issue:{issue['id']}:{suffix}", detail)
+        return self._deliver(profile, route, mapping, f"issue:{issue['id']}:{suffix}", detail)
 
     def _deliver(
         self, profile: WatcherProfile, route: WatcherRoute, mapping: dict[str, Any], event_key: str, text: str,
-    ) -> None:
+    ) -> bool:
         key = hashlib.sha256(f"{profile.name}\0{route.route_id}\0{event_key}".encode()).hexdigest()
         state = self.states[profile.name]
         claim = state.claim_delivery(key, mapping["issue_id"], mapping["platform"], mapping["chat_id"])
+        if claim == "sending":
+            return False
         if claim != "claimed":
-            return
+            return True
         try:
             if mapping["platform"] == "max":
                 recipient_id = mapping["user_id"] if mapping["chat_type"] == "dm" else mapping["chat_id"]
                 delay = state.reserve_chat_slot(profile.name, "max", recipient_id)
                 wait_for_rate_slot(delay)
+            elif mapping["platform"] == "telegram":
+                delay = state.reserve_chat_slot(
+                    profile.name, "telegram", mapping["chat_id"], interval_ms=1_100
+                )
+                wait_for_rate_slot(delay)
             result = self.senders[profile.name].send(mapping, text[: self.config.max_message_chars])
             state.finish_delivery(key, result.status, result.detail)
+            return not (result.status == "not_sent" and result.detail == "http_429")
         except Exception:  # noqa: BLE001 - an unexpected send failure has an ambiguous delivery outcome
             try:
                 state.finish_delivery(key, "delivery_unknown", "unexpected_delivery_error")
             except BridgeError:
-                pass
+                return False
             logger.error("Watcher delivery outcome is unknown for route %s", route.route_id)
+            return True
 
     async def _serve_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         sock = writer.get_extra_info("socket")

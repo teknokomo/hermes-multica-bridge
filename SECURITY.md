@@ -50,7 +50,7 @@ Bridge соединяет доверенный контекст Hermes Kanban с
 - `hermes-multica-watcher.service` запускается отдельным `om73-watcher`, имеет `ProtectHome=yes`, собственные root-owned config, `LoadCredential`, `StateDirectory` и профильный приватный SQLite state.
 - IPC использует Unix socket с ограниченной группой, ограниченным размером frame и проверкой UID через `SO_PEERCRED`. До сохранения mapping watcher заново читает issue из Multica и сверяет workspace/project. Mapping фиксируется до успешного ответа IPC.
 - WebSocket принимает только известные Multica event names; polling сверяет issue и comments. События без сохранённого mapping игнорируются, собственные комментарии watcher не рассылаются.
-- Доставка имеет at-most-once учёт. После подтверждения сохраняется `delivered`; если отправка точно не принята — `not_sent`; если исход неизвестен — `delivery_unknown`, повтор после рестарта или события запрещён.
+- После подтверждения доставки сохраняется `delivered`; доказанный отказ — `not_sent`; неизвестный исход — `delivery_unknown` без повтора. Только явный HTTP 429 можно повторить при следующей сверке, поскольку платформа подтвердила, что запрос не принят. Telegram отправляется с интервалом по чату, MAX сохраняет свой лимит. Неудачный IPC mapping остаётся в профильном ledger и повторяется при следующих разрешённых Workspace операциях с исходными сохранёнными source fields; `get` не создаёт mapping из текущего контекста.
 - MAX/Telegram отправка отвечает на исходный message ID. Telegram thread использует исходный `message_thread_id`; MAX reply использует исходный message ID. При отсутствии точного reply target сообщение не отправляется в родительский чат.
 
 ## Standard mode

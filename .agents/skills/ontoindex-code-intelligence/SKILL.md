@@ -19,7 +19,7 @@ ontoindex status --repo "$PWD"
 ontoindex analyze --skip-git --skip-agents-md --name hermes-multica-bridge "$PWD"
 ```
 
-This repository has no initial Git commit yet, so analysis must use `--skip-git`; `analyze` accepts a path argument rather than `--repo`. After the first commit, refresh with `ontoindex analyze "$PWD"`. Do not run `ontoindex setup` from this project unless asked to change MCP client configuration.
+Use `ontoindex analyze --skip-git "$PWD"` only while the checkout has no commit history. Once Git history exists, refresh with `ontoindex analyze "$PWD"`; `analyze` accepts a path argument rather than `--repo`. Do not run `ontoindex setup` from this project unless asked to change MCP client configuration.
 
 ## Safe use
 

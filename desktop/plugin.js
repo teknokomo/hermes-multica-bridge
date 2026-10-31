@@ -11,6 +11,7 @@ import {
 } from './profile_guard.mjs'
 import {
   cloneRegistry,
+  connectionLabel,
   connectionForRoute,
   csvToList,
   mergeServerRouteLocks,
@@ -817,7 +818,7 @@ function RegistryEditor({ ctx, profile }) {
               ...registry.connections.map(item => jsx(Button, {
                 onClick: () => setSelectedConnection(item.connection_id),
                 disabled: item.connection_id === selectedConnection,
-                children: `${item.route_type === 'workspace' ? 'Workspace' : 'Autopilot'} · ${item.name}`
+                children: connectionLabel(item)
               }, item.connection_id)),
               jsx(Button, { onClick: () => void addConnection(), children: '+ Connection' })
             ]

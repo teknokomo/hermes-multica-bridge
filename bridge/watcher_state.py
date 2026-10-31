@@ -199,7 +199,9 @@ class WatcherState:
 
     def save_snapshot(self, issue_id: str, issue: dict[str, Any]) -> None:
         revision = issue.get("revision", 0)
-        if type(revision) is not int or revision < 0:
+        if type(revision) is not int:
+            revision = 0
+        if revision < 0:
             raise BridgeError("watcher_api_response_invalid", "Multica returned an invalid issue revision.")
         values = (
             issue_id, revision, str(issue.get("status") or ""), str(issue.get("title") or ""),
@@ -249,8 +251,15 @@ class WatcherState:
         db = self._connect()
         try:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT status FROM deliveries WHERE delivery_key=?", (delivery_key,)).fetchone()
+            row = db.execute("SELECT status,detail FROM deliveries WHERE delivery_key=?", (delivery_key,)).fetchone()
             if row is not None:
+                if row["status"] == "not_sent" and row["detail"] == "http_429":
+                    db.execute(
+                        "UPDATE deliveries SET status='sending',detail='',updated_at=? WHERE delivery_key=?",
+                        (int(time.time()), delivery_key),
+                    )
+                    db.commit()
+                    return "claimed"
                 db.rollback()
                 return str(row["status"])
             db.execute(

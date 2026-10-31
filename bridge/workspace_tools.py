@@ -8,6 +8,7 @@ import os
 import re
 import stat
 import threading
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -193,6 +194,9 @@ def _read_hermes_attachment(path: str, *, max_bytes: int) -> bytes:
 class WorkspaceRuntime:
     def __init__(self, ctx: Any):
         self.ctx = ctx
+        self._watcher_mapping_registered: set[tuple[str, str]] = set()
+        self._watcher_mapping_retry_after: dict[tuple[str, str], float] = {}
+        self._watcher_mapping_lock = threading.Lock()
 
     def _registry(self) -> ConnectionRegistry:
         raw = self.ctx.get_config("registry", None)
@@ -287,6 +291,43 @@ class WorkspaceRuntime:
             raise BridgeError("operation_unknown", "The write result is uncertain; inspect Multica before retrying.") from None
         state.finish(key, status="accepted", result=result)
         return result
+
+    def _retry_watcher_mapping(self, state: WorkspaceState, route: RegistryRoute, issue_id: str) -> bool:
+        if not route.watcher_enabled:
+            return False
+        stored = state.issue_mapping(issue_id)
+        if stored is None or stored["route_id"] != route.route_id:
+            return False
+
+        key = (route.route_id, issue_id)
+        now = time.monotonic()
+        with self._watcher_mapping_lock:
+            if key in self._watcher_mapping_registered:
+                return True
+            if self._watcher_mapping_retry_after.get(key, 0.0) > now:
+                return False
+            self._watcher_mapping_retry_after[key] = now + 30.0
+
+        watcher_mapping = {
+            "profile": self._profile(),
+            "issue_id": issue_id,
+            "route_id": stored["route_id"],
+            **{
+                field: stored[field]
+                for field in ("platform", "user_id", "chat_id", "thread_id", "message_id", "chat_type")
+            },
+        }
+        try:
+            from .watcher_ipc import WatcherIpcClient
+
+            WatcherIpcClient().register_issue(watcher_mapping)
+        except BridgeError:
+            return False
+
+        with self._watcher_mapping_lock:
+            self._watcher_mapping_registered.add(key)
+            self._watcher_mapping_retry_after.pop(key, None)
+        return True
 
     def _attachments(self, context: Any, route: RegistryRoute) -> list[tuple[str, str, str, bytes]]:
         if isinstance(context, _HermesMessageContext):
@@ -401,16 +442,8 @@ class WorkspaceRuntime:
             if not state.register_issue(issue_id, route.route_id, source):
                 raise BridgeError("mapping_conflict", "This Multica issue is already mapped to a different source message.")
             mapping_status = "pending"
-            if route.watcher_enabled:
-                try:
-                    from .watcher_ipc import WatcherIpcClient
-                    WatcherIpcClient().register_issue({
-                        "profile": self._profile(), "issue_id": issue_id,
-                        "route_id": route.route_id, **source,
-                    })
-                    mapping_status = "registered"
-                except BridgeError:
-                    mapping_status = "pending"
+            if route.watcher_enabled and self._retry_watcher_mapping(state, route, issue_id):
+                mapping_status = "registered"
             files = self._upload_attachments(state=state, api=api, route=route, context=tool_context,
                                              issue_id=issue_id, attachments=attachments)
             return _json({"ok": True, "issue": self._safe_issue(issue), "attachments": files,
@@ -429,6 +462,7 @@ class WorkspaceRuntime:
             route = self._route(registry, tool_context, route_id)
             issue = self._api(registry, route).get_issue(args.get("issue_id"))
             self._issue_in_route(issue, registry, route)
+            self._retry_watcher_mapping(self._state(), route, args["issue_id"])
             comments = self._api(registry, route).list_comments(args.get("issue_id"))
             safe_comments = [
                 {key: item[key] for key in ("id", "author_type", "author_id", "content", "type", "created_at")
@@ -453,6 +487,7 @@ class WorkspaceRuntime:
             issue = api.get_issue(issue_id)
             self._issue_in_route(issue, registry, route)
             state = self._state()
+            self._retry_watcher_mapping(state, route, issue_id)
             result = self._operation(state, route, tool_context, "create_comment",
                                      {"issue_id": issue_id, "content": args.get("content")},
                                      lambda: api.create_comment(issue_id, args.get("content")))
@@ -473,6 +508,8 @@ class WorkspaceRuntime:
             api = self._api(registry, route)
             issue = api.get_issue(issue_id)
             self._issue_in_route(issue, registry, route)
+            state = self._state()
+            self._retry_watcher_mapping(state, route, issue_id)
             updates = {key: args[key] for key in ("title", "description", "status", "assignee_id") if key in args}
             if not updates:
                 raise BridgeError("invalid_arguments", "At least one supported issue field must be updated.")
@@ -482,7 +519,6 @@ class WorkspaceRuntime:
                 raise BridgeError("route_denied", "The requested human assignee is not allowed by this route.")
             if "assignee_id" in updates:
                 updates.update(assignee_type="member")
-            state = self._state()
             changed = self._operation(state, route, tool_context, "update_issue",
                                       {"issue_id": issue_id, "updates": updates},
                                       lambda: api.update_issue(issue_id, updates))

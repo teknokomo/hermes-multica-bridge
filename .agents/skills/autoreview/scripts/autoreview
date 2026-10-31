@@ -1008,7 +1008,7 @@ def compact_diff(
             "--",
             pathspec,
         )
-        redacted_complete_patch = redact_sensitive_content(complete_patch)
+        redacted_complete_patch = redact_sensitive_content(complete_patch, source_path=path)
         if redacted_complete_patch != complete_patch:
             patch = redacted_complete_patch
         elif per_file_limit is None:

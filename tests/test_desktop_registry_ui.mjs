@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import {
   cloneRegistry,
+  connectionLabel,
   connectionForRoute,
   csvToList,
   emptyRegistry,
@@ -35,6 +36,11 @@ test('registry helpers keep multi-route entities independent', () => {
   assert.equal(registry.routes.length, 10)
   assert.equal(workspacesForConnection(registry, registry.connections[0].connection_id).length, 2)
   assert.equal(connectionForRoute(registry, registry.routes[7]).connection_id, registry.connections[0].connection_id)
+})
+
+test('connection labels use the configured security mode', () => {
+  assert.equal(connectionLabel({ security_mode: 'isolated', name: 'Primary' }), 'Isolated · Primary')
+  assert.equal(connectionLabel({ security_mode: 'standard', name: 'Workspace link' }), 'Standard · Workspace link')
 })
 
 test('changing an unlocked workspace connection updates all dependent routes', () => {

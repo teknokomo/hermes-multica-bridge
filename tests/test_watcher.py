@@ -199,6 +199,74 @@ class WatcherTests(unittest.TestCase):
         sender.send.assert_called_once()
         self.assertTrue(state.comment_seen("issue-1", "comment-claim-failure"))
 
+    def test_non_integer_revision_does_not_block_comment_reconciliation(self) -> None:
+        state = self.watcher.states["om73"]
+        state.register_mapping(self.mapping)
+        api = self.watcher.apis[("om73", "route-1")]
+        api.issue = {**self.issue, "revision": "not-an-integer"}
+        api.comments = [{
+            "id": "comment-revisionless", "author_id": "user-2", "content": "Still deliver",
+            "created_at": "2099-01-01T00:00:00Z",
+        }]
+        sender = self.watcher.senders["om73"]
+        sender.send.return_value = DeliveryResult("delivered", "accepted")
+
+        self.watcher._reconcile(self.profile, self.route, "issue-1", initial=True)
+
+        self.assertEqual(state.snapshot("issue-1")["revision"], 0)
+        self.assertTrue(state.comment_seen("issue-1", "comment-revisionless"))
+        sender.send.assert_called_once()
+
+    def test_http_429_comment_is_retried_and_only_then_marked_seen(self) -> None:
+        state = self.watcher.states["om73"]
+        state.register_mapping(self.mapping)
+        state.save_snapshot("issue-1", self.issue)
+        api = self.watcher.apis[("om73", "route-1")]
+        api.comments = [{"id": "comment-rate-limited", "author_id": "user-2", "content": "Retry me"}]
+        sender = self.watcher.senders["om73"]
+        sender.send.side_effect = [
+            DeliveryResult("not_sent", "http_429"),
+            DeliveryResult("delivered", "accepted"),
+        ]
+
+        with patch("bridge.watcher.wait_for_rate_slot"):
+            self.watcher._reconcile(self.profile, self.route, "issue-1")
+            self.assertFalse(state.comment_seen("issue-1", "comment-rate-limited"))
+            self.watcher._reconcile(self.profile, self.route, "issue-1")
+
+        self.assertTrue(state.comment_seen("issue-1", "comment-rate-limited"))
+        self.assertEqual(sender.send.call_count, 2)
+
+    def test_http_429_issue_notification_keeps_snapshot_pending_until_retry(self) -> None:
+        state = self.watcher.states["om73"]
+        state.register_mapping(self.mapping)
+        state.save_snapshot("issue-1", self.issue)
+        api = self.watcher.apis[("om73", "route-1")]
+        api.issue = {**self.issue, "status": "done", "revision": 2}
+        sender = self.watcher.senders["om73"]
+        sender.send.side_effect = [
+            DeliveryResult("not_sent", "http_429"),
+            DeliveryResult("delivered", "accepted"),
+        ]
+
+        with patch("bridge.watcher.wait_for_rate_slot"):
+            self.watcher._reconcile(self.profile, self.route, "issue-1")
+            self.assertEqual(state.snapshot("issue-1")["revision"], 1)
+            self.watcher._reconcile(self.profile, self.route, "issue-1")
+            self.assertEqual(state.snapshot("issue-1")["revision"], 2)
+            self.watcher._reconcile(self.profile, self.route, "issue-1")
+
+        self.assertEqual(sender.send.call_count, 2)
+
+    def test_telegram_delivery_uses_per_chat_pacing(self) -> None:
+        state = self.watcher.states["om73"]
+        state.register_mapping(self.mapping)
+        self.watcher.senders["om73"].send.return_value = DeliveryResult("delivered", "accepted")
+        with patch.object(state, "reserve_chat_slot", return_value=0) as reserve, \
+                patch("bridge.watcher.wait_for_rate_slot"):
+            self.watcher._deliver(self.profile, self.route, self.mapping, "telegram-rate", "status")
+        reserve.assert_called_once_with("om73", "telegram", "chat-1", interval_ms=1_100)
+
     def test_description_change_is_detected_without_persisting_description(self) -> None:
         state = self.watcher.states["om73"]
         state.register_mapping(self.mapping)

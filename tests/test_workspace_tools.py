@@ -6,8 +6,9 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+from bridge.errors import BridgeError
 from bridge.workspace_state import WorkspaceState
 from bridge.workspace_tools import WorkspaceRuntime
 from tests.test_registry import workspace_registry_payload
@@ -117,6 +118,38 @@ class WorkspaceToolsTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(len(self.api.create_calls), 1)
         self.assertEqual(self.state.issue_mapping("issue-1")["message_id"], "message-1")
+
+    def test_failed_watcher_registration_retries_from_persisted_source_on_get(self) -> None:
+        ipc = SimpleNamespace(register_issue=Mock(side_effect=[
+            BridgeError("watcher_ipc_unavailable", "unavailable"), {"ok": True},
+        ]))
+        other_source = SimpleNamespace(**{**vars(self.source), "message_id": "message-2"})
+        with patch("bridge.watcher_ipc.WatcherIpcClient", return_value=ipc), \
+                patch("bridge.workspace_tools.time.monotonic", return_value=100):
+            created = json.loads(self.runtime.send(
+                {"route_id": self.route_id, "title": "Task"}, tool_context=self.source,
+            ))
+        with patch("bridge.watcher_ipc.WatcherIpcClient", return_value=ipc), \
+                patch("bridge.workspace_tools.time.monotonic", return_value=131):
+            fetched = json.loads(self.runtime.get(
+                {"route_id": self.route_id, "issue_id": "issue-1"}, tool_context=other_source,
+            ))
+
+        self.assertEqual(created["watcher_mapping"], "pending")
+        self.assertTrue(fetched["ok"])
+        self.assertEqual(ipc.register_issue.call_count, 2)
+        self.assertEqual(ipc.register_issue.call_args.args[0]["message_id"], "message-1")
+        self.assertEqual(ipc.register_issue.call_args.args[0]["chat_id"], "chat-1")
+
+    def test_get_does_not_create_watcher_mapping_from_current_message(self) -> None:
+        self.api.issue = {**self.api.issue, "id": "unmapped-issue"}
+        ipc = SimpleNamespace(register_issue=Mock(return_value={"ok": True}))
+        with patch("bridge.watcher_ipc.WatcherIpcClient", return_value=ipc):
+            result = json.loads(self.runtime.get(
+                {"route_id": self.route_id, "issue_id": "unmapped-issue"}, tool_context=self.source,
+            ))
+        self.assertTrue(result["ok"])
+        ipc.register_issue.assert_not_called()
 
     def test_session_context_fails_closed_when_no_bound_source_or_env_exists(self) -> None:
         empty = {name: "" for name in (

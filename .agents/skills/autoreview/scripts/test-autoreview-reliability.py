@@ -258,6 +258,22 @@ class AutoreviewReliabilityTests(unittest.TestCase):
         self.assertIn(marker, bundle)
         self.assertNotIn("[truncated at 24000 characters]", bundle)
 
+    def test_local_bundle_preserves_python_credential_references_in_tracked_diff(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = Path(repo_dir)
+            subprocess.run(["git", "init", "--quiet"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Fixture"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "fixture@example.com"], cwd=repo, check=True)
+            path = repo / "service.py"
+            path.write_text("def send():\n    return None\n")
+            subprocess.run(["git", "add", "service.py"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "--quiet", "-m", "initial"], cwd=repo, check=True)
+            path.write_text("def send():\n    deliver(webhook_url=secrets.webhook_url)\n")
+
+            bundle = AUTOREVIEW.local_bundle(repo)
+
+        self.assertIn("webhook_url=secrets.webhook_url", bundle)
+
     def test_generated_and_binary_paths_are_summarized(self) -> None:
         self.assertTrue(AUTOREVIEW.should_summarize_patch("pnpm-lock.yaml"))
         self.assertTrue(AUTOREVIEW.should_summarize_patch("docs/screenshot.png"))

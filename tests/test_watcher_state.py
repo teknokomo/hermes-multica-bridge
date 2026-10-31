@@ -44,6 +44,27 @@ class WatcherStateTests(unittest.TestCase):
         self.state.finish_delivery("event-1", "delivery_unknown", "transport_uncertain")
         self.assertEqual(self.state.claim_delivery("event-1", "issue-1", "telegram", "chat-1"), "delivery_unknown")
 
+    def test_only_explicit_http_429_can_be_reclaimed(self) -> None:
+        self.state.claim_delivery("retryable", "issue-1", "telegram", "chat-1")
+        self.state.finish_delivery("retryable", "not_sent", "http_429")
+        self.assertEqual(self.state.claim_delivery("retryable", "issue-1", "telegram", "chat-1"), "claimed")
+        self.state.finish_delivery("retryable", "delivered", "accepted")
+        self.assertEqual(self.state.claim_delivery("retryable", "issue-1", "telegram", "chat-1"), "delivered")
+
+        self.state.claim_delivery("permanent", "issue-1", "telegram", "chat-1")
+        self.state.finish_delivery("permanent", "not_sent", "http_400")
+        self.assertEqual(self.state.claim_delivery("permanent", "issue-1", "telegram", "chat-1"), "not_sent")
+        self.state.claim_delivery("unknown", "issue-1", "telegram", "chat-1")
+        self.state.finish_delivery("unknown", "delivery_unknown", "transport_uncertain")
+        self.assertEqual(self.state.claim_delivery("unknown", "issue-1", "telegram", "chat-1"), "delivery_unknown")
+
+    def test_non_integer_revision_is_normalized_but_negative_integer_is_rejected(self) -> None:
+        self.state.save_snapshot("issue-1", {"revision": "not-an-integer", "status": "todo"})
+        self.assertEqual(self.state.snapshot("issue-1")["revision"], 0)
+        with self.assertRaises(BridgeError) as raised:
+            self.state.save_snapshot("issue-1", {"revision": -1, "status": "todo"})
+        self.assertEqual(raised.exception.code, "watcher_api_response_invalid")
+
     def test_concurrent_delivery_claim_has_one_winner(self) -> None:
         barrier = threading.Barrier(2)
 

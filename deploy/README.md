@@ -93,8 +93,8 @@ Workspace tools не требуют изменений `PluginContext.register_t
 Соберите wheel, установите его в watcher venv, затем скопируйте unit:
 
 ```bash
-python3 -m venv /opt/hermes-multica-bridge/watcher-venv
-/opt/hermes-multica-bridge/watcher-venv/bin/pip install /path/to/hermes_multica_bridge-0.1.0-py3-none-any.whl
+sudo python3 -m venv /opt/hermes-multica-bridge/watcher-venv
+sudo /opt/hermes-multica-bridge/watcher-venv/bin/pip install /path/to/hermes_multica_bridge-0.1.0-py3-none-any.whl
 sudo install -m 0644 deploy/systemd/hermes-multica-watcher.service \
   /etc/systemd/system/hermes-multica-watcher.service
 ```
@@ -109,7 +109,7 @@ systemd-analyze verify deploy/systemd/hermes-multica-watcher.service
 
 `systemctl enable --now hermes-multica-watcher.service` относится к отдельному live deployment этапу. Этот план реализации не устанавливает unit и не меняет текущий server runtime.
 
-На сервере прежние `/etc/hermes-multica-bridge` и `/var/lib/private/hermes-multica-bridge` остаются read-only архивом до отдельного принятия новой установки. Новый watcher использует только собственные `/etc/hermes-multica-watcher` и `/var/lib/hermes-multica-watcher`; старые конфиги и ledger не импортируются.
+Предыдущие `/etc/hermes-multica-bridge` и `/var/lib/private/hermes-multica-bridge` не импортируются и не мигрируются. Если их нужно сохранить, заранее сделайте отдельную резервную копию вне путей новой установки: `/etc/hermes-multica-bridge` используется для новой Isolated-конфигурации, а watcher работает только со своими `/etc/hermes-multica-watcher` и `/var/lib/hermes-multica-watcher`.
 
 ## 2. Подготовить Isolated instance
 
