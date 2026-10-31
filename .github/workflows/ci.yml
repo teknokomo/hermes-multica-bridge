@@ -1,0 +1,149 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ruff
+        run: python -m pip install --disable-pip-version-check "ruff==0.17.3"
+      - name: Ruff check
+        run: ruff check .
+
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install project and test runner
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . pytest
+      - name: Run Python tests
+        run: python -m pytest -q
+
+  desktop:
+    name: Desktop tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Run Node tests
+        run: node --test tests/*.mjs
+
+  package:
+    name: Package and manifest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build tools
+        run: python -m pip install --upgrade pip build twine
+      - name: Verify MANIFEST.sha256
+        run: sha256sum -c MANIFEST.sha256
+      - name: Build wheel and sdist
+        run: python -m build
+      - name: Twine check
+        run: python -m twine check dist/*
+      - name: Inspect distributions
+        run: |
+          python - <<'PY'
+          import glob, sys, tarfile, zipfile
+
+          wheel = glob.glob("dist/*.whl")
+          sdist = glob.glob("dist/*.tar.gz")
+          if len(wheel) != 1 or len(sdist) != 1:
+              sys.exit(f"unexpected dist contents: {wheel + sdist}")
+
+          forbidden = (".agents/", ".claude/", "CLAUDE.md")
+          with zipfile.ZipFile(wheel[0]) as zf:
+              names = zf.namelist()
+              blob = b"".join(zf.read(n) for n in names if n.endswith((".py", ".yaml", ".js", ".mjs")))
+          bad = [n for n in names if any(f in n for f in forbidden)]
+          problems = []
+          if bad:
+              problems.append(f"wheel contains dev tooling: {bad}")
+          if b"platform-api2" in blob:
+              problems.append("wheel still references platform-api2.max.ru")
+          if b"botapi.max.ru" not in blob:
+              problems.append("wheel does not reference botapi.max.ru")
+
+          with tarfile.open(sdist[0]) as tf:
+              sd_names = tf.getnames()
+          bad_sd = [n for n in sd_names if any(f in n for f in forbidden)]
+          if bad_sd:
+              problems.append(f"sdist contains dev tooling: {bad_sd}")
+
+          if problems:
+              sys.exit("\n".join(problems))
+          print(f"wheel entries: {len(names)}, sdist entries: {len(sd_names)} — OK")
+          PY
+
+  secret-scan:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Scan tracked files for credentials
+        run: |
+          python - <<'PY'
+          import re, subprocess, sys
+
+          patterns = {
+              "github token": re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,}"),
+              "gitlab token": re.compile(r"\bglpat-[A-Za-z0-9_-]{16,}"),
+              "multica pat": re.compile(r"\bmul_[A-Za-z0-9]{16,}"),
+              "openai key": re.compile(r"\bsk-[A-Za-z0-9]{32,}"),
+              "aws key": re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+              "jwt": re.compile(r"\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}"),
+              "private key": re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----\s*[A-Za-z0-9+/=\s]{32,}"),
+          }
+
+          files = subprocess.run(["git", "ls-files", "-z"], capture_output=True, check=True).stdout
+          findings = []
+          for raw in files.split(b"\0"):
+              if not raw:
+                  continue
+              path = raw.decode()
+              try:
+                  text = open(path, encoding="utf-8", errors="ignore").read()
+              except OSError:
+                  continue
+              for label, rx in patterns.items():
+                  if rx.search(text):
+                      findings.append(f"{label}: {path}")
+
+          if findings:
+              sys.exit("potential credentials found:\n" + "\n".join(findings))
+          print("no credential patterns found")
+          PY
