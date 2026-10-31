@@ -1,0 +1,18 @@
+include plugin.yaml
+include __init__.py
+include pyproject.toml
+include uv.lock
+include MANIFEST.sha256
+recursive-include bridge *.py
+recursive-include config *.toml *.json
+recursive-include deploy *.py *.md *.service *.socket
+include dashboard/manifest.json dashboard/plugin_api.py
+include dashboard/dist/index.js dashboard/dist/style.css
+recursive-include desktop *.js *.mjs
+include README.md README-RU.md SECURITY.md CHANGELOG.md LICENSE.md LICENSE-RU.md
+prune tests
+prune memory-bank
+prune .agents
+prune .backup
+prune .claude
+global-exclude __pycache__ *.py[cod] *.sqlite3 *.sqlite3-* .env .env.* *.log

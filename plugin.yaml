@@ -1,0 +1,33 @@
+name: hermes-multica-bridge
+version: "0.1.0"
+manifest_version: 2
+api_version: 1
+requires_hermes: ">=0.22.4"
+description: "Мост Hermes ↔ Multica: Autopilot-маршруты Kanban и Workspace-маршруты MAX/Telegram с отдельным watcher."
+author: Universo
+license: "LicenseRef-Omsk-Open-License-Basic-Attribution"
+kind: standalone
+platforms:
+  - linux
+provides_tools:
+  - multica_list_routes
+  - multica_send_task
+  - multica_check_task_result
+  - multica_workspace_send
+  - multica_workspace_get
+  - multica_workspace_comment
+  - multica_workspace_update
+tags:
+  - multica
+  - kanban
+  - integration
+config_schema:
+  registry:
+    type: dict
+    label: "ConnectionRegistry"
+    description: "Структурированный реестр подключений, рабочих пространств, маршрутов и точечных операторских разрешений. Секреты в реестре не хранятся."
+    default:
+      connections: []
+      workspaces: []
+      routes: []
+      operator_grants: []

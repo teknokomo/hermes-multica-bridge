@@ -1,0 +1,38 @@
+default_deny = true
+
+[ipc]
+# Replace with the UID of the Hermes OS account that owns the selected profile.
+allowed_peer_uids = [12345]
+# Replace with the root-owned Hermes Gateway service unit for this profile.
+trusted_gateway_unit = "hermes-gateway.service"
+
+[route]
+route_id = "018f0000-0000-7000-8000-000000000001"
+connection_id = "018f0000-0000-7000-8000-000000000002"
+workspace_key = "018f0000-0000-7000-8000-000000000003"
+route_policy_fingerprint = "route-policy-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+[connection]
+security_mode = "isolated"
+enabled = false
+multica_origin = "https://multica.example.org"
+workspace_id = "workspace-example"
+autopilot_id = "autopilot-example"
+trigger_id = "trigger-example"
+event = "hermes.task.dispatched"
+source_boards = ["example-board"]
+request_timeout_seconds = 10
+max_response_bytes = 16384
+max_payload_bytes = 65536
+max_requests_per_window = 5
+window_seconds = 600
+max_attempts_per_request = 2
+result_tracking_enabled = false
+hmac_enabled = true
+isolated_instance_id = "r-018f0000000070008000000000000001"
+
+[credentials]
+webhook_url_ref = "HMB_WEBHOOK_URL"
+webhook_sha256 = ""
+hmac_signing_secret_ref = "HMB_HMAC_SIGNING_SECRET"
+multica_pat_ref = ""

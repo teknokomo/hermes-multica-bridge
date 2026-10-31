@@ -1,0 +1,23 @@
+.hmb-dashboard {
+  display: grid;
+  gap: 1rem;
+  max-width: 56rem;
+  padding: 1rem;
+}
+
+.hmb-dashboard-grid {
+  display: grid;
+  grid-template-columns: minmax(10rem, 1fr) 2fr;
+  gap: 0.5rem 1rem;
+  margin: 0;
+}
+
+.hmb-dashboard-grid dt,
+.hmb-dashboard-note {
+  color: var(--text-secondary);
+}
+
+.hmb-dashboard-grid dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}

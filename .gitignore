@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+build/
+.backup/
+/dist/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.ontoindex/
+*.sqlite3
+*.sqlite3-*
+.env
+.env.*
+memory-bank/

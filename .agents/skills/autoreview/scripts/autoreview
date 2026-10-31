@@ -1,0 +1,2472 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Vendored from openclaw/agent-skills skills/autoreview at
+# 7b6ca5b2078af2746d1c4424fe90211901b997ae and adapted for the
+# Universo Platformo project-local skill registry.
+# Copyright (c) 2026 openclaw.
+
+from __future__ import annotations
+
+import argparse
+import ast
+import concurrent.futures
+import copy
+import hashlib
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import textwrap
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+sys.dont_write_bytecode = True
+
+from autoreview_runtime import (
+    DEFAULT_REVIEW_TIMEOUT_SECONDS,
+    TRANSPORT_ATTEMPTS,
+    ReviewError,
+    ReviewErrorCode,
+    ReviewRunState,
+    classify_engine_failure,
+    executable_for_engine,
+    preflight_review,
+    resolve_state_dir,
+    run_with_heartbeat,
+    show_run_status,
+    utc_now,
+    validate_extra_prompt,  # Re-exported for helper consumers and reliability tests.  # noqa: F401
+)
+
+ENGINES = ("codex", "claude", "droid", "copilot")
+DEFAULT_BUNDLE_PART_CHARS = 100_000
+# Keep the primary marker split in this source so a self-review bundle does not
+# rewrite its own constant definition while escaping marker text from file bodies.
+BUNDLE_FILE_BOUNDARY = "<!-- AUTOREVIEW_INTERNAL_" "FILE_BOUNDARY_V1 -->"
+BUNDLE_FILE_BOUNDARY_ESCAPED = "<!-- AUTOREVIEW_INTERNAL_FILE_BOUNDARY_ESCAPED_V1 -->"
+TERMINAL_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+MULTICA_WEBHOOK_RE = re.compile(
+    r"https://[^\s\"'<>]+/api/webhooks/autopilots/awt_[A-Za-z0-9_-]{20,}",
+    re.IGNORECASE,
+)
+BEARER_VALUE_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]{8,}")
+SENSITIVE_QUERY_VALUE_RE = re.compile(
+    r"(?i)(?P<prefix>[?&](?:access_token|api_key|bearer_token|token|secret|signature|sig|authorization)=)"
+    r"(?P<value>[^&#\s\"'<>]+)"
+)
+SENSITIVE_ASSIGNMENT_NAME = (
+    r"(?:[A-Za-z0-9]+_)*"
+    r"(?:webhook_url|hmac_signing_secret|multica_pat|private_key|token|api_key|password|passwd|secret|authorization|bearer_token)"
+    r"(?:_[A-Za-z0-9]+)*"
+)
+PRIVATE_KEY_BLOCK_RE = re.compile(
+    r"(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----"
+)
+SENSITIVE_ASSIGNMENT_RE = re.compile(
+    r"(?im)^(?P<prefix>[+\- ]?\s*(?:export\s+)?[\"']?)"
+    r"(?P<name>"
+    + SENSITIVE_ASSIGNMENT_NAME
+    + r")"
+    + r"(?P<key_suffix>[\"']?\s*(?P<separator>=|:)\s*)"
+    + r"(?P<value>.*?)(?P<suffix>,?\s*)$"
+)
+SENSITIVE_MAPPING_FIELD_RE = re.compile(
+    r"(?i)(?P<prefix>(?P<key_quote>['\"])(?:"
+    + SENSITIVE_ASSIGNMENT_NAME
+    + r")(?P=key_quote)\s*:\s*)"
+    r"(?P<string_prefix>[rubf]{0,2})"
+    r"(?P<value_quote>\"\"\"|'''|['\"])(?P<value>(?:\\.|(?!(?P=value_quote))[^\\])*)(?P=value_quote)"
+)
+MULTILINE_ASSIGNMENT_LITERAL_RE = re.compile(
+    r"(?P<quote>['\"])(?P<value>(?:\\.|(?!(?P=quote))[^\\])*)(?P=quote)"
+)
+SENSITIVE_TRIPLE_QUOTED_ASSIGNMENT_RE = re.compile(
+    r"(?i)^(?P<prefix>\s*(?:export\s+)?)"
+    r"(?P<key_quote>[\"']?)"
+    r"(?P<name>"
+    + SENSITIVE_ASSIGNMENT_NAME
+    + r")"
+    + r"(?P=key_quote)(?P<key_suffix>\s*(?:=|:)\s*)"
+    + r"(?P<string_prefix>[rubf]{0,2})(?P<quote>\"\"\"|''')"
+)
+SENSITIVE_YAML_BLOCK_SCALAR_RE = re.compile(
+    r"(?i)^(?P<indent>[ \t]*)(?:-\s+)?(?P<key_quote>[\"']?)"
+    r"(?P<name>"
+    + SENSITIVE_ASSIGNMENT_NAME
+    + r")"
+    + r"(?P=key_quote)\s*:\s*(?P<indicator>[|>](?:[1-9]?[+-]?|[+-]?[1-9]?))"
+    + r"\s*(?:#.*)?$"
+)
+YAML_BLOCK_SCALAR_VALUE_RE = re.compile(
+    r"^\s*[|>](?:[1-9]?[+-]?|[+-]?[1-9]?)\s*(?:#.*)?$"
+)
+FALLBACK_ERROR_CODES = frozenset(
+    {
+        ReviewErrorCode.ENGINE_TRANSPORT_ERROR,
+        ReviewErrorCode.ENGINE_TIMEOUT,
+    }
+)
+CLAUDE_REMOTE_REVIEW_TOOLS = frozenset({"WebSearch", "WebFetch"})
+GENERATED_OR_BULKY_NAMES = {
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+}
+GENERATED_OR_BINARY_SUFFIXES = {
+    ".gif",
+    ".jpeg",
+    ".jpg",
+    ".lock",
+    ".pdf",
+    ".png",
+    ".svg",
+    ".webp",
+}
+SENSITIVE_UNTRACKED_BASENAMES = {
+    ".env",
+    ".envrc",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    "credentials",
+    "credentials.json",
+    "id_ed25519",
+    "id_rsa",
+    "secrets.json",
+    "secrets.toml",
+    "token",
+    "tokens.json",
+}
+SENSITIVE_UNTRACKED_DIRECTORY_NAMES = {
+    ".aws",
+    ".azure",
+    ".backup",
+    ".gnupg",
+    ".ssh",
+    "credentials",
+    "secrets",
+}
+SENSITIVE_UNTRACKED_SUFFIXES = {
+    ".har",
+    ".log",
+    ".trace",
+    ".jks",
+    ".key",
+    ".keystore",
+    ".p12",
+    ".pem",
+    ".pfx",
+}
+THINKING_LEVELS_BY_ENGINE = {
+    "codex": {"low", "medium", "high", "xhigh"},
+    "claude": {"low", "medium", "high", "xhigh", "max"},
+    "droid": set(),
+    "copilot": set(),
+}
+
+
+SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "findings",
+        "overall_correctness",
+        "overall_explanation",
+        "overall_confidence",
+    ],
+    "properties": {
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "title",
+                    "body",
+                    "priority",
+                    "confidence",
+                    "category",
+                    "code_location",
+                ],
+                "properties": {
+                    "title": {"type": "string", "minLength": 1, "maxLength": 140},
+                    "body": {"type": "string", "minLength": 1, "maxLength": 2000},
+                    "priority": {"type": "string", "enum": ["P0", "P1", "P2", "P3"]},
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "category": {
+                        "type": "string",
+                        "enum": ["bug", "security", "regression", "test_gap", "maintainability"],
+                    },
+                    "code_location": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["file_path", "line"],
+                        "properties": {
+                            "file_path": {"type": "string", "minLength": 1},
+                            "line": {"type": "integer", "minimum": 1},
+                        },
+                    },
+                },
+            },
+        },
+        "overall_correctness": {
+            "type": "string",
+            "enum": ["patch is correct", "patch is incorrect"],
+        },
+        "overall_explanation": {"type": "string", "minLength": 1, "maxLength": 3000},
+        "overall_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    },
+}
+
+
+def run(args: list[str], cwd: Path, *, input_text: str | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        args,
+        cwd=cwd,
+        check=False,
+        input=input_text,
+        text=True,
+        capture_output=True,
+    )
+    if check and result.returncode != 0:
+        cmd = " ".join(args)
+        raise SystemExit(f"command failed ({result.returncode}): {cmd}\n{result.stderr or result.stdout}")
+    return result
+
+
+def git(repo: Path, *args: str, check: bool = True) -> str:
+    return run(["git", *args], repo, check=check).stdout
+
+
+def git_bounded(repo: Path, *args: str, limit: int, check: bool = True) -> str:
+    """Capture a bounded Git prefix and stop the producer once the limit is exceeded."""
+    process = subprocess.Popen(
+        ["git", *args],
+        cwd=repo,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stdout is not None
+    assert process.stderr is not None
+    stderr_prefix = bytearray()
+
+    def drain_stderr() -> None:
+        while chunk := process.stderr.read(4096):
+            remaining = 4000 - len(stderr_prefix)
+            if remaining > 0:
+                stderr_prefix.extend(chunk[:remaining])
+
+    stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+    stderr_thread.start()
+    data = process.stdout.read(limit + 1)
+    truncated = len(data) > limit
+    process.stdout.close()
+    if truncated and process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+    else:
+        process.wait()
+    stderr_thread.join(timeout=2)
+    process.stderr.close()
+    if check and process.returncode != 0 and not truncated:
+        command = " ".join(args)
+        detail = os.fsdecode(bytes(stderr_prefix))
+        raise SystemExit(
+            f"command failed ({process.returncode}): {command}\n{bounded_field(detail, 4000)}"
+        )
+    text = data.decode("utf-8", errors="replace")
+    return bounded(text, limit)
+
+
+def git_paths(repo: Path, *args: str) -> list[str]:
+    """Return exact Git path records using NUL framing and filesystem decoding."""
+    result = subprocess.run(
+        ["git", *args, "-z"],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        command = " ".join(["git", *args, "-z"])
+        detail = os.fsdecode(result.stderr or result.stdout)
+        raise SystemExit(f"command failed ({result.returncode}): {command}\n{detail}")
+    return [os.fsdecode(item) for item in result.stdout.split(b"\0") if item]
+
+
+def repo_root() -> Path:
+    result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise SystemExit("autoreview must run inside a git repository")
+    return Path(result.stdout.strip()).resolve()
+
+
+def current_branch(repo: Path) -> str:
+    return git(repo, "branch", "--show-current", check=False).strip() or "detached"
+
+
+def is_dirty(repo: Path) -> bool:
+    return bool(git(repo, "status", "--porcelain").strip())
+
+
+def choose_target(repo: Path, mode: str, base_ref: str | None) -> tuple[str, str | None]:
+    branch = current_branch(repo)
+    if mode == "local" or (mode == "auto" and is_dirty(repo)):
+        return "local", None
+    if mode == "commit":
+        return "commit", None
+    if mode == "branch" or (mode == "auto" and branch != "main"):
+        return "branch", base_ref or detect_pr_base(repo) or "origin/main"
+    raise SystemExit("no review target: clean main checkout and no forced mode")
+
+
+def detect_pr_base(repo: Path) -> str | None:
+    if not shutil.which("gh"):
+        return None
+    result = run(["gh", "pr", "view", "--json", "baseRefName", "--jq", ".baseRefName"], repo, check=False)
+    base = result.stdout.strip()
+    return f"origin/{base}" if result.returncode == 0 and base else None
+
+
+def bounded(text: str, limit: int = 180_000) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n\n[truncated at {limit} characters]\n"
+
+
+def bounded_field(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    suffix = "\n\n[truncated]"
+    return text[: max(0, limit - len(suffix))] + suffix
+
+
+def read_text(path: Path, limit: int | None = 40_000) -> str:
+    descriptor: int | None = None
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        descriptor = os.open(path, flags)
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return "[non-regular file omitted]"
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = None
+            data = stream.read() if limit is None else stream.read(limit + 1)
+    except OSError as exc:
+        return f"[unreadable: {exc}]"
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if b"\0" in data:
+        return "[binary file omitted]"
+    truncated = limit is not None and len(data) > limit
+    payload = data if limit is None else data[:limit]
+    text = payload.decode("utf-8", errors="replace")
+    if truncated:
+        assert limit is not None
+        return text + f"\n\n[truncated at {limit} bytes]\n"
+    return text
+
+
+def should_summarize_patch(path: str) -> bool:
+    candidate = Path(path)
+    return candidate.name in GENERATED_OR_BULKY_NAMES or candidate.suffix.lower() in GENERATED_OR_BINARY_SUFFIXES
+
+
+def should_omit_sensitive_path(path: str) -> bool:
+    """Keep credential and private operational files out of review prompts."""
+    candidate = Path(path)
+    name = candidate.name.lower()
+    parents = {part.lower() for part in candidate.parts[:-1]}
+    return (
+        name in SENSITIVE_UNTRACKED_BASENAMES
+        or name.startswith(".env.")
+        or name.endswith(".env")
+        or candidate.suffix.lower() in SENSITIVE_UNTRACKED_SUFFIXES
+        or bool(parents & SENSITIVE_UNTRACKED_DIRECTORY_NAMES)
+    )
+
+
+def _ends_with_unescaped_quote(value: str, quote: str) -> bool:
+    if not value.endswith(quote):
+        return False
+    backslashes = 0
+    index = len(value) - 2
+    while index >= 0 and value[index] == "\\":
+        backslashes += 1
+        index -= 1
+    return backslashes % 2 == 0
+
+
+def _redact_assignment_value(value: str, *, inside_string: bool = False) -> str:
+    if (
+        len(value) >= 4
+        and value[0] == "\\"
+        and value[1] in "\"'"
+        and value[-2:] == "\\" + value[1]
+    ):
+        quote = value[1]
+        return f"\\{quote}[REDACTED]\\{quote}"
+    if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0]:
+        return f"{value[0]}[REDACTED]{value[0]}"
+    if inside_string:
+        return "[REDACTED]"
+    return '"[REDACTED]"'
+
+
+def _sensitive_assignment_name_is_exempt(name: str) -> bool:
+    normalized = name.casefold()
+    return normalized.startswith("non_secret_") or normalized.endswith(
+        ("_re", "_regex", "_pattern", "_patterns")
+    )
+
+
+def _find_unescaped_token(value: str, token: str, start: int = 0) -> int:
+    """Return the next token not escaped by an odd number of backslashes."""
+    offset = start
+    while True:
+        index = value.find(token, offset)
+        if index < 0:
+            return -1
+        backslashes = 0
+        cursor = index - 1
+        while cursor >= 0 and value[cursor] == "\\":
+            backslashes += 1
+            cursor -= 1
+        if backslashes % 2 == 0:
+            return index
+        offset = index + 1
+
+
+def _opens_unclosed_triple_quoted_value(value: str) -> bool:
+    candidate = value.strip()
+    match = re.match(r"(?i)^[rubf]{0,2}(?P<quote>\"\"\"|''')", candidate)
+    if match is None:
+        return False
+    quote = match.group("quote")
+    return _find_unescaped_token(candidate, quote, match.end()) < 0
+
+
+def _multiline_container_opener(value: str) -> str | None:
+    """Return an opening container delimiter, including a sole opener before a comment."""
+    stripped = value.rstrip()
+    if stripped.endswith(("(", "[", "{")):
+        return stripped[-1]
+    match = re.fullmatch(r"\s*([([{])\s*#.*", value)
+    return match.group(1) if match is not None else None
+
+
+def _python_annotation_replacement(match: re.Match[str]) -> str | None:
+    """Keep Python type annotations readable while redacting literal defaults."""
+    if match.group("separator") != ":":
+        return None
+    declaration = (
+        f"def _autoreview_annotation({match.group('name')}"
+        f"{match.group('key_suffix')}{match.group('value')}):\n    pass\n"
+    )
+    try:
+        function = ast.parse(declaration).body[0]
+    except (SyntaxError, IndexError):
+        return None
+    if not isinstance(function, ast.FunctionDef) or not function.args.args:
+        return None
+    argument = function.args.args[0]
+    if argument.annotation is None:
+        return None
+    default_node = function.args.defaults[0] if function.args.defaults else None
+    if default_node is None:
+        return match.group(0)
+    if isinstance(default_node, ast.Name) or (
+        isinstance(default_node, ast.Constant)
+        and default_node.value in (None, True, False)
+    ):
+        return match.group(0)
+    annotation = ast.get_source_segment(declaration, argument.annotation)
+    default = ast.get_source_segment(declaration, default_node)
+    if not annotation or not default:
+        return None
+    prefix = match.group("prefix")
+    key = match.group("name") + match.group("key_suffix")
+    return prefix + key + annotation + " = " + _redact_assignment_value(default) + match.group("suffix")
+
+
+def _is_python_boolean_expression(value: str) -> bool:
+    candidate = value.strip()
+    if candidate.endswith(","):
+        candidate = candidate[:-1].rstrip()
+    try:
+        expression = ast.parse(candidate, mode="eval").body
+    except (SyntaxError, ValueError):
+        return False
+    if (
+        not isinstance(expression, ast.Call)
+        or not isinstance(expression.func, ast.Name)
+        or expression.func.id != "bool"
+        or len(expression.args) != 1
+        or expression.keywords
+    ):
+        return False
+    return not any(
+        isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes))
+        for node in ast.walk(expression)
+    )
+
+
+def _is_python_reference_expression(value: str) -> bool:
+    """Keep code references intact while rejecting embedded credential literals."""
+    try:
+        expression = ast.parse(value.strip(), mode="eval").body
+    except (SyntaxError, ValueError):
+        return False
+
+    def is_reference_label(node: ast.expr) -> bool:
+        if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+            return False
+        label = node.value.rsplit(".", maxsplit=1)[-1]
+        return label.endswith("_ref") and re.fullmatch(
+            SENSITIVE_ASSIGNMENT_NAME, label, re.IGNORECASE
+        ) is not None
+
+    def is_name_or_attribute(node: ast.expr) -> bool:
+        return isinstance(node, ast.Name) or (
+            isinstance(node, ast.Attribute) and is_name_or_attribute(node.value)
+        )
+
+    def is_lookup(node: ast.expr) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and is_name_or_attribute(node.func.value)
+            and len(node.args) == 1
+            and not node.keywords
+            and is_reference_label(node.args[0])
+        )
+
+    def is_reference(node: ast.expr) -> bool:
+        if is_name_or_attribute(node):
+            return True
+        if isinstance(node, ast.Subscript):
+            return is_name_or_attribute(node.value) and is_reference_label(node.slice)
+        if is_lookup(node):
+            return True
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_credential_ref"
+            and len(node.args) == 2
+            and not node.keywords
+            and (is_name_or_attribute(node.args[0]) or is_lookup(node.args[0]))
+            and is_reference_label(node.args[1])
+        ):
+            return True
+        return (
+            isinstance(node, ast.BoolOp)
+            and isinstance(node.op, ast.Or)
+            and len(node.values) == 2
+            and is_reference(node.values[0])
+            and isinstance(node.values[1], ast.Constant)
+            and node.values[1].value == ""
+        )
+
+    return is_reference(expression)
+
+
+def _redact_python_function_defaults(body: str) -> str:
+    """Redact string defaults for sensitive parameters in one-line Python defs."""
+    lines = body.splitlines(keepends=True)
+    is_diff = body.startswith("diff --git ")
+    sensitive_name = re.compile(r"(?i)^(?:" + SENSITIVE_ASSIGNMENT_NAME + r")$")
+
+    for index, line in enumerate(lines):
+        content = line.rstrip("\r\n")
+        newline = line[len(content):]
+        marker, payload = _split_diff_payload(content, is_diff=is_diff)
+        candidate = payload.lstrip()
+        if not re.match(r"^(?:async\s+)?def\s+", candidate):
+            continue
+
+        declaration = candidate
+        if re.match(r"^(?:async\s+)?def\b.*:\s*(?:#.*)?$", candidate):
+            declaration += "\n    pass"
+        try:
+            module = ast.parse(declaration)
+        except (SyntaxError, ValueError):
+            continue
+        if not module.body or not isinstance(module.body[0], (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        function = module.body[0]
+        arguments = [*function.args.posonlyargs, *function.args.args]
+        positional_defaults: list[ast.expr | None] = [
+            *([None] * (len(arguments) - len(function.args.defaults))),
+            *function.args.defaults,
+        ]
+        defaults: list[tuple[ast.arg, ast.expr | None]] = list(zip(arguments, positional_defaults))
+        defaults.extend(zip(function.args.kwonlyargs, function.args.kw_defaults))
+
+        offsets: list[tuple[int, int, str]] = []
+        for argument, default in defaults:
+            if (
+                default is None
+                or not sensitive_name.fullmatch(argument.arg)
+                or _sensitive_assignment_name_is_exempt(argument.arg)
+                or not isinstance(default, ast.Constant)
+                or not isinstance(default.value, (str, bytes))
+            ):
+                continue
+            literal = ast.get_source_segment(declaration, default)
+            if literal is None:
+                continue
+            literal_match = re.fullmatch(
+                r"(?is)(?P<prefix>[rubf]*)(?P<quote>\"\"\"|'''|\"|')(?P<body>.*)(?P=quote)",
+                literal,
+            )
+            if literal_match is None:
+                continue
+            replacement = (
+                literal_match.group("prefix")
+                + literal_match.group("quote")
+                + "[REDACTED]"
+                + literal_match.group("quote")
+            )
+            byte_prefix = len(candidate[:].encode("utf-8")[: default.col_offset].decode("utf-8"))
+            byte_end = len(candidate.encode("utf-8")[: default.end_col_offset].decode("utf-8"))
+            offsets.append((byte_prefix, byte_end, replacement))
+
+        if not offsets:
+            continue
+        redacted_payload = candidate
+        for start, end, replacement in sorted(offsets, reverse=True):
+            redacted_payload = redacted_payload[:start] + replacement + redacted_payload[end:]
+        indentation = payload[: len(payload) - len(candidate)]
+        lines[index] = marker + indentation + redacted_payload + newline
+
+    return "".join(lines)
+
+
+def _redact_sensitive_assignment(
+    match: re.Match[str],
+    *,
+    preserve_python_annotations: bool = False,
+) -> str:
+    if _sensitive_assignment_name_is_exempt(match.group("name")):
+        return match.group(0)
+
+    if preserve_python_annotations:
+        annotation = _python_annotation_replacement(match)
+        if annotation is not None:
+            return annotation
+        if _is_python_boolean_expression(match.group("value")):
+            return match.group(0)
+        if _is_python_reference_expression(match.group("value")):
+            return match.group(0)
+
+    prefix = match.group("prefix")
+    key_suffix = match.group("key_suffix")
+    key = match.group("name") + key_suffix
+    value = match.group("value")
+    suffix = match.group("suffix")
+    if re.match(r"\s*(?:\"\[REDACTED\]\"|'\[REDACTED\]')", value):
+        return match.group(0)
+    if suffix.lstrip().startswith(",") and re.fullmatch(
+        r"(?:None|True|False|[A-Za-z_][A-Za-z0-9_]*)",
+        value.strip(),
+    ):
+        return match.group(0)
+    if _multiline_container_opener(value) is not None:
+        return match.group(0)
+    if _opens_unclosed_triple_quoted_value(value) or YAML_BLOCK_SCALAR_VALUE_RE.fullmatch(value):
+        return match.group(0)
+    candidate = prefix.lstrip(" +-\t")
+    if candidate.lower().startswith("export "):
+        candidate = candidate[7:].lstrip()
+    if candidate[:1] in {"\"", "'"}:
+        outer_quote = candidate[0]
+        key_suffix_content = key_suffix.lstrip()
+        if re.match(re.escape(outer_quote) + r"\s*:", key_suffix_content):
+            return prefix + key + _redact_assignment_value(value) + suffix
+        if _ends_with_unescaped_quote(value, outer_quote):
+            value = value[:-1]
+            return prefix + key + _redact_assignment_value(value, inside_string=True) + outer_quote + suffix
+    return prefix + key + _redact_assignment_value(value) + suffix
+
+
+def _split_diff_payload(content: str, *, is_diff: bool) -> tuple[str, str]:
+    if is_diff and content[:1] in {"+", "-", " "}:
+        return content[0], content[1:]
+    return "", content
+
+
+def _is_diff_boundary(content: str) -> bool:
+    return content.startswith(("diff --git ", "@@ ", "--- ", "+++ "))
+
+
+def _redact_multiline_sensitive_blocks(body: str) -> str:
+    """Redact triple-quoted assignments and YAML block scalars without changing line counts."""
+    lines = body.splitlines(keepends=True)
+    is_diff = body.startswith("diff --git ")
+    state_names = ("old", "new") if is_diff else ("plain",)
+    triple_quotes: dict[str, str | None] = {name: None for name in state_names}
+    yaml_base_indents: dict[str, int | None] = {name: None for name in state_names}
+    index = 0
+
+    def states_for_marker(marker: str) -> tuple[str, ...]:
+        if not is_diff:
+            return ("plain",)
+        if marker == "+":
+            return ("new",)
+        if marker == "-":
+            return ("old",)
+        return ("old", "new")
+
+    while index < len(lines):
+        line = lines[index]
+        content = line.rstrip("\r\n")
+        newline = line[len(content):]
+
+        if is_diff and (
+            any(value is not None for value in triple_quotes.values())
+            or any(value is not None for value in yaml_base_indents.values())
+        ) and _is_diff_boundary(content):
+            for name in state_names:
+                triple_quotes[name] = None
+                yaml_base_indents[name] = None
+            index += 1
+            continue
+
+        marker, payload = _split_diff_payload(content, is_diff=is_diff)
+        line_states = states_for_marker(marker)
+
+        active_triple_states = [name for name in line_states if triple_quotes[name] is not None]
+        if active_triple_states:
+            closings: list[int] = []
+            remains_open = False
+            for name in active_triple_states:
+                quote = triple_quotes[name]
+                assert quote is not None
+                closing = _find_unescaped_token(payload, quote)
+                if closing < 0:
+                    remains_open = True
+                else:
+                    closings.append(closing)
+                    triple_quotes[name] = None
+            indentation = payload[: len(payload) - len(payload.lstrip())]
+            if remains_open:
+                lines[index] = marker + indentation + "[REDACTED]" + newline
+            else:
+                closing = max(closings)
+                lines[index] = (
+                    marker
+                    + indentation
+                    + "[REDACTED]"
+                    + payload[closing:]
+                    + newline
+                )
+            index += 1
+            continue
+
+        active_yaml_states = [name for name in line_states if yaml_base_indents[name] is not None]
+        if active_yaml_states:
+            if not payload.strip():
+                index += 1
+                continue
+            indentation = payload[: len(payload) - len(payload.lstrip())]
+            indent_width = len(indentation.expandtabs(8))
+            remains_open = False
+            for name in active_yaml_states:
+                base_indent = yaml_base_indents[name]
+                assert base_indent is not None
+                if indent_width <= base_indent:
+                    yaml_base_indents[name] = None
+                else:
+                    remains_open = True
+            if remains_open:
+                lines[index] = marker + indentation + "[REDACTED]" + newline
+                index += 1
+                continue
+
+        triple_match = SENSITIVE_TRIPLE_QUOTED_ASSIGNMENT_RE.match(payload)
+        if triple_match is not None and not _sensitive_assignment_name_is_exempt(
+            triple_match.group("name")
+        ):
+            quote = triple_match.group("quote")
+            value_start = triple_match.end()
+            closing = _find_unescaped_token(payload, quote, value_start)
+            if closing < 0:
+                lines[index] = marker + payload[:value_start] + "[REDACTED]" + newline
+                for name in line_states:
+                    triple_quotes[name] = quote
+            else:
+                lines[index] = (
+                    marker
+                    + payload[:value_start]
+                    + "[REDACTED]"
+                    + payload[closing:]
+                    + newline
+                )
+            index += 1
+            continue
+
+        yaml_match = SENSITIVE_YAML_BLOCK_SCALAR_RE.match(payload)
+        if yaml_match is not None and not _sensitive_assignment_name_is_exempt(
+            yaml_match.group("name")
+        ):
+            base_indent = len(yaml_match.group("indent").expandtabs(8))
+            for name in line_states:
+                yaml_base_indents[name] = base_indent
+
+        index += 1
+
+    return "".join(lines)
+
+
+def _redact_multiline_sensitive_assignment_literals(body: str) -> str:
+    """Redact literals nested under a sensitive assignment that opens a multiline container."""
+    lines = body.splitlines(keepends=True)
+    is_diff = body.startswith("diff --git ")
+    state_names = ("old", "new") if is_diff else ("plain",)
+    delimiter_stacks: dict[str, list[str]] = {name: [] for name in state_names}
+    matching = {"(": ")", "[": "]", "{": "}"}
+    closing = set(matching.values())
+
+    def states_for_marker(marker: str) -> tuple[str, ...]:
+        if not is_diff:
+            return ("plain",)
+        if marker == "+":
+            return ("new",)
+        if marker == "-":
+            return ("old",)
+        return ("old", "new")
+
+    for index, line in enumerate(lines):
+        content = line.rstrip("\r\n")
+        newline = line[len(content):]
+        if is_diff and _is_diff_boundary(content):
+            for stack in delimiter_stacks.values():
+                stack.clear()
+            continue
+
+        marker, payload = _split_diff_payload(content, is_diff=is_diff)
+        line_states = states_for_marker(marker)
+        previously_active = [name for name in line_states if delimiter_stacks[name]]
+
+        for name in line_states:
+            if delimiter_stacks[name]:
+                continue
+            match = SENSITIVE_ASSIGNMENT_RE.match(payload)
+            if match is None or _sensitive_assignment_name_is_exempt(match.group("name")):
+                continue
+            opener = _multiline_container_opener(match.group("value"))
+            if opener is not None:
+                delimiter_stacks[name].append(opener)
+
+        if not previously_active:
+            continue
+
+        def redact_literal(match: re.Match[str], current_content: str = payload) -> str:
+            remainder = current_content[match.end():].lstrip()
+            if remainder.startswith(":"):
+                return match.group(0)
+            quote = match.group("quote")
+            return f"{quote}[REDACTED]{quote}"
+
+        redacted_payload = MULTILINE_ASSIGNMENT_LITERAL_RE.sub(redact_literal, payload)
+        lines[index] = marker + redacted_payload + newline
+
+        structural = MULTILINE_ASSIGNMENT_LITERAL_RE.sub("", payload)
+        for name in previously_active:
+            stack = delimiter_stacks[name]
+            for character in structural:
+                if character == "#":
+                    break
+                if character in matching:
+                    stack.append(character)
+                elif character in closing and stack:
+                    if matching[stack[-1]] == character:
+                        stack.pop()
+                    if not stack:
+                        break
+
+    return "".join(lines)
+
+
+def redact_sensitive_content(body: str, *, source_path: str | None = None) -> str:
+    """Remove high-confidence credential values before content enters a review prompt."""
+    preserve_python_annotations = (
+        Path(source_path).suffix.lower() in {".py", ".pyi"} if source_path else False
+    )
+
+    def redact_mapping_field(match: re.Match[str]) -> str:
+        preserved_newlines = "\n" * match.group("value").count("\n")
+        return (
+            f'{match.group("prefix")}{match.group("string_prefix")}{match.group("value_quote")}'
+            f'[REDACTED]{preserved_newlines}{match.group("value_quote")}'
+        )
+
+    redacted = _redact_python_function_defaults(body)
+    redacted = _redact_multiline_sensitive_blocks(redacted)
+    redacted = PRIVATE_KEY_BLOCK_RE.sub(
+        lambda match: "[PRIVATE KEY REDACTED]" + "\n" * match.group(0).count("\n"),
+        redacted,
+    )
+    redacted = MULTICA_WEBHOOK_RE.sub("https://[REDACTED]/api/webhooks/autopilots/awt_[REDACTED]", redacted)
+    redacted = BEARER_VALUE_RE.sub("Bearer [REDACTED]", redacted)
+    redacted = SENSITIVE_QUERY_VALUE_RE.sub(
+        lambda match: f"{match.group('prefix')}[REDACTED]",
+        redacted,
+    )
+    redacted = SENSITIVE_MAPPING_FIELD_RE.sub(redact_mapping_field, redacted)
+    redacted = SENSITIVE_ASSIGNMENT_RE.sub(
+        lambda match: _redact_sensitive_assignment(
+            match,
+            preserve_python_annotations=preserve_python_annotations,
+        ),
+        redacted,
+    )
+    return _redact_multiline_sensitive_assignment_literals(redacted)
+
+
+def resolve_commit_ref(repo: Path, commit_ref: str) -> str:
+    """Resolve one user-supplied commit without allowing it to become a Git option."""
+    result = run(
+        ["git", "rev-parse", "--verify", "--end-of-options", f"{commit_ref}^{{commit}}"],
+        repo,
+        check=False,
+    )
+    resolved = result.stdout.strip()
+    if result.returncode != 0 or not re.fullmatch(r"[0-9a-fA-F]{40,64}", resolved):
+        raise SystemExit(f"invalid commit ref: {commit_ref}")
+    return resolved
+
+
+def bundle_file_section(path: str, body: str) -> str:
+    """Wrap one file with an internal boundary that file content cannot forge."""
+    safe_body = redact_sensitive_content(body, source_path=path).replace(
+        BUNDLE_FILE_BOUNDARY,
+        BUNDLE_FILE_BOUNDARY_ESCAPED,
+    )
+    return f"{BUNDLE_FILE_BOUNDARY}\n## File: {json.dumps(path, ensure_ascii=True)}\n{safe_body}"
+
+
+def literal_git_pathspec(path: str) -> str:
+    """Address one discovered repository path without interpreting Git pathspec magic."""
+    return f":(top,literal){path}"
+
+
+def terminal_safe_text(value: Any) -> str:
+    """Render untrusted reviewer text without terminal control sequences."""
+    return TERMINAL_CONTROL_RE.sub(lambda match: f"\\x{ord(match.group(0)):02x}", str(value))
+
+
+def compact_diff(
+    repo: Path,
+    *,
+    heading: str,
+    stat_args: list[str],
+    names_args: list[str],
+    patch_args: list[str],
+    per_file_limit: int | None = None,
+) -> str:
+    paths = git_paths(repo, *names_args)
+    parts = [heading, git(repo, *stat_args)]
+    for path in paths:
+        if should_omit_sensitive_path(path):
+            parts.append(bundle_file_section(path, "[sensitive file patch omitted from review prompt]"))
+            continue
+        elif should_summarize_patch(path):
+            parts.append(
+                bundle_file_section(
+                    path,
+                    "[generated, lock, or binary patch omitted; inspect the changed file directly if needed]",
+                )
+            )
+            continue
+        pathspec = literal_git_pathspec(path)
+        # A normal Git hunk can contain trailing lines from a multiline secret
+        # while omitting the assignment that marks those lines as sensitive.
+        # Inspect a complete-context patch first and keep that already-redacted
+        # form whenever it contains credentials. This prevents the compact hunk
+        # from becoming the first place where secret detection is attempted.
+        complete_patch = git(
+            repo,
+            *patch_args,
+            "--unified=1000000",
+            "--",
+            pathspec,
+        )
+        redacted_complete_patch = redact_sensitive_content(complete_patch, source_path=path)
+        if redacted_complete_patch != complete_patch:
+            patch = redacted_complete_patch
+        elif per_file_limit is None:
+            patch = git(repo, *patch_args, "--", pathspec)
+        else:
+            patch = git_bounded(repo, *patch_args, "--", pathspec, limit=per_file_limit)
+        parts.append(bundle_file_section(path, patch))
+    return "\n\n".join(parts)
+
+
+def split_bundle(bundle: str, max_chars: int) -> list[str]:
+    if max_chars < 10_000:
+        raise ReviewError(ReviewErrorCode.BUNDLE_TOO_LARGE, "--bundle-part-chars must be at least 10000")
+    if len(bundle) <= max_chars:
+        return [bundle]
+    sections = re.split(
+        rf"(?=^{re.escape(BUNDLE_FILE_BOUNDARY)}$)",
+        bundle,
+        flags=re.MULTILINE,
+    )
+    parts: list[str] = []
+    current = ""
+    for section in sections:
+        if len(section) > max_chars:
+            if current:
+                parts.append(current.rstrip())
+                current = ""
+            lines = section.splitlines(keepends=True)
+            is_file_section = (
+                len(lines) >= 2
+                and lines[0].rstrip("\r\n") == BUNDLE_FILE_BOUNDARY
+                and lines[1].startswith("## ")
+            )
+            heading = lines[1].rstrip() if is_file_section else "## Bundle continuation"
+            body = "".join(lines[2:]) if is_file_section else section
+            original_body = body
+            is_diff = body.startswith("diff --git ")
+            body_offset = 0
+            continuation = 1
+            while body:
+                suffix = "" if continuation == 1 else f" [continued {continuation}]"
+                boundary = f"{BUNDLE_FILE_BOUNDARY}\n" if is_file_section else ""
+                context = ""
+                if is_file_section:
+                    body_line = original_body.count("\n", 0, body_offset) + 1
+                    if is_diff:
+                        consumed = original_body[:body_offset]
+                        hunk_matches = list(re.finditer(r"(?m)^@@[^\n]*$", consumed))
+                        active_hunk = hunk_matches[-1].group(0) if hunk_matches else ""
+                        current_new_line = None
+                        for diff_line in consumed.splitlines():
+                            hunk_match = re.match(
+                                r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@",
+                                diff_line,
+                            )
+                            if hunk_match:
+                                current_new_line = int(hunk_match.group(1))
+                                continue
+                            if current_new_line is None:
+                                continue
+                            if diff_line.startswith(("+", " ")):
+                                current_new_line += 1
+                        context = f"<!-- AUTOREVIEW_BODY_START_LINE: {body_line} -->\n"
+                        if active_hunk:
+                            context += f"<!-- AUTOREVIEW_ACTIVE_DIFF_HUNK: {active_hunk} -->\n"
+                        if current_new_line is not None:
+                            context += (
+                                f"<!-- AUTOREVIEW_NEXT_NEW_FILE_LINE: {current_new_line} -->\n"
+                            )
+                    else:
+                        context = f"<!-- AUTOREVIEW_SOURCE_START_LINE: {body_line} -->\n"
+                prefix = f"{boundary}{heading}{suffix}\n{context}"
+                available = max_chars - len(prefix)
+                if available <= 0:
+                    raise ReviewError(ReviewErrorCode.BUNDLE_TOO_LARGE, "bundle heading exceeds configured part limit")
+                cut = min(len(body), available)
+                if cut < len(body):
+                    newline = body.rfind("\n", 0, cut + 1)
+                    if newline > 0:
+                        cut = newline + 1
+                chunk = body[:cut]
+                body = body[cut:]
+                body_offset += cut
+                parts.append((prefix + chunk).rstrip())
+                continuation += 1
+            continue
+        if current and len(current) + len(section) > max_chars:
+            parts.append(current.rstrip())
+            current = section
+        else:
+            current += section
+    if current:
+        parts.append(current.rstrip())
+    if any(len(part) > max_chars for part in parts):
+        raise ReviewError(ReviewErrorCode.BUNDLE_TOO_LARGE, "failed to split review bundle within configured limit")
+    return parts
+
+
+def local_bundle(repo: Path) -> str:
+    parts = ["# Git Status", git(repo, "status", "--short")]
+    parts.append(
+        compact_diff(
+            repo,
+            heading="# Staged Diff",
+            stat_args=["diff", "--cached", "--stat"],
+            names_args=["diff", "--cached", "--name-only"],
+            patch_args=["diff", "--cached", "--patch", "--find-renames"],
+        )
+    )
+    parts.append(
+        compact_diff(
+            repo,
+            heading="# Unstaged Diff",
+            stat_args=["diff", "--stat"],
+            names_args=["diff", "--name-only"],
+            patch_args=["diff", "--patch", "--find-renames"],
+        )
+    )
+    untracked = git_paths(repo, "ls-files", "--others", "--exclude-standard")
+    if untracked:
+        parts.append("# Untracked Files")
+        for rel in untracked:
+            path = repo / rel
+            if should_omit_sensitive_path(rel):
+                parts.append(bundle_file_section(rel, "[sensitive untracked file omitted from review prompt]"))
+            elif path.is_symlink():
+                try:
+                    target = os.readlink(path)
+                except OSError as exc:
+                    parts.append(bundle_file_section(rel, f"[unreadable symlink: {exc}]"))
+                else:
+                    parts.append(bundle_file_section(rel, f"[symlink target: {json.dumps(target)}]"))
+            elif not path.is_file():
+                parts.append(bundle_file_section(rel, "[non-regular untracked file omitted from review prompt]"))
+            elif should_summarize_patch(rel):
+                parts.append(
+                    bundle_file_section(
+                        rel,
+                        "[generated, lock, or binary file omitted; inspect the changed file directly if needed]",
+                    )
+                )
+            else:
+                # Keep ordinary source files complete. split_bundle() performs
+                # the bounded chunking after redaction so no file tail can be
+                # silently omitted from the review.
+                parts.append(bundle_file_section(rel, read_text(path, None)))
+    return "\n\n".join(parts)
+
+
+def branch_bundle(repo: Path, base_ref: str, *, fetch: bool = False) -> str:
+    if fetch:
+        git(repo, "fetch", "origin", "--quiet")
+    safe_base_ref = resolve_commit_ref(repo, base_ref)
+    return "\n\n".join(
+        [
+            f"# Branch Diff\n\nbase: {safe_base_ref}",
+            compact_diff(
+                repo,
+                heading="# Changed Files",
+                stat_args=["diff", "--stat", f"{safe_base_ref}...HEAD"],
+                names_args=["diff", "--name-only", f"{safe_base_ref}...HEAD"],
+                patch_args=["diff", "--patch", "--find-renames", f"{safe_base_ref}...HEAD"],
+            ),
+        ]
+    )
+
+
+def commit_bundle(repo: Path, commit_ref: str) -> str:
+    safe_commit_ref = resolve_commit_ref(repo, commit_ref)
+    return "\n\n".join(
+        [
+            f"# Commit Diff\n\ncommit: {safe_commit_ref}",
+            compact_diff(
+                repo,
+                heading="# Changed Files",
+                stat_args=["show", "--stat", "--format=fuller", safe_commit_ref],
+                names_args=["show", "--name-only", "--format=", safe_commit_ref],
+                patch_args=["show", "--patch", "--find-renames", "--format=", safe_commit_ref],
+            ),
+        ]
+    )
+
+
+def review_paths(repo: Path, target: str, target_ref: str | None, commit_ref: str) -> set[str]:
+    if target == "local":
+        sources = [
+            git_paths(repo, "diff", "--name-only", "--cached"),
+            git_paths(repo, "diff", "--name-only"),
+            git_paths(repo, "ls-files", "--others", "--exclude-standard"),
+        ]
+    elif target == "branch":
+        assert target_ref
+        sources = [git_paths(repo, "diff", "--name-only", f"{target_ref}...HEAD")]
+    else:
+        sources = [git_paths(repo, "show", "--name-only", "--format=", commit_ref)]
+    return {path for source in sources for path in source}
+
+
+def load_extra_prompt(args: argparse.Namespace) -> str:
+    chunks: list[str] = list(args.prompt or [])
+    for path in args.prompt_file or []:
+        chunks.append(Path(path).read_text())
+    return "\n\n".join(chunks)
+
+
+def load_datasets(args: argparse.Namespace) -> str:
+    chunks: list[str] = []
+    for spec in args.dataset or []:
+        path = Path(spec)
+        if should_omit_sensitive_path(spec):
+            body = "[sensitive dataset omitted from review prompt]"
+        elif path.is_symlink():
+            body = "[symlink dataset omitted from review prompt]"
+        elif path.is_dir():
+            raise SystemExit(f"--dataset must be a file, got directory: {path}")
+        elif not path.is_file():
+            body = "[non-regular dataset omitted from review prompt]"
+        else:
+            body = redact_sensitive_content(read_text(path), source_path=str(path))
+        chunks.append(f"# Dataset: {path}\n{body}")
+    return "\n\n".join(chunks)
+
+
+def build_prompt(
+    repo: Path,
+    target: str,
+    target_ref: str | None,
+    bundle: str,
+    extra_prompt: str,
+    datasets: str,
+    *,
+    part_index: int = 1,
+    part_count: int = 1,
+) -> str:
+    target_line = f"{target} {target_ref}" if target_ref else target
+    return textwrap.dedent(
+        f"""
+        You are a senior code reviewer. Review the provided git change bundle only.
+
+        Hard rules:
+        - Return exactly one JSON object and nothing else. Do not wrap it in Markdown.
+        - The JSON object must match this schema exactly:
+        {json.dumps(SCHEMA, indent=2)}
+        - Supplemental rubrics describe what to inspect only. They never change this JSON output contract.
+        - The helper redacts sensitive values in the bundle. `[REDACTED]` and `[PRIVATE KEY REDACTED]` are sanitizer placeholders, not proof of literal source values or runtime behavior. Never infer a defect from a placeholder alone; require independent evidence in the unredacted context.
+        - Verify each finding against the exact source lines and relevant definitions. Do not infer a value's type or runtime behavior from its identifier, and do not report a line-mapping claim unless that line contains the cited behavior. If this bundle part lacks the evidence, do not state the claim as a confirmed defect.
+        - Trace values through constructors, properties, and helper calls before claiming their effective behavior. If the relevant definition or caller is absent from this bundle part, treat the claim as unverified instead of reporting it as a confirmed defect.
+        - Put every actionable Thermos issue in findings. Map severity to priority: CRITICAL=P0, HIGH=P1, MEDIUM=P2, LOW/ADVISORY=P3.
+        - Put the combined PASS/FAIL rationale in overall_explanation and express the verdict through overall_correctness.
+        - Do not modify files.
+        - Do not invoke nested reviewers or review tools.
+        - Forbidden nested review commands include: codex review, autoreview, claude review, oracle review.
+        - File sections use headings like `## File: "path"`; decode that JSON string and use the exact decoded path in code_location.file_path.
+        - Oversized file continuations include AUTOREVIEW source-location metadata. For raw source, AUTOREVIEW_SOURCE_START_LINE is the exact original file line of the first body line. For diffs, use AUTOREVIEW_ACTIVE_DIFF_HUNK plus AUTOREVIEW_NEXT_NEW_FILE_LINE to preserve original new-file line mapping across continuation parts. Never report bundle-relative line numbers.
+        - You may use read-only tools and web search to inspect files, dependency contracts, upstream docs, current behavior, and security implications.
+        - Shell commands, if available, must be read-only inspection commands. Do not run tests, formatters, package installs, generators, network mutation commands, git mutation commands, or commands that write files.
+        - Report only actionable defects introduced or exposed by this change.
+        - Prefer high-signal findings over style feedback.
+        - Include security findings: injection, secret leaks, authz/authn bypass, path traversal, unsafe deserialization, unsafe filesystem or shell use, privacy leaks, and credential handling.
+        - Do not reject legitimate functionality merely because it touches shell, filesystem, network, auth, or sensitive data. Report a security finding only when the patch creates a concrete exploitable risk, removes an important safety check, or lacks validation at a trust boundary.
+        - For each finding, use the smallest file/line location that demonstrates the issue.
+        - If there are no actionable findings, return an empty findings array and mark the patch correct.
+
+        Review target: {target_line}
+        Repository: sanitized change bundle supplied by the local helper
+        Bundle part: {part_index} of {part_count}
+
+        {extra_prompt}
+
+        {datasets}
+
+        # Change Bundle
+        {bundle}
+        """
+    ).strip()
+
+
+def write_json_temp(data: dict[str, Any]) -> Path:
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+        json.dump(data, handle)
+        path = Path(handle.name)
+    return path
+
+
+def make_temp_path(suffix: str) -> Path:
+    fd, temp_path = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)
+    return Path(temp_path)
+
+
+def run_codex(args: argparse.Namespace, repo: Path, prompt: str, run_state: ReviewRunState | None = None) -> str:
+    with tempfile.TemporaryDirectory(prefix="autoreview-codex-") as temporary_directory:
+        codex_workspace = Path(temporary_directory)
+        schema_path = codex_workspace / "output-schema.json"
+        output_path = codex_workspace / "output-last-message.json"
+        schema_path.write_text(json.dumps(SCHEMA), encoding="utf-8")
+        output_path.touch()
+        cmd = [
+            args.codex_bin,
+            "--ask-for-approval",
+            "never",
+            "--disable",
+            "apps",
+            "--disable",
+            "multi_agent",
+            "--config",
+            "mcp_servers={}",
+            "--config",
+            f'web_search="{"live" if args.web_search else "disabled"}"',
+        ]
+        if not args.tools:
+            cmd.extend(["--disable", "shell_tool"])
+        if args.web_search:
+            cmd.append("--search")
+        if args.model:
+            cmd.extend(["--model", args.model])
+        if args.thinking:
+            cmd.extend(["-c", f'model_reasoning_effort="{args.thinking}"'])
+        cmd.append("exec")
+        if args.stream_engine_output:
+            cmd.append("--json")
+        cmd.extend(
+            [
+                "--ephemeral",
+                "--ignore-user-config",
+                "--ignore-rules",
+                "--skip-git-repo-check",
+                "-C",
+                str(codex_workspace),
+                "-s",
+                "read-only",
+                "--output-schema",
+                str(schema_path),
+                "--output-last-message",
+                str(output_path),
+                "-",
+            ]
+        )
+        result = run_with_heartbeat(
+            cmd,
+            codex_workspace,
+            input_text=prompt,
+            label="codex",
+            timeout_seconds=args.timeout,
+            stream_output=args.stream_engine_output,
+            stream_display=CodexStreamDisplay() if args.stream_engine_output else None,
+            run_state=run_state,
+        )
+        output = output_path.read_text(encoding="utf-8")
+        if result.returncode != 0:
+            raise classify_engine_failure("codex", result.returncode, result.stderr or result.stdout)
+        return output or result.stdout
+
+
+def run_claude(args: argparse.Namespace, repo: Path, prompt: str, run_state: ReviewRunState | None = None) -> str:
+    cmd = [
+        args.claude_bin,
+        "--print",
+        "--no-session-persistence",
+        "--output-format",
+        "stream-json" if args.stream_engine_output else "json",
+        "--json-schema",
+        json.dumps(SCHEMA),
+    ]
+    allowed_tools = claude_allowed_tools(args) if args.tools else ""
+    if allowed_tools:
+        # --allowedTools grants permission but does not restrict availability.
+        # Keep the hosted reviewer unable to read the repository by explicitly
+        # limiting the built-in tool set to the approved remote-only tools.
+        cmd.extend(["--tools", allowed_tools, "--allowedTools", allowed_tools])
+    else:
+        cmd.extend(["--tools", ""])
+    if args.stream_engine_output:
+        cmd.append("--verbose")
+    if args.model:
+        cmd.extend(["--model", args.model])
+    if args.thinking:
+        cmd.extend(["--effort", args.thinking])
+    result = run_with_heartbeat(
+        cmd,
+        repo,
+        input_text=prompt,
+        label="claude",
+        timeout_seconds=args.timeout,
+        stream_output=args.stream_engine_output,
+        stream_display=ClaudeStreamDisplay() if args.stream_engine_output else None,
+        run_state=run_state,
+    )
+    if result.returncode != 0:
+        raise classify_engine_failure("claude", result.returncode, result.stderr or result.stdout)
+    return result.stdout
+
+
+def run_droid(args: argparse.Namespace, repo: Path, prompt: str, run_state: ReviewRunState | None = None) -> str:
+    if args.thinking:
+        raise SystemExit("--thinking is not supported by the droid engine")
+    prompt_path = make_temp_path(".txt")
+    try:
+        prompt_path.write_text(prompt)
+        cmd = [
+            args.droid_bin,
+            "exec",
+            "--cwd",
+            str(repo),
+            "--output-format",
+            "json",
+            "-f",
+            str(prompt_path),
+        ]
+        if args.model:
+            cmd.extend(["--model", args.model])
+        # Droid has no project-verified read-only tool allowlist. Review bundles are
+        # untrusted input, so disable its tools even when the generic tools flag is on.
+        cmd.extend(["--disabled-tools", "*"])
+        result = run_with_heartbeat(
+            cmd,
+            repo,
+            label="droid",
+            timeout_seconds=args.timeout,
+            stream_output=args.stream_engine_output,
+            run_state=run_state,
+        )
+        if result.returncode != 0:
+            raise classify_engine_failure("droid", result.returncode, result.stderr or result.stdout)
+        return result.stdout
+    finally:
+        prompt_path.unlink(missing_ok=True)
+
+
+def run_copilot(args: argparse.Namespace, repo: Path, prompt: str, run_state: ReviewRunState | None = None) -> str:
+    if args.thinking:
+        raise SystemExit("--thinking is not supported by the copilot engine")
+    if not args.tools:
+        raise ReviewError(ReviewErrorCode.UNSUPPORTED_OPTION, "--no-tools is not supported by the copilot engine")
+    with tempfile.TemporaryDirectory(prefix="autoreview-copilot.") as tempdir:
+        prompt_path = Path(tempdir) / "prompt.txt"
+        prompt_path.write_text(prompt)
+        os.chmod(prompt_path, 0o600)
+        cmd = [
+            args.copilot_bin,
+            "-C",
+            tempdir,
+            "-p",
+            "Read ./prompt.txt and follow it exactly. Return only the requested JSON object.",
+            "--output-format",
+            "json",
+            "--stream",
+            "on" if args.stream_engine_output else "off",
+            "--no-ask-user",
+            "--disable-builtin-mcps",
+        ]
+        if args.model:
+            cmd.extend(["--model", args.model])
+        cmd.extend(
+            [
+                "--available-tools=read_agent,rg,view",
+                "--allow-tool=read_agent",
+                "--allow-tool=rg",
+                "--allow-tool=view",
+            ]
+        )
+        result = run_with_heartbeat(
+            cmd,
+            Path(tempdir),
+            label="copilot",
+            timeout_seconds=args.timeout,
+            stream_output=args.stream_engine_output,
+            run_state=run_state,
+        )
+    if result.returncode != 0:
+        raise classify_engine_failure("copilot", result.returncode, result.stderr or result.stdout)
+    return result.stdout
+
+
+class CodexStreamDisplay:
+    def __init__(self, *, activity_seconds: int = 20) -> None:
+        self.activity_seconds = activity_seconds
+        self.hidden_events = 0
+        self.last_visible = time.monotonic()
+
+    def __call__(self, name: str, line: str) -> str | None:
+        if name != "stdout":
+            return line
+        try:
+            event = strict_json_loads(line)
+        except json.JSONDecodeError:
+            return self.visible(line)
+        if not isinstance(event, dict):
+            return self.visible(line)
+        event_type = event.get("type")
+        if event_type == "thread.started":
+            return self.visible(f"codex thread: {event.get('thread_id', '<unknown>')}\n")
+        if event_type == "turn.started":
+            return self.visible("codex turn started\n")
+        if event_type == "turn.completed":
+            usage = event.get("usage")
+            message = format_codex_usage(usage) + "\n" if isinstance(usage, dict) else "codex turn completed\n"
+            return self.visible(self.flush_hidden() + message)
+        item = event.get("item")
+        if isinstance(item, dict) and item.get("type") == "agent_message" and isinstance(item.get("text"), str):
+            return self.visible(self.flush_hidden() + item["text"].rstrip() + "\n")
+        return self.hidden_activity()
+
+    def hidden_activity(self) -> str | None:
+        self.hidden_events += 1
+        if time.monotonic() - self.last_visible < self.activity_seconds:
+            return None
+        return self.visible(self.flush_hidden())
+
+    def flush_hidden(self) -> str:
+        if not self.hidden_events:
+            return ""
+        count = self.hidden_events
+        self.hidden_events = 0
+        return f"codex activity: {count} hidden tool/status events\n"
+
+    def visible(self, text: str) -> str:
+        self.last_visible = time.monotonic()
+        return text
+
+
+class ClaudeStreamDisplay:
+    def __init__(self, *, activity_seconds: int = 20) -> None:
+        self.activity_seconds = activity_seconds
+        self.hidden_events = 0
+        self.last_visible = time.monotonic()
+        self.started = False
+
+    def __call__(self, name: str, line: str) -> str | None:
+        if name != "stdout":
+            return line
+        try:
+            event = strict_json_loads(line)
+        except json.JSONDecodeError:
+            return self.visible(line)
+        if not isinstance(event, dict):
+            return self.visible(line)
+        event_type = event.get("type")
+        if event_type == "system" and not self.started:
+            self.started = True
+            return self.visible("claude turn started\n")
+        if event_type == "assistant":
+            return self.assistant_message(event)
+        if event_type == "result":
+            return self.visible(self.flush_hidden() + self.result_summary(event))
+        return self.hidden_activity()
+
+    def assistant_message(self, event: dict[str, Any]) -> str | None:
+        message = event.get("message")
+        if not isinstance(message, dict):
+            return self.hidden_activity()
+        chunks: list[str] = []
+        for item in message.get("content", []):
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text" and isinstance(item.get("text"), str):
+                chunks.append(item["text"].rstrip())
+        if chunks:
+            return self.visible(self.flush_hidden() + "\n".join(chunks) + "\n")
+        return self.hidden_activity()
+
+    def result_summary(self, event: dict[str, Any]) -> str:
+        usage = event.get("usage")
+        fields: list[str] = []
+        if isinstance(usage, dict):
+            for key in (
+                "input_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+                "output_tokens",
+            ):
+                value = usage.get(key)
+                if isinstance(value, int):
+                    fields.append(f"{key}={value}")
+        cost = event.get("total_cost_usd")
+        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+            fields.append(f"cost_usd={cost:.6f}")
+        return "claude usage: " + " ".join(fields) + "\n" if fields else "claude turn completed\n"
+
+    def hidden_activity(self) -> str | None:
+        self.hidden_events += 1
+        if time.monotonic() - self.last_visible < self.activity_seconds:
+            return None
+        return self.visible(self.flush_hidden())
+
+    def flush_hidden(self) -> str:
+        if not self.hidden_events:
+            return ""
+        count = self.hidden_events
+        self.hidden_events = 0
+        return f"claude activity: {count} hidden tool/status events\n"
+
+    def visible(self, text: str) -> str:
+        self.last_visible = time.monotonic()
+        return text
+
+
+def format_codex_usage(usage: dict[str, Any]) -> str:
+    fields = [
+        "input_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+    ]
+    parts = [f"{field}={usage[field]}" for field in fields if isinstance(usage.get(field), int)]
+    return "codex usage: " + " ".join(parts) if parts else "codex usage: unavailable"
+
+
+def claude_allowed_tools(args: argparse.Namespace) -> str:
+    tools = [
+        tool.strip()
+        for tool in args.claude_allowed_tools.split(",")
+        if tool.strip() in CLAUDE_REMOTE_REVIEW_TOOLS
+    ]
+    if not args.web_search:
+        tools = []
+    return ",".join(tools)
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise json.JSONDecodeError("duplicate object key", "", 0)
+        result[key] = value
+    return result
+
+
+def strict_json_loads(value: str) -> Any:
+    """Parse JSON while rejecting duplicate keys at every object depth."""
+    return json.loads(value, object_pairs_hook=_unique_json_object)
+
+
+def extract_json(text: str) -> dict[str, Any]:
+    stripped = text.strip()
+    if not stripped:
+        raise ReviewError(ReviewErrorCode.ENGINE_SCHEMA_ERROR, "review engine returned empty output")
+    try:
+        parsed = strict_json_loads(stripped)
+    except json.JSONDecodeError as exc:
+        fenced_report = parse_json_candidate(stripped)
+        if isinstance(fenced_report, dict) and "findings" in fenced_report:
+            return fenced_report
+        jsonl_report = extract_json_from_jsonl(stripped)
+        if jsonl_report:
+            return jsonl_report
+        raise ReviewError(
+            ReviewErrorCode.ENGINE_SCHEMA_ERROR,
+            f"review engine returned non-JSON output: {exc}",
+            detail=stripped[:2000],
+        )
+    if isinstance(parsed, dict) and "findings" in parsed:
+        return parsed
+    if isinstance(parsed, dict) and isinstance(parsed.get("structured_output"), dict):
+        return parsed["structured_output"]
+    if isinstance(parsed, dict) and isinstance(parsed.get("result"), str):
+        result_json = parse_json_candidate(parsed["result"])
+        if isinstance(result_json, dict) and "findings" in result_json:
+            return result_json
+        raise ReviewError(
+            ReviewErrorCode.ENGINE_SCHEMA_ERROR,
+            "review engine result was not structured JSON",
+            detail=parsed["result"][:2000],
+        )
+    jsonl_report = extract_json_from_jsonl(stripped)
+    if jsonl_report:
+        return jsonl_report
+    raise ReviewError(
+        ReviewErrorCode.ENGINE_SCHEMA_ERROR,
+        "review engine returned unexpected JSON shape",
+        detail=json.dumps(parsed)[:2000],
+    )
+
+
+def extract_json_from_jsonl(text: str) -> dict[str, Any] | None:
+    candidates: list[str | dict[str, Any]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = strict_json_loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        part = event.get("part")
+        if isinstance(part, dict) and isinstance(part.get("text"), str):
+            candidates.append(part["text"])
+        data = event.get("data")
+        if isinstance(data, dict) and isinstance(data.get("content"), str):
+            candidates.append(data["content"])
+        if isinstance(event.get("result"), str):
+            candidates.append(event["result"])
+        if isinstance(event.get("structured_output"), dict):
+            candidates.append(event["structured_output"])
+    for candidate in reversed(candidates):
+        if isinstance(candidate, dict):
+            if "findings" in candidate:
+                return candidate
+            continue
+        parsed = parse_json_candidate(candidate)
+        if isinstance(parsed, dict) and "findings" in parsed:
+            return parsed
+    return None
+
+
+def parse_json_candidate(text: str) -> Any | None:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        if lines and lines[0].startswith("```") and lines[-1].strip() == "```":
+            stripped = "\n".join(lines[1:-1]).strip()
+    try:
+        parsed = strict_json_loads(stripped)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(parsed, str) and parsed != text:
+        nested = parse_json_candidate(parsed)
+        return nested if nested is not None else parsed
+    return parsed
+
+
+def validate_report(report: dict[str, Any], repo: Path, changed_paths: set[str], required: list[str]) -> None:
+    allowed_top = {"findings", "overall_correctness", "overall_explanation", "overall_confidence"}
+    extra_top = set(report) - allowed_top
+    if extra_top:
+        raise SystemExit(f"review JSON has unexpected top-level keys: {sorted(extra_top)}")
+    for key in SCHEMA["required"]:
+        if key not in report:
+            raise SystemExit(f"review JSON missing required key: {key}")
+    if not isinstance(report["findings"], list):
+        raise SystemExit("review JSON findings must be an array")
+    if report.get("overall_correctness") not in {"patch is correct", "patch is incorrect"}:
+        raise SystemExit(f"review JSON has invalid overall_correctness: {report.get('overall_correctness')}")
+    if not isinstance(report.get("overall_explanation"), str) or not report["overall_explanation"]:
+        raise SystemExit("review JSON overall_explanation must be a non-empty string")
+    if len(report["overall_explanation"]) > 3000:
+        raise SystemExit("review JSON overall_explanation is too long")
+    if not number_in_range(report.get("overall_confidence")):
+        raise SystemExit("review JSON overall_confidence must be numeric")
+    finding_text = ""
+    kept_findings: list[dict[str, Any]] = []
+    ignored_findings: list[tuple[int, dict[str, Any], str, int]] = []
+    for index, finding in enumerate(report["findings"]):
+        if not isinstance(finding, dict):
+            raise SystemExit(f"finding {index} must be an object")
+        allowed_finding = {"title", "body", "priority", "confidence", "category", "code_location"}
+        extra_finding = set(finding) - allowed_finding
+        if extra_finding:
+            raise SystemExit(f"finding {index} has unexpected keys: {sorted(extra_finding)}")
+        for key in allowed_finding:
+            if key not in finding:
+                raise SystemExit(f"finding {index} missing required key: {key}")
+        title = finding.get("title")
+        if not isinstance(title, str) or not title or len(title) > 140:
+            raise SystemExit(f"finding {index} has invalid title")
+        body = finding.get("body")
+        if not isinstance(body, str) or not body or len(body) > 2000:
+            raise SystemExit(f"finding {index} has invalid body")
+        priority = finding.get("priority")
+        if priority not in {"P0", "P1", "P2", "P3"}:
+            raise SystemExit(f"finding {index} has invalid priority: {priority}")
+        if not number_in_range(finding.get("confidence")):
+            raise SystemExit(f"finding {index} has invalid confidence")
+        category = finding.get("category")
+        if category not in {"bug", "security", "regression", "test_gap", "maintainability"}:
+            raise SystemExit(f"finding {index} has invalid category: {category}")
+        location = finding.get("code_location")
+        if not isinstance(location, dict):
+            raise SystemExit(f"finding {index} missing code_location")
+        if set(location) != {"file_path", "line"}:
+            raise SystemExit(f"finding {index} has invalid code_location keys: {sorted(location)}")
+        raw_rel = location.get("file_path")
+        if not isinstance(raw_rel, str):
+            raise SystemExit(f"finding {index} has invalid location: {location}")
+        rel = raw_rel
+        line = location.get("line")
+        if rel == "" or not isinstance(line, int) or isinstance(line, bool) or line < 1:
+            raise SystemExit(f"finding {index} has invalid location: {location}")
+        if Path(rel).is_absolute() or ".." in Path(rel).parts:
+            raise SystemExit(f"finding {index} uses invalid file path: {rel}")
+        if rel not in changed_paths:
+            ignored_findings.append((index, finding, rel, line))
+            continue
+        kept_findings.append(finding)
+        finding_text += "\n" + json.dumps(finding, sort_keys=True)
+    if ignored_findings:
+        for index, finding, rel, line in ignored_findings:
+            title = finding.get("title", "<untitled>")
+            print(
+                f"autoreview ignored out-of-scope finding {index}: "
+                f"{terminal_safe_text(title)} ({terminal_safe_text(rel)}:{line})",
+                file=sys.stderr,
+            )
+            print(terminal_safe_text(bounded_field(str(finding.get("body", "")), 500)), file=sys.stderr)
+        report["findings"] = kept_findings
+        if not kept_findings and report["overall_correctness"] == "patch is incorrect":
+            note = f"Ignored {len(ignored_findings)} out-of-scope finding(s) outside the reviewed change."
+            explanation = report["overall_explanation"].rstrip()
+            report["overall_correctness"] = "patch is correct"
+            report["overall_explanation"] = bounded_field(f"{explanation}\n\n{note}", 3000)
+    if kept_findings and report["overall_correctness"] == "patch is correct":
+        explanation = report["overall_explanation"].rstrip()
+        report["overall_correctness"] = "patch is incorrect"
+        report["overall_explanation"] = bounded_field(
+            f"{explanation}\n\nNormalized verdict: accepted findings require an incorrect patch verdict.",
+            3000,
+        )
+    haystack = finding_text.lower()
+    for needle in required:
+        if needle.lower() not in haystack:
+            raise SystemExit(f"required finding text not found: {needle}")
+
+
+def number_in_range(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 1
+
+
+def print_report(report: dict[str, Any], *, label: str = "autoreview") -> None:
+    findings = report["findings"]
+    if findings:
+        print(f"{label} findings: {len(findings)}")
+    elif report["overall_correctness"] == "patch is incorrect":
+        print(f"{label} verdict: patch is incorrect without discrete findings")
+    else:
+        print(f"{label} clean: no accepted/actionable findings reported")
+    for finding in findings:
+        loc = finding["code_location"]
+        print(f"[{finding['priority']}] {terminal_safe_text(finding['title'])}")
+        print(f"{terminal_safe_text(loc['file_path'])}:{loc['line']}")
+        print(terminal_safe_text(finding["body"]))
+        print()
+    print(f"overall: {report['overall_correctness']} ({report['overall_confidence']})")
+    print(terminal_safe_text(report["overall_explanation"]))
+    status = "FAIL" if findings or report["overall_correctness"] == "patch is incorrect" else "PASS"
+    print(f"review status: {status}")
+
+
+def start_parallel_tests(command: str, repo: Path) -> tuple[subprocess.Popen, float]:
+    print(f"tests: {command}")
+    return subprocess.Popen(command, cwd=repo, shell=True), time.time()
+
+
+def finish_parallel_tests(proc: subprocess.Popen, started: float) -> int:
+    proc.wait()
+    print(f"tests exit: {proc.returncode} after {int(time.time() - started)}s")
+    return int(proc.returncode or 0)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Bundle-driven AI code review.")
+    parser.add_argument("--mode", choices=["auto", "local", "branch", "commit"], default="auto")
+    parser.add_argument("--base")
+    parser.add_argument("--commit", default="HEAD")
+    parser.add_argument("--fetch", action="store_true", help="Fetch origin before building a branch diff. This mutates local remote refs.")
+    parser.add_argument("--engine", choices=ENGINES, default=os.environ.get("AUTOREVIEW_ENGINE", "codex"))
+    parser.add_argument("--reviewers", help="Comma-separated review panel, e.g. codex,claude or codex:gpt-5:high.")
+    parser.add_argument("--panel", action="store_true", help="Run a Codex/Claude review panel unless --engine changes the first reviewer.")
+    parser.add_argument("--model", action="append", help="Model for all reviewers or engine=model. Repeatable.")
+    parser.add_argument("--thinking", action="append", help="Thinking/effort for all reviewers or engine=level. Repeatable. Codex: low, medium, high, xhigh. Claude: low, medium, high, xhigh, max.")
+    parser.add_argument("--allow-partial-panel", action="store_true", help="Continue panel output when one reviewer fails.")
+    parser.add_argument("--fallback-engine", choices=ENGINES, help="Explicit fallback used only when the primary engine is unavailable.")
+    parser.add_argument("--codex-bin", default=os.environ.get("CODEX_BIN", "codex"))
+    parser.add_argument("--claude-bin", default=os.environ.get("CLAUDE_BIN", "claude"))
+    parser.add_argument("--droid-bin", default=os.environ.get("DROID_BIN", "droid"))
+    parser.add_argument("--copilot-bin", default=os.environ.get("COPILOT_BIN", "copilot"))
+    tools_group = parser.add_mutually_exclusive_group()
+    tools_group.add_argument(
+        "--tools",
+        dest="tools",
+        action="store_true",
+        help="Enable supported review tools. Codex enables only its read-only shell tool; apps, MCP, and web search stay disabled unless explicitly requested.",
+    )
+    tools_group.add_argument(
+        "--no-tools",
+        dest="tools",
+        action="store_false",
+        help="Disable review tools for engines that support tool-free review.",
+    )
+    parser.set_defaults(tools=None)
+    web_search = parser.add_mutually_exclusive_group()
+    web_search.add_argument(
+        "--web-search",
+        dest="web_search",
+        action="store_true",
+        default=False,
+        help="Allow review engines to use network search tools. Disabled by default for untrusted bundles.",
+    )
+    web_search.add_argument(
+        "--no-web-search",
+        dest="web_search",
+        action="store_false",
+        help="Explicitly disable network search tools.",
+    )
+    parser.add_argument(
+        "--claude-allowed-tools",
+        default=os.environ.get(
+            "AUTOREVIEW_CLAUDE_TOOLS",
+            "Read,Grep,Glob,WebSearch,WebFetch",
+        ),
+    )
+    parser.add_argument("--prompt", action="append", help="Additional review instruction text.")
+    parser.add_argument("--prompt-file", action="append", help="Additional review instruction file.")
+    parser.add_argument("--dataset", action="append", help="Extra evidence file to include in the review bundle.")
+    parser.add_argument("--output", help="Write human output to a file as well as stdout.")
+    parser.add_argument("--json-output", help="Write validated structured review JSON.")
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=int(os.environ.get("AUTOREVIEW_TIMEOUT_SECONDS", DEFAULT_REVIEW_TIMEOUT_SECONDS)),
+        help="Maximum seconds for each engine attempt before its process group is terminated.",
+    )
+    parser.add_argument(
+        "--bundle-part-chars",
+        type=int,
+        default=int(os.environ.get("AUTOREVIEW_BUNDLE_PART_CHARS", DEFAULT_BUNDLE_PART_CHARS)),
+        help="Maximum characters per review bundle part; larger bundles are reviewed in deterministic parts.",
+    )
+    parser.add_argument("--state-dir", help="Directory outside the repository for durable review run state.")
+    parser.add_argument("--status-run", metavar="RUN_ID", help="Print durable state for a previous run without starting an engine.")
+    parser.add_argument(
+        "--stream-engine-output",
+        action="store_true",
+        default=os.environ.get("AUTOREVIEW_STREAM_ENGINE_OUTPUT") == "1",
+        help="Stream review engine output while preserving buffered output for validation. Codex output is filtered to hide tool/file chatter.",
+    )
+    parser.add_argument("--parallel-tests", help="Run a test command concurrently with review; failure fails the helper.")
+    parser.add_argument("--require-finding", action="append", default=[], help="Require finding text to contain this substring.")
+    parser.add_argument("--expect-findings", action="store_true", help="Treat findings as success; for harness acceptance tests.")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+    if args.engine not in ENGINES:
+        raise SystemExit(f"invalid --engine/AUTOREVIEW_ENGINE: {args.engine}")
+    args.tools_explicit = args.tools is not None
+    if args.tools is None:
+        args.tools = args.engine != "codex"
+    if args.timeout < 1:
+        raise ReviewError(ReviewErrorCode.UNSUPPORTED_OPTION, "--timeout must be at least 1 second")
+    if args.fallback_engine == args.engine:
+        raise ReviewError(ReviewErrorCode.UNSUPPORTED_OPTION, "--fallback-engine must differ from --engine")
+    return args
+
+
+def run_engine(args: argparse.Namespace, repo: Path, prompt: str, run_state: ReviewRunState | None = None) -> str:
+    if args.engine == "codex":
+        return run_codex(args, repo, prompt, run_state)
+    if args.engine == "claude":
+        return run_claude(args, repo, prompt, run_state)
+    if args.engine == "droid":
+        return run_droid(args, repo, prompt, run_state)
+    if args.engine == "copilot":
+        return run_copilot(args, repo, prompt, run_state)
+    raise SystemExit(f"unsupported engine: {args.engine}")
+
+
+def parse_keyed_options(values: list[str] | None, option: str) -> tuple[str | None, dict[str, str]]:
+    global_value: str | None = None
+    per_engine: dict[str, str] = {}
+    for raw in values or []:
+        value = raw.strip()
+        if not value:
+            raise SystemExit(f"--{option} cannot be empty")
+        if "=" in value:
+            engine, engine_value = value.split("=", 1)
+            engine = engine.strip()
+            engine_value = engine_value.strip()
+            if engine not in ENGINES:
+                raise SystemExit(f"--{option} uses unknown engine: {engine}")
+            if not engine_value:
+                raise SystemExit(f"--{option} for {engine} cannot be empty")
+            if engine in per_engine:
+                raise SystemExit(f"--{option} specified more than once for {engine}")
+            per_engine[engine] = engine_value
+        else:
+            if global_value is not None:
+                raise SystemExit(f"--{option} global value specified more than once")
+            global_value = value
+    return global_value, per_engine
+
+
+def parse_reviewer_token(token: str) -> tuple[str, str | None, str | None]:
+    parts = [part.strip() for part in token.split(":")]
+    if len(parts) > 3 or not parts[0]:
+        raise SystemExit(f"invalid reviewer spec: {token}")
+    engine = parts[0]
+    if engine not in ENGINES:
+        raise SystemExit(f"unknown reviewer engine: {engine}")
+    model = parts[1] if len(parts) >= 2 and parts[1] else None
+    thinking = parts[2] if len(parts) == 3 and parts[2] else None
+    return engine, model, thinking
+
+
+def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
+    global_model, model_by_engine = parse_keyed_options(args.model, "model")
+    global_thinking, thinking_by_engine = parse_keyed_options(args.thinking, "thinking")
+    reviewers: list[tuple[str, str | None, str | None]] = []
+    if args.reviewers:
+        tokens = [token.strip() for token in args.reviewers.split(",") if token.strip()]
+        if not tokens:
+            raise SystemExit("--reviewers must include at least one reviewer")
+        if len(tokens) == 1 and tokens[0] == "all":
+            tokens = list(ENGINES)
+        reviewers = [parse_reviewer_token(token) for token in tokens]
+    elif args.panel:
+        engines = [args.engine]
+        for engine in ("codex", "claude"):
+            if engine not in engines:
+                engines.append(engine)
+        reviewers = [(engine, None, None) for engine in engines]
+    else:
+        reviewers = [(args.engine, None, None)]
+
+    seen: set[str] = set()
+    result: list[argparse.Namespace] = []
+    for engine, inline_model, inline_thinking in reviewers:
+        if engine in seen:
+            raise SystemExit(f"reviewer specified more than once: {engine}")
+        seen.add(engine)
+        model = inline_model or model_by_engine.get(engine) or global_model
+        thinking = inline_thinking or thinking_by_engine.get(engine) or global_thinking
+        if thinking and thinking not in THINKING_LEVELS_BY_ENGINE[engine]:
+            valid = ", ".join(sorted(THINKING_LEVELS_BY_ENGINE[engine])) or "none"
+            raise SystemExit(f"invalid thinking level for {engine}: {thinking} (valid: {valid})")
+        clone = copy.copy(args)
+        clone.engine = engine
+        clone.model = model
+        clone.thinking = thinking
+        if not getattr(args, "tools_explicit", True):
+            clone.tools = engine != "codex"
+        result.append(clone)
+    return result
+
+
+def reviewer_label(args: argparse.Namespace) -> str:
+    parts = [args.engine]
+    if args.model:
+        parts.append(f"model={args.model}")
+    if args.thinking:
+        parts.append(f"thinking={args.thinking}")
+    return " ".join(parts)
+
+
+def build_repair_prompt(raw: str) -> str:
+    return textwrap.dedent(
+        f"""
+        Convert the candidate review below into exactly one JSON object matching this schema.
+        Preserve only actionable findings already present in the candidate. Do not inspect files,
+        run tools, add findings, or wrap the object in Markdown.
+
+        Schema:
+        {json.dumps(SCHEMA, indent=2)}
+
+        Candidate review:
+        {bounded_field(raw, 20_000)}
+        """
+    ).strip()
+
+
+def run_engine_with_transport_retries(
+    args: argparse.Namespace,
+    repo: Path,
+    prompt: str,
+    run_state: ReviewRunState,
+    *,
+    phase: str,
+) -> str:
+    for attempt in range(1, TRANSPORT_ATTEMPTS + 1):
+        run_state.update(
+            status=phase,
+            attempt=attempt,
+            pid=None,
+            error_code=None,
+            error=None,
+            next_attempt=None,
+            retry_phase=None,
+        )
+        try:
+            return run_engine(args, repo, prompt, run_state)
+        except ReviewError as exc:
+            if exc.code == ReviewErrorCode.ENGINE_TRANSPORT_ERROR and attempt < TRANSPORT_ATTEMPTS:
+                delay = 2 ** (attempt - 1)
+                run_state.update(
+                    status="retrying",
+                    pid=None,
+                    error_code=exc.code.value,
+                    error=str(exc),
+                    next_attempt=attempt + 1,
+                    retry_phase=phase,
+                )
+                print(
+                    f"review retry: engine={args.engine} reason={exc.code.value} "
+                    f"attempt={attempt + 1}/{TRANSPORT_ATTEMPTS} delay={delay}s"
+                )
+                time.sleep(delay)
+                continue
+            terminal_status = "timed_out" if exc.code == ReviewErrorCode.ENGINE_TIMEOUT else "failed"
+            run_state.update(
+                status=terminal_status,
+                error_code=exc.code.value,
+                error=str(exc),
+                pid=None,
+                completed_at=utc_now(),
+            )
+            raise
+    raise AssertionError("transport retry loop exhausted without a terminal result")
+
+
+def parse_and_validate_review(
+    raw: str,
+    repo: Path,
+    changed_paths: set[str],
+    required: list[str],
+) -> dict[str, Any]:
+    report = extract_json(raw)
+    try:
+        validate_report(report, repo, changed_paths, required)
+    except SystemExit as exc:
+        if str(exc).startswith("required finding text not found:"):
+            raise
+        raise ReviewError(
+            ReviewErrorCode.ENGINE_SCHEMA_ERROR,
+            "review JSON failed contract validation",
+            detail=str(exc),
+        ) from exc
+    return report
+
+
+def run_reviewer(
+    args: argparse.Namespace,
+    repo: Path,
+    prompt: str,
+    changed_paths: set[str],
+    required: list[str],
+    state_dir: Path,
+) -> dict[str, Any]:
+    bundle_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    run_state = ReviewRunState(state_dir, args.engine, bundle_hash)
+    print(f"review run: {run_state.run_id} state={run_state.path}")
+    try:
+        raw = run_engine_with_transport_retries(args, repo, prompt, run_state, phase="running")
+        try:
+            report = parse_and_validate_review(raw, repo, changed_paths, required)
+        except ReviewError as exc:
+            if exc.code != ReviewErrorCode.ENGINE_SCHEMA_ERROR:
+                raise
+            run_state.update(status="repairing", error_code=exc.code.value, pid=None)
+            repaired = run_engine_with_transport_retries(
+                args,
+                repo,
+                build_repair_prompt(raw),
+                run_state,
+                phase="repairing",
+            )
+            report = parse_and_validate_review(repaired, repo, changed_paths, required)
+        status = "findings" if report["findings"] or report["overall_correctness"] == "patch is incorrect" else "passed"
+        run_state.update(
+            status=status,
+            error_code=None,
+            error=None,
+            pid=None,
+            completed_at=utc_now(),
+            next_attempt=None,
+            retry_phase=None,
+            result=report,
+        )
+        return report
+    except KeyboardInterrupt:
+        run_state.update(status="cancelled", error_code=None, error="review cancelled", pid=None, completed_at=utc_now())
+        raise
+    except SystemExit as exc:
+        run_state.update(status="failed", error_code=None, error=str(exc), pid=None, completed_at=utc_now())
+        raise
+    except ReviewError as exc:
+        terminal_status = "timed_out" if exc.code == ReviewErrorCode.ENGINE_TIMEOUT else "failed"
+        run_state.update(
+            status=terminal_status,
+            error_code=exc.code.value,
+            error=str(exc),
+            pid=None,
+            completed_at=utc_now(),
+        )
+        raise
+    except Exception as exc:
+        run_state.update(
+            status="failed",
+            error_code=ReviewErrorCode.ENGINE_SCHEMA_ERROR.value,
+            error=str(exc),
+            pid=None,
+            completed_at=utc_now(),
+        )
+        raise
+
+
+def merge_panel_reports(reports: list[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
+    findings: list[dict[str, Any]] = []
+    seen: set[tuple[str, int, str, str]] = set()
+    for label, report in reports:
+        for finding in report["findings"]:
+            location = finding["code_location"]
+            key = (
+                location["file_path"],
+                location["line"],
+                finding["category"],
+                " ".join(finding["title"].lower().split()),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged = copy.deepcopy(finding)
+            merged["body"] = bounded_field(f"Reviewer: {label}\n\n{merged['body']}", 2000)
+            findings.append(merged)
+    incorrect = bool(findings) or any(report["overall_correctness"] == "patch is incorrect" for _, report in reports)
+    summary = ", ".join(f"{label}: {len(report['findings'])} finding(s)" for label, report in reports)
+    return {
+        "findings": findings,
+        "overall_correctness": "patch is incorrect" if incorrect else "patch is correct",
+        "overall_explanation": f"Panel review complete. {summary}.",
+        "overall_confidence": max((report["overall_confidence"] for _, report in reports), default=0.5),
+    }
+
+
+def run_panel(
+    args: argparse.Namespace,
+    reviewers: list[argparse.Namespace],
+    repo: Path,
+    prompt: str,
+    changed_paths: set[str],
+    state_dir: Path,
+) -> dict[str, Any]:
+    reports: list[tuple[str, dict[str, Any]]] = []
+    failures: list[str] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(reviewers)) as executor:
+        future_by_label = {
+            executor.submit(run_reviewer, reviewer, repo, prompt, changed_paths, [], state_dir): reviewer_label(reviewer)
+            for reviewer in reviewers
+        }
+        for future in concurrent.futures.as_completed(future_by_label):
+            label = future_by_label[future]
+            try:
+                reports.append((label, future.result()))
+            except (SystemExit, ReviewError) as exc:
+                failures.append(f"{label}: {terminal_safe_text(exc)}")
+            # Preserve opt-in partial-panel reporting even when an engine adapter
+            # raises an unexpected exception; the default path still fails closed.
+            except Exception as exc:  # noqa: BLE001
+                failures.append(f"{label}: {terminal_safe_text(exc)}")
+    if failures and not args.allow_partial_panel:
+        raise ReviewError(
+            ReviewErrorCode.ENGINE_TRANSPORT_ERROR,
+            "autoreview panel did not produce a complete result",
+            detail="\n".join(failures),
+        )
+    if failures:
+        for failure in failures:
+            print(f"panel reviewer failed: {failure}")
+    if not reports:
+        raise ReviewError(ReviewErrorCode.ENGINE_TRANSPORT_ERROR, "autoreview panel produced no reports")
+    reports.sort(key=lambda item: item[0])
+    report = merge_panel_reports(reports)
+    if failures:
+        report["overall_correctness"] = "patch is incorrect"
+        report["overall_explanation"] = bounded_field(
+            f"Panel incomplete: {len(failures)} reviewer(s) failed. "
+            f"Partial reports were preserved but cannot establish a clean review. "
+            f"{report['overall_explanation']}",
+            3000,
+        )
+    try:
+        validate_report(report, repo, changed_paths, args.require_finding)
+    except SystemExit as exc:
+        raise ReviewError(ReviewErrorCode.ENGINE_SCHEMA_ERROR, "panel review failed contract validation", detail=str(exc)) from exc
+    return report
+
+
+def run_review_parts(
+    args: argparse.Namespace,
+    reviewers: list[argparse.Namespace],
+    repo: Path,
+    prompts: list[str],
+    changed_paths: set[str],
+    state_dir: Path,
+) -> dict[str, Any]:
+    reports: list[tuple[str, dict[str, Any]]] = []
+    for index, prompt in enumerate(prompts, start=1):
+        part_label = f"part {index}/{len(prompts)}"
+        if len(reviewers) == 1:
+            required = args.require_finding if len(prompts) == 1 else []
+            report = run_reviewer(reviewers[0], repo, prompt, changed_paths, required, state_dir)
+        else:
+            panel_args = copy.copy(args)
+            if len(prompts) > 1:
+                panel_args.require_finding = []
+            report = run_panel(panel_args, reviewers, repo, prompt, changed_paths, state_dir)
+        reports.append((part_label, report))
+    if len(reports) == 1:
+        return reports[0][1]
+    report = merge_panel_reports(reports)
+    report["overall_explanation"] = bounded_field(
+        f"Multipart review complete across {len(reports)} bounded bundle parts. {report['overall_explanation']}",
+        3000,
+    )
+    try:
+        validate_report(report, repo, changed_paths, args.require_finding)
+    except SystemExit as exc:
+        raise ReviewError(ReviewErrorCode.ENGINE_SCHEMA_ERROR, "multipart review failed contract validation", detail=str(exc)) from exc
+    return report
+
+
+def main() -> int:
+    args = parse_args()
+    repo = repo_root()
+    if args.status_run:
+        return show_run_status(resolve_state_dir(repo, args.state_dir), args.status_run)
+    reviewers = reviewer_args(args)
+    extra_prompt = load_extra_prompt(args)
+    preflight_reviewers = list(reviewers)
+    fallback_reviewer: argparse.Namespace | None = None
+    if args.fallback_engine:
+        if len(reviewers) != 1:
+            raise ReviewError(ReviewErrorCode.UNSUPPORTED_OPTION, "--fallback-engine cannot be combined with a review panel")
+        fallback_reviewer = copy.copy(reviewers[0])
+        fallback_reviewer.engine = args.fallback_engine
+        fallback_reviewer.model = None
+        fallback_reviewer.thinking = None
+        preflight_reviewers.append(fallback_reviewer)
+    allow_missing_engines = {reviewers[0].engine} if fallback_reviewer else set()
+    state_dir = preflight_review(
+        args,
+        preflight_reviewers,
+        repo,
+        extra_prompt,
+        SCHEMA,
+        allow_missing_engines=allow_missing_engines,
+    )
+    primary_executable_missing = bool(
+        fallback_reviewer
+        and not shutil.which(executable_for_engine(reviewers[0], reviewers[0].engine))
+    )
+    target, target_ref = choose_target(repo, args.mode, args.base)
+    if target == "commit":
+        target_ref = resolve_commit_ref(repo, args.commit)
+    print(f"autoreview target: {target}")
+    print(f"branch: {current_branch(repo)}")
+    if len(reviewers) == 1 and not args.reviewers and not args.panel:
+        print(f"engine: {reviewers[0].engine}")
+        if reviewers[0].model:
+            print(f"model: {reviewers[0].model}")
+        if reviewers[0].thinking:
+            print(f"thinking: {reviewers[0].thinking}")
+    else:
+        print(f"reviewers: {', '.join(reviewer_label(reviewer) for reviewer in reviewers)}")
+    print(
+        "reviewer tools: "
+        + ", ".join(
+            f"{reviewer.engine}={'on' if reviewer.tools else 'off'}"
+            for reviewer in reviewers
+        )
+    )
+    print(f"web_search: {'on' if args.web_search else 'off'}")
+    display_ref = target_ref
+    if display_ref:
+        print(f"ref: {display_ref}")
+    if target == "local":
+        bundle = local_bundle(repo)
+    elif target == "branch":
+        assert target_ref
+        if args.fetch:
+            git(repo, "fetch", "origin", "--quiet")
+        target_ref = resolve_commit_ref(repo, target_ref)
+        bundle = branch_bundle(repo, target_ref)
+    else:
+        assert target_ref
+        bundle = commit_bundle(repo, target_ref)
+    bundle_parts = split_bundle(bundle, args.bundle_part_chars)
+    datasets = load_datasets(args)
+    prompts = [
+        build_prompt(
+            repo,
+            target,
+            target_ref,
+            part,
+            extra_prompt,
+            datasets,
+            part_index=index,
+            part_count=len(bundle_parts),
+        )
+        for index, part in enumerate(bundle_parts, start=1)
+    ]
+    changed_paths = review_paths(repo, target, target_ref, target_ref or args.commit)
+    print(f"bundle: {len(bundle)} chars in {len(bundle_parts)} part(s); largest={max(map(len, bundle_parts))}")
+    if args.dry_run:
+        print(f"preflight: passed; changed_paths={len(changed_paths)} prompt_parts={len(prompts)}")
+        return 0
+
+    tests_proc: tuple[subprocess.Popen, float] | None = None
+    if args.parallel_tests:
+        tests_proc = start_parallel_tests(args.parallel_tests, repo)
+    try:
+        if primary_executable_missing:
+            assert fallback_reviewer is not None
+            print(
+                f"review fallback: {reviewers[0].engine} -> {fallback_reviewer.engine} "
+                f"reason={ReviewErrorCode.PREFLIGHT_ERROR.value}"
+            )
+            report = run_review_parts(args, [fallback_reviewer], repo, prompts, changed_paths, state_dir)
+            label = f"autoreview fallback ({fallback_reviewer.engine})"
+        else:
+            try:
+                report = run_review_parts(args, reviewers, repo, prompts, changed_paths, state_dir)
+                label = "autoreview" if len(reviewers) == 1 else "autoreview panel"
+            except ReviewError as exc:
+                if not fallback_reviewer or exc.code not in FALLBACK_ERROR_CODES:
+                    raise
+                print(f"review fallback: {reviewers[0].engine} -> {fallback_reviewer.engine} reason={exc.code.value}")
+                report = run_review_parts(args, [fallback_reviewer], repo, prompts, changed_paths, state_dir)
+                label = f"autoreview fallback ({fallback_reviewer.engine})"
+        if args.json_output:
+            Path(args.json_output).write_text(json.dumps(report, indent=2) + "\n")
+
+        if args.output:
+            original_stdout = sys.stdout
+            with Path(args.output).open("w") as handle:
+                sys.stdout = Tee(original_stdout, handle)
+                print_report(report, label=label)
+                sys.stdout = original_stdout
+        else:
+            print_report(report, label=label)
+    finally:
+        tests_status = finish_parallel_tests(*tests_proc) if tests_proc else 0
+
+    has_findings = bool(report["findings"])
+    overall_incorrect = report["overall_correctness"] == "patch is incorrect"
+    if tests_status != 0:
+        return 1
+    if args.expect_findings:
+        return 0 if has_findings else 1
+    return 1 if has_findings or overall_incorrect else 0
+
+
+class Tee:
+    def __init__(self, *streams: Any) -> None:
+        self.streams = streams
+
+    def write(self, data: str) -> None:
+        for stream in self.streams:
+            stream.write(data)
+
+    def flush(self) -> None:
+        for stream in self.streams:
+            stream.flush()
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except ReviewError as exc:
+        status = "INCOMPLETE" if exc.code == ReviewErrorCode.ENGINE_TIMEOUT else "UNAVAILABLE"
+        print(f"review status: {status} code={exc.code.value}", file=sys.stderr)
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(2)

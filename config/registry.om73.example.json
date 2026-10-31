@@ -1,0 +1,149 @@
+{
+  "connections": [
+    {
+      "connection_id": "018f0000-0000-7000-8000-000000000001",
+      "name": "OM73 Multica",
+      "multica_origin": "https://multica.example.org",
+      "security_mode": "standard",
+      "enabled": false,
+      "hmac_enabled": true
+    }
+  ],
+  "workspaces": [
+    {
+      "workspace_key": "018f0000-0000-7000-8000-000000000011",
+      "connection_id": "018f0000-0000-7000-8000-000000000001",
+      "name": "Пространство 1",
+      "workspace_id": "REPLACE-WORKSPACE-ID-1"
+    },
+    {
+      "workspace_key": "018f0000-0000-7000-8000-000000000012",
+      "connection_id": "018f0000-0000-7000-8000-000000000001",
+      "name": "Пространство 2",
+      "workspace_id": "REPLACE-WORKSPACE-ID-2"
+    },
+    {
+      "workspace_key": "018f0000-0000-7000-8000-000000000013",
+      "connection_id": "018f0000-0000-7000-8000-000000000001",
+      "name": "Пространство 3",
+      "workspace_id": "REPLACE-WORKSPACE-ID-3"
+    },
+    {
+      "workspace_key": "018f0000-0000-7000-8000-000000000014",
+      "connection_id": "018f0000-0000-7000-8000-000000000001",
+      "name": "Пространство 4",
+      "workspace_id": "REPLACE-WORKSPACE-ID-4"
+    }
+  ],
+  "routes": [
+    {
+      "route_id": "018f0000-0000-7000-8000-000000000101",
+      "connection_id": "018f0000-0000-7000-8000-000000000001",
+      "workspace_key": "018f0000-0000-7000-8000-000000000011",
+      "name": "Workspace 1",
+      "route_type": "workspace",
+      "project_id": "REPLACE-PROJECT-ID-1",
+      "enabled": false,
+      "tombstoned": false,
+      "destination_locked": false,
+      "allowed_assignees": ["REPLACE-HUMAN-ASSIGNEE-ID"],
+      "source_platforms": ["max", "telegram"],
+      "allowed_user_ids": ["REPLACE-USER-ID"],
+      "allowed_chat_ids": ["REPLACE-CHAT-ID"],
+      "allow_groups": false,
+      "allowed_statuses": ["todo", "in_progress", "done"],
+      "require_source_attachment": false,
+      "max_attachments": 4,
+      "max_attachment_bytes": 10485760,
+      "allowed_mime_types": ["application/pdf"],
+      "allowed_extensions": [".pdf"],
+      "watcher_enabled": true
+    },
+    {
+      "route_id": "018f0000-0000-7000-8000-000000000102",
+      "connection_id": "018f0000-0000-7000-8000-000000000001",
+      "workspace_key": "018f0000-0000-7000-8000-000000000012",
+      "name": "Workspace 2",
+      "route_type": "workspace",
+      "project_id": "REPLACE-PROJECT-ID-2",
+      "enabled": false,
+      "tombstoned": false,
+      "destination_locked": false,
+      "allowed_assignees": ["REPLACE-HUMAN-ASSIGNEE-ID"],
+      "source_platforms": ["max", "telegram"],
+      "allowed_user_ids": ["REPLACE-USER-ID"],
+      "allowed_chat_ids": ["REPLACE-CHAT-ID"],
+      "allow_groups": false,
+      "allowed_statuses": ["todo", "in_progress", "done"],
+      "require_source_attachment": false,
+      "max_attachments": 4,
+      "max_attachment_bytes": 10485760,
+      "allowed_mime_types": ["application/pdf"],
+      "allowed_extensions": [".pdf"],
+      "watcher_enabled": true
+    },
+    {
+      "route_id": "018f0000-0000-7000-8000-000000000103",
+      "connection_id": "018f0000-0000-7000-8000-000000000001",
+      "workspace_key": "018f0000-0000-7000-8000-000000000013",
+      "name": "Workspace 3",
+      "route_type": "workspace",
+      "project_id": "REPLACE-PROJECT-ID-3",
+      "enabled": false,
+      "tombstoned": false,
+      "destination_locked": false,
+      "allowed_assignees": ["REPLACE-HUMAN-ASSIGNEE-ID"],
+      "source_platforms": ["max", "telegram"],
+      "allowed_user_ids": ["REPLACE-USER-ID"],
+      "allowed_chat_ids": ["REPLACE-CHAT-ID"],
+      "allow_groups": false,
+      "allowed_statuses": ["todo", "in_progress", "done"],
+      "require_source_attachment": false,
+      "max_attachments": 4,
+      "max_attachment_bytes": 10485760,
+      "allowed_mime_types": ["application/pdf"],
+      "allowed_extensions": [".pdf"],
+      "watcher_enabled": true
+    },
+    {
+      "route_id": "018f0000-0000-7000-8000-000000000104",
+      "connection_id": "018f0000-0000-7000-8000-000000000001",
+      "workspace_key": "018f0000-0000-7000-8000-000000000014",
+      "name": "Workspace 4",
+      "route_type": "workspace",
+      "project_id": "REPLACE-PROJECT-ID-4",
+      "enabled": false,
+      "tombstoned": false,
+      "destination_locked": false,
+      "allowed_assignees": ["REPLACE-HUMAN-ASSIGNEE-ID"],
+      "source_platforms": ["max", "telegram"],
+      "allowed_user_ids": ["REPLACE-USER-ID"],
+      "allowed_chat_ids": ["REPLACE-CHAT-ID"],
+      "allow_groups": false,
+      "allowed_statuses": ["todo", "in_progress", "done"],
+      "require_source_attachment": false,
+      "max_attachments": 4,
+      "max_attachment_bytes": 10485760,
+      "allowed_mime_types": ["application/pdf"],
+      "allowed_extensions": [".pdf"],
+      "watcher_enabled": true
+    },
+    {
+      "route_id": "018f0000-0000-7000-8000-000000000199",
+      "connection_id": "018f0000-0000-7000-8000-000000000001",
+      "workspace_key": "018f0000-0000-7000-8000-000000000011",
+      "name": "Autopilot example",
+      "route_type": "autopilot",
+      "autopilot_id": "REPLACE-AUTOPILOT-ID",
+      "trigger_id": "REPLACE-TRIGGER-ID",
+      "event": "hermes.task.dispatched",
+      "enabled": false,
+      "tombstoned": false,
+      "destination_locked": false,
+      "source_boards": ["REPLACE-BOARD"],
+      "allowed_profiles": ["REPLACE-PROFILE"],
+      "allowed_assignees": ["REPLACE-ASSIGNEE"]
+    }
+  ],
+  "operator_grants": []
+}
