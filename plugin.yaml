@@ -3,7 +3,7 @@ version: "0.1.0"
 manifest_version: 2
 api_version: 1
 requires_hermes: ">=0.22.4"
-description: "Мост Hermes ↔ Multica: Autopilot-маршруты Kanban и Workspace-маршруты MAX/Telegram с отдельным watcher."
+description: "Bridge between Hermes and Multica: Kanban Autopilot routes and MAX/Telegram workspace routes with a separate delivery watcher."
 author: Universo
 license: "LicenseRef-Omsk-Open-License-Basic-Attribution"
 kind: standalone
