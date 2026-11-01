@@ -11,9 +11,11 @@
 
 ## Developers
 
-Developed by [Teknokomo](https://universo.pro/) — the international Teknokomo community.
+Developed by [Teknokomo](https://universo.pro/).
 
 Made with the support of the [73rd Meridian Consortium](https://om73.ru).
+
+## Overview
 
 `hermes-multica-bridge` is a Hermes plugin for two Multica workflows: sending the current pinned Kanban task to Autopilot and creating/managing Workspace issues from trusted MAX or Telegram message context.
 
