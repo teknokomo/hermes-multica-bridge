@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import sys
 import tempfile
@@ -10,8 +12,13 @@ from unittest.mock import Mock, patch
 
 from bridge.errors import BridgeError
 from bridge.workspace_state import WorkspaceState
-from bridge.workspace_tools import WorkspaceRuntime
-from tests.test_registry import workspace_registry_payload
+from bridge.workspace_tools import WORKSPACE_TOOLS, WorkspaceRuntime
+from tests.test_registry import (
+    AGENT_UUID,
+    MEMBER_UUID,
+    SQUAD_UUID,
+    workspace_registry_payload,
+)
 
 
 class _Context:
@@ -19,9 +26,14 @@ class _Context:
         self.config = config
         self.profile_name = "om73"
         self.source = source
+        self.posted_messages = []
 
     def get_config(self, key, default=None):
         return self.config.get(key, default)
+
+    def post_message(self, text):
+        self.posted_messages.append(text)
+        return {"ok": True, "message_id": f"notice-{len(self.posted_messages)}"}
 
 
 class _Api:
@@ -30,15 +42,27 @@ class _Api:
         self.comments = []
         self.updates = []
         self.uploads = []
+        self.metadata = {}
+        self.metadata_calls = []
+        self.metadata_error = False
+        self.readback_error = None
+        self.readback_override = None
         self.issue = {"id": "issue-1", "workspace_id": "workspace-1", "project_id": "project-1",
-                      "title": "Task", "description": "", "status": "todo", "revision": 1}
+                      "identifier": "73AN-7", "title": "Task", "description": "", "status": "todo",
+                      "assignee_id": MEMBER_UUID, "assignee_type": "member", "revision": 1}
         self.parent = {"id": "parent-1", "workspace_id": "workspace-1", "project_id": "project-1"}
 
     def create_issue(self, **kwargs):
         self.create_calls.append(kwargs)
+        self.issue.update({key: value for key, value in kwargs.items() if key != "project_id"})
+        self.issue["project_id"] = kwargs["project_id"]
         return dict(self.issue)
 
     def get_issue(self, issue_id):
+        if issue_id != "parent-1" and self.readback_error is not None:
+            raise self.readback_error
+        if issue_id != "parent-1" and self.readback_override is not None:
+            return dict(self.readback_override)
         return self.parent if issue_id == "parent-1" else dict(self.issue)
 
     def list_comments(self, issue_id):
@@ -49,12 +73,30 @@ class _Api:
         return {"id": "comment-1", "content": content, "created_at": "now"}
 
     def update_issue(self, issue_id, updates):
-        self.updates.append((issue_id, updates))
-        return {**self.issue, **updates}
+        normalized = dict(updates)
+        if isinstance(normalized.get("title"), str):
+            normalized["title"] = normalized["title"].strip()
+        self.updates.append((issue_id, normalized))
+        self.issue.update(normalized)
+        return dict(self.issue)
 
     def upload_issue_attachment(self, issue_id, filename, media_type, data):
         self.uploads.append((issue_id, filename, media_type, data))
         return {"id": "attachment-1"}
+
+    def set_issue_metadata(self, issue_id, key, value):
+        self.metadata_calls.append(("set", issue_id, key, value))
+        if self.metadata_error:
+            raise BridgeError("api_unavailable", "metadata unavailable")
+        self.metadata[key] = value
+        return {"metadata": dict(self.metadata)}
+
+    def delete_issue_metadata(self, issue_id, key):
+        self.metadata_calls.append(("delete", issue_id, key))
+        if self.metadata_error:
+            raise BridgeError("api_unavailable", "metadata unavailable")
+        self.metadata.pop(key, None)
+        return {"metadata": dict(self.metadata)}
 
 
 class WorkspaceToolsTests(unittest.TestCase):
@@ -73,8 +115,14 @@ class WorkspaceToolsTests(unittest.TestCase):
         self.api = _Api()
         self.runtime._state = lambda: self.state
         self.runtime._api = lambda registry, route: self.api
+        self.secrets_patcher = patch(
+            "bridge.workspace_tools.standard_route_secrets",
+            return_value=SimpleNamespace(multica_pat="test-profile-multica-pat"),
+        )
+        self.secrets_patcher.start()
 
     def tearDown(self) -> None:
+        self.secrets_patcher.stop()
         self.temp.cleanup()
 
     def _gateway_modules(self, source=None, *, attachments=(), bound=None, env=None):
@@ -228,7 +276,7 @@ class WorkspaceToolsTests(unittest.TestCase):
         self.assertEqual(denied["error_code"], "route_denied")
         self.api.parent["project_id"] = "other-project"
         parent_denied = json.loads(self.runtime.send(
-            {"route_id": self.route_id, "title": "Child", "parent_issue_id": "parent-1", "assignee_id": "member-1"},
+            {"route_id": self.route_id, "title": "Child", "parent_issue_id": "parent-1", "assignee_id": MEMBER_UUID},
             tool_context=self.source,
         ))
         self.assertEqual(parent_denied["error_code"], "route_denied")
@@ -295,12 +343,322 @@ class WorkspaceToolsTests(unittest.TestCase):
         ))
         update = json.loads(self.runtime.update(
             {"route_id": self.route_id, "issue_id": "issue-1", "status": "done",
-             "assignee_id": "member-1"}, tool_context=self.source,
+             "assignee_id": MEMBER_UUID}, tool_context=self.source,
         ))
         self.assertTrue(comment["ok"])
         self.assertEqual(update["issue"]["status"], "done")
         self.assertEqual(self.api.comments, [("issue-1", "hello")])
-        self.assertEqual(self.api.updates[0][1], {"status": "done", "assignee_id": "member-1", "assignee_type": "member"})
+        self.assertEqual(self.api.updates[0][1], {"status": "done", "assignee_id": MEMBER_UUID, "assignee_type": "member"})
+
+    def test_update_title_is_normalized_before_readback_comparison(self) -> None:
+        result = json.loads(self.runtime.update(
+            {"route_id": self.route_id, "issue_id": "issue-1", "title": "  New title  "},
+            tool_context=self.source,
+        ))
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["issue"]["title"], "New title")
+        self.assertEqual(self.api.updates[-1][1], {"title": "New title"})
+
+    def test_create_resolves_explicit_default_and_typed_assignments(self) -> None:
+        for assignee_id, assignee_type in (
+            (MEMBER_UUID, "member"), (AGENT_UUID, "agent"), (SQUAD_UUID, "squad"),
+        ):
+            with self.subTest(assignee_type=assignee_type):
+                self.state = WorkspaceState(Path(self.temp.name) / assignee_type / "workspace.sqlite3")
+                self.runtime._state = lambda: self.state
+                self.api = _Api()
+                self.runtime._api = lambda registry, route: self.api
+                source = SimpleNamespace(**{**vars(self.source), "message_id": f"message-{assignee_type}"})
+                result = json.loads(self.runtime.send(
+                    {"route_id": self.route_id, "title": "Task",
+                     "assignee_id": assignee_id, "assignee_type": assignee_type},
+                    tool_context=source,
+                ))
+                self.assertTrue(result["ok"])
+                self.assertEqual(self.api.create_calls[0]["assignee_id"], assignee_id)
+                self.assertEqual(self.api.create_calls[0]["assignee_type"], assignee_type)
+                self.assertEqual(result["issue"]["assignee_type"], assignee_type)
+
+    def test_assignee_id_inference_and_ambiguity_fail_closed(self) -> None:
+        result = json.loads(self.runtime.send(
+            {"route_id": self.route_id, "title": "Task", "assignee_id": MEMBER_UUID},
+            tool_context=self.source,
+        ))
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.api.create_calls[0]["assignee_type"], "member")
+
+        payload = copy.deepcopy(self.payload)
+        payload["routes"][0]["allowed_assignees"].append({"id": MEMBER_UUID, "type": "agent"})
+        payload["routes"][0]["default_assignee"] = {"id": MEMBER_UUID, "type": "member"}
+        self.ctx.config["registry"] = payload
+        self.state = WorkspaceState(Path(self.temp.name) / "ambiguous" / "workspace.sqlite3")
+        self.runtime._state = lambda: self.state
+        self.api = _Api()
+        self.runtime._api = lambda registry, route: self.api
+        result = json.loads(self.runtime.send(
+            {"route_id": self.route_id, "title": "Task", "assignee_id": MEMBER_UUID},
+            tool_context=self.source,
+        ))
+        self.assertEqual(result["error_code"], "assignee_type_required")
+        self.assertEqual(self.api.create_calls, [])
+
+    def test_same_assignee_id_resolves_only_with_explicit_type_when_ambiguous(self) -> None:
+        payload = copy.deepcopy(self.payload)
+        payload["routes"][0]["allowed_assignees"].append({"id": MEMBER_UUID, "type": "agent"})
+        self.ctx.config["registry"] = payload
+        self.state = WorkspaceState(Path(self.temp.name) / "typed-duplicate" / "workspace.sqlite3")
+        self.runtime._state = lambda: self.state
+        self.api = _Api()
+        self.runtime._api = lambda registry, route: self.api
+        result = json.loads(self.runtime.send(
+            {"route_id": self.route_id, "title": "Task", "assignee_id": MEMBER_UUID, "assignee_type": "agent"},
+            tool_context=self.source,
+        ))
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.api.create_calls[0]["assignee_type"], "agent")
+
+    def test_missing_or_disallowed_assignee_fails_before_post(self) -> None:
+        payload = copy.deepcopy(self.payload)
+        payload["routes"][0]["default_assignee"] = None
+        self.ctx.config["registry"] = payload
+        missing = json.loads(self.runtime.send(
+            {"route_id": self.route_id, "title": "Task"}, tool_context=self.source,
+        ))
+        denied = json.loads(self.runtime.send(
+            {"route_id": self.route_id, "title": "Task", "assignee_id": "00000000-0000-4000-8000-000000000099",
+             "assignee_type": "member"}, tool_context=self.source,
+        ))
+        self.assertEqual(missing["error_code"], "assignee_required")
+        self.assertEqual(denied["error_code"], "assignee_not_allowed")
+        self.assertEqual(self.api.create_calls, [])
+
+    def test_accepted_post_with_failed_readback_never_posts_twice(self) -> None:
+        self.api.readback_error = BridgeError("api_unavailable", "readback offline", retryable=True)
+        first = json.loads(self.runtime.send(
+            {"route_id": self.route_id, "title": "Task"}, tool_context=self.source,
+        ))
+        self.assertEqual(first["error_code"], "assignee_verification_failed")
+        self.assertEqual(first["issue_id"], "issue-1")
+        self.assertEqual(len(self.api.create_calls), 1)
+
+        self.api.readback_error = None
+        second = json.loads(self.runtime.send(
+            {"route_id": self.route_id, "title": "Task"}, tool_context=self.source,
+        ))
+        self.assertTrue(second["ok"])
+        self.assertEqual(len(self.api.create_calls), 1)
+
+    def test_assignment_readback_mismatch_is_recoverable_by_get_only(self) -> None:
+        self.api.readback_override = {**self.api.issue, "assignee_type": "agent"}
+        first = json.loads(self.runtime.send(
+            {"route_id": self.route_id, "title": "Task", "assignee_id": MEMBER_UUID, "assignee_type": "member"},
+            tool_context=self.source,
+        ))
+        self.assertEqual(first["error_code"], "assignee_verification_failed")
+        self.api.readback_override = None
+        second = json.loads(self.runtime.send(
+            {"route_id": self.route_id, "title": "Task", "assignee_id": MEMBER_UUID, "assignee_type": "member"},
+            tool_context=self.source,
+        ))
+        self.assertTrue(second["ok"])
+        self.assertEqual(len(self.api.create_calls), 1)
+
+    def test_unassigned_creation_is_not_successful_and_notice_is_attempted_once(self) -> None:
+        payload = copy.deepcopy(self.payload)
+        payload["routes"][0]["default_assignee"] = None
+        self.ctx.config["registry"] = payload
+        args = {"route_id": self.route_id, "title": "Unassigned", "allow_unassigned": True}
+        first = json.loads(self.runtime.send(args, tool_context=self.source))
+        second = json.loads(self.runtime.send(args, tool_context=self.source))
+        self.assertFalse(first["ok"])
+        self.assertEqual(first["error_code"], "assignee_required")
+        self.assertEqual(first["issue_id"], "issue-1")
+        self.assertEqual(first["notification_status"], "delivered")
+        self.assertFalse(second["ok"])
+        self.assertEqual(len(self.api.create_calls), 1)
+        self.assertEqual(len(self.ctx.posted_messages), 1)
+        self.assertIn("73AN-7", self.ctx.posted_messages[0])
+
+    def test_unassigned_notice_unknown_is_terminal(self) -> None:
+        payload = copy.deepcopy(self.payload)
+        payload["routes"][0]["default_assignee"] = None
+        self.ctx.config["registry"] = payload
+        self.ctx.post_message = Mock(return_value={"ok": False, "error": "timeout"})
+        args = {"route_id": self.route_id, "title": "Unassigned", "allow_unassigned": True}
+        first = json.loads(self.runtime.send(args, tool_context=self.source))
+        second = json.loads(self.runtime.send(args, tool_context=self.source))
+        self.assertEqual(first["notification_status"], "delivery_unknown")
+        self.assertEqual(second["notification_status"], "delivery_unknown")
+        self.ctx.post_message.assert_called_once()
+
+    def test_unassigned_creation_requires_public_post_message_before_multica_write(self) -> None:
+        payload = copy.deepcopy(self.payload)
+        payload["routes"][0]["default_assignee"] = None
+        ctx = SimpleNamespace(get_config=lambda key, default=None: {"registry": payload}.get(key, default),
+                              profile_name="om73")
+        runtime = WorkspaceRuntime(ctx)
+        runtime._state = lambda: self.state
+        runtime._api = lambda registry, route: self.api
+        result = json.loads(runtime.send(
+            {"route_id": self.route_id, "title": "Task", "allow_unassigned": True},
+            tool_context=self.source,
+        ))
+        self.assertEqual(result["error_code"], "notification_unavailable")
+        self.assertEqual(self.api.create_calls, [])
+
+    def test_related_issue_metadata_is_compact_and_validated_before_post(self) -> None:
+        related = ["73AN-8", "73FIN-3"]
+        result = json.loads(self.runtime.send(
+            {"route_id": self.route_id, "title": "Task", "related_issue_ids": related},
+            tool_context=self.source,
+        ))
+        self.assertTrue(result["ok"])
+        self.assertIn(("set", "issue-1", "related_issue_ids", '["73AN-8","73FIN-3"]'), self.api.metadata_calls)
+
+        self.api = _Api()
+        self.runtime._api = lambda registry, route: self.api
+        invalid = json.loads(self.runtime.send(
+            {"route_id": self.route_id, "title": "Task", "related_issue_ids": ["73AN-8", "73AN-8"]},
+            tool_context=SimpleNamespace(**{**vars(self.source), "message_id": "duplicate-message"}),
+        ))
+        self.assertEqual(invalid["error_code"], "invalid_arguments")
+        self.assertEqual(self.api.create_calls, [])
+
+    def test_test_route_metadata_is_pseudonymous_and_metadata_failure_warns_once(self) -> None:
+        payload = copy.deepcopy(self.payload)
+        payload["routes"][0]["test"] = True
+        self.ctx.config["registry"] = payload
+        self.api.metadata_error = True
+        result = json.loads(self.runtime.send(
+            {"route_id": self.route_id, "title": "Task"}, tool_context=self.source,
+        ))
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["warnings"], ["metadata_incomplete"])
+        metadata_values = json.dumps(self.api.metadata)
+        self.assertNotIn("user-1", metadata_values)
+        self.assertNotIn("chat-1", metadata_values)
+        self.assertNotIn("message-1", metadata_values)
+        self.assertIn(("set", "issue-1", "origin_test", True), self.api.metadata_calls)
+        self.assertEqual(self.api.metadata, {})
+        self.assertFalse(any("user-1" in str(call) for call in self.api.metadata_calls))
+
+    def test_successful_metadata_contains_hashes_and_expected_origin_fields(self) -> None:
+        payload = copy.deepcopy(self.payload)
+        payload["routes"][0]["test"] = True
+        self.ctx.config["registry"] = payload
+        result = json.loads(self.runtime.send(
+            {"route_id": self.route_id, "title": "Task"}, tool_context=self.source,
+        ))
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.api.metadata["origin"], "telegram")
+        self.assertEqual(self.api.metadata["origin_route"], self.route_id)
+        self.assertEqual(self.api.metadata["created_by"], "hermes-multica-bridge")
+        self.assertEqual(self.api.metadata["origin_test"], True)
+        self.assertRegex(self.api.metadata["requester"], r"^[0-9a-f]{64}$")
+        self.assertRegex(self.api.metadata["source_message_id"], r"^[0-9a-f]{64}$")
+        plain_requester = hashlib.sha256(
+            json.dumps(
+                {"platform": "telegram", "user_id": "user-1", "route_id": self.route_id},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        self.assertNotEqual(self.api.metadata["requester"], plain_requester)
+        serialized = json.dumps(self.api.metadata)
+        for raw in ("user-1", "chat-1", "message-1"):
+            self.assertNotIn(raw, serialized)
+
+    def test_update_supports_agent_squad_type_change_and_null_pair(self) -> None:
+        agent_update = json.loads(self.runtime.update(
+            {"route_id": self.route_id, "issue_id": "issue-1", "assignee_id": AGENT_UUID, "assignee_type": "agent"},
+            tool_context=self.source,
+        ))
+        self.assertTrue(agent_update["ok"])
+        self.assertEqual(self.api.updates[-1][1], {"assignee_id": AGENT_UUID, "assignee_type": "agent"})
+
+        squad_update = json.loads(self.runtime.update(
+            {"route_id": self.route_id, "issue_id": "issue-1", "assignee_id": SQUAD_UUID, "assignee_type": "squad"},
+            tool_context=SimpleNamespace(**{**vars(self.source), "message_id": "squad-update"}),
+        ))
+        self.assertTrue(squad_update["ok"])
+        self.assertEqual(self.api.updates[-1][1], {"assignee_id": SQUAD_UUID, "assignee_type": "squad"})
+
+        payload = copy.deepcopy(self.payload)
+        payload["routes"][0]["require_assignee"] = False
+        self.ctx.config["registry"] = payload
+        unassigned = json.loads(self.runtime.update(
+            {"route_id": self.route_id, "issue_id": "issue-1", "assignee_id": None},
+            tool_context=SimpleNamespace(**{**vars(self.source), "message_id": "unassign-message"}),
+        ))
+        self.assertTrue(unassigned["ok"])
+        self.assertEqual(self.api.updates[-1][1], {"assignee_id": None, "assignee_type": None})
+
+    def test_confirmed_update_with_failed_readback_retries_only_get(self) -> None:
+        get_issue = self.api.get_issue
+        self.api.get_issue = Mock(side_effect=[
+            dict(self.api.issue),
+            BridgeError("api_unavailable", "readback offline", retryable=True),
+        ])
+        args = {"route_id": self.route_id, "issue_id": "issue-1", "status": "done"}
+        first = json.loads(self.runtime.update(args, tool_context=self.source))
+        self.assertEqual(first["error_code"], "assignee_verification_failed")
+        self.assertEqual(len(self.api.updates), 1)
+        self.api.get_issue = get_issue
+        second = json.loads(self.runtime.update(args, tool_context=self.source))
+        self.assertTrue(second["ok"])
+        self.assertEqual(len(self.api.updates), 1)
+
+    def test_assignment_change_changes_operation_hash(self) -> None:
+        first = json.loads(self.runtime.send(
+            {"route_id": self.route_id, "title": "Task", "assignee_id": MEMBER_UUID, "assignee_type": "member"},
+            tool_context=self.source,
+        ))
+        second = json.loads(self.runtime.send(
+            {"route_id": self.route_id, "title": "Task", "assignee_id": AGENT_UUID, "assignee_type": "agent"},
+            tool_context=self.source,
+        ))
+        self.assertTrue(first["ok"])
+        self.assertEqual(second["error_code"], "operation_conflict")
+        self.assertEqual(len(self.api.create_calls), 1)
+
+    def test_default_assignee_change_conflicts_with_an_accepted_operation(self) -> None:
+        first = json.loads(self.runtime.send(
+            {"route_id": self.route_id, "title": "Task"}, tool_context=self.source,
+        ))
+        self.assertTrue(first["ok"])
+        payload = copy.deepcopy(self.payload)
+        payload["routes"][0]["default_assignee"] = {"id": AGENT_UUID, "type": "agent"}
+        self.ctx.config["registry"] = payload
+        second = json.loads(self.runtime.send(
+            {"route_id": self.route_id, "title": "Task"}, tool_context=self.source,
+        ))
+        self.assertEqual(second["error_code"], "operation_conflict")
+        self.assertEqual(len(self.api.create_calls), 1)
+
+    def test_related_issue_identifier_limit_accepts_16_and_rejects_17_before_post(self) -> None:
+        accepted = [f"73AN-{index}" for index in range(16)]
+        result = json.loads(self.runtime.send(
+            {"route_id": self.route_id, "title": "Task", "related_issue_ids": accepted},
+            tool_context=self.source,
+        ))
+        self.assertTrue(result["ok"])
+        self.assertIn(("set", "issue-1", "related_issue_ids", json.dumps(accepted, separators=(",", ":"))),
+                      self.api.metadata_calls)
+
+        self.api = _Api()
+        self.runtime._api = lambda registry, route: self.api
+        rejected = json.loads(self.runtime.send(
+            {"route_id": self.route_id, "title": "Task", "related_issue_ids": accepted + ["73AN-16"]},
+            tool_context=SimpleNamespace(**{**vars(self.source), "message_id": "too-many-related"}),
+        ))
+        self.assertEqual(rejected["error_code"], "invalid_arguments")
+        self.assertEqual(self.api.create_calls, [])
+
+    def test_tool_schemas_expose_typed_assignment_and_related_issue_fields(self) -> None:
+        schemas = {name: properties for name, _, properties, _, _ in WORKSPACE_TOOLS}
+        self.assertEqual(schemas["multica_workspace_send"]["assignee_type"]["enum"], ["member", "agent", "squad"])
+        self.assertEqual(schemas["multica_workspace_send"]["related_issue_ids"]["maxItems"], 16)
+        self.assertEqual(schemas["multica_workspace_update"]["assignee_id"]["type"], ["string", "null"])
 
 
 if __name__ == "__main__":

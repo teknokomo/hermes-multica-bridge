@@ -222,6 +222,21 @@ def _route_status(registry: ConnectionRegistry, route: RegistryRoute) -> dict[st
             "tombstoned": route.tombstoned,
             "security_mode": effective_config.security_mode,
             "project_id": route.project_id,
+            "assignees": [
+                {
+                    "id": item.id,
+                    "type": item.type,
+                    "label": item.label,
+                    "default": bool(
+                        route.default_assignee
+                        and (route.default_assignee.id, route.default_assignee.type) == (item.id, item.type)
+                    ),
+                }
+                for item in route.workspace_assignees
+            ],
+            "require_assignee": route.require_assignee,
+            "test": route.test,
+            "warnings": list(route.config_warnings),
             "watcher_ready": watcher_ready,
             "readiness_errors": readiness,
             "secrets": secrets,
@@ -247,6 +262,7 @@ def _route_status(registry: ConnectionRegistry, route: RegistryRoute) -> dict[st
         "enabled": effective_config.enabled,
         "tombstoned": route.tombstoned,
         "security_mode": effective_config.security_mode,
+        "warnings": list(route.config_warnings),
         "readiness_errors": readiness,
         "secrets": secrets,
         "isolated_socket_path": effective_config.socket_path if effective_config.security_mode == "isolated" else None,

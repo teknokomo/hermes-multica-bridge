@@ -1,9 +1,9 @@
 <!-- ontoindex:start -->
 # OntoIndex — Code Intelligence
 
-This project is indexed by OntoIndex as **hermes-multica-bridge** (2917 symbols, 6695 relationships, 251 execution flows). Use the OntoIndex MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by OntoIndex as **hermes-multica-bridge** (4275 symbols, 10151 relationships, 300 execution flows). Use the OntoIndex MCP tools to understand code, assess impact, and navigate safely.
 
-> The graph index is commit-based. If any OntoIndex tool warns the index is stale, or current HEAD differs from the indexed commit, coordinate first; exactly one process must run `ontoindex analyze` before graph-backed claims. Never silently assume dirty or uncommitted worktree changes are represented in the graph — verify current source or the diff for those changes.
+> Always query OntoIndex first. Repo queries refresh stale indexes in the background; dirty edits use the automatic overlay. Use stale/refreshing results with freshness labels; verify edited or new code from source. Never fall back to grep-only because the index is stale. Manual `ontoindex analyze` is only for immediate refresh with no active job. Sub-agents never start reindex jobs; refresh-on-query covers them.
 
 ## Always Do
 
@@ -12,14 +12,14 @@ Use OntoIndex in this order:
 1. **Explore/search** — MCP `search({action: "semantic", repo: "hermes-multica-bridge", query: "concept"})` to find execution flows instead of grepping.
 2. **Inspect context** — MCP `inspect({action: "context", repo: "hermes-multica-bridge", target: "symbolName"})` for a symbol's callers, callees, and execution flows.
 3. **Impact before edits** — MCP `impact({action: "symbol", repo: "hermes-multica-bridge", target: "symbolName", direction: "upstream"})` or CLI `ontoindex impact --repo hermes-multica-bridge <symbol>`; report the blast radius and MUST warn on HIGH or CRITICAL risk before editing.
-4. **gn_verify_diff before commit** — MCP `gn_verify_diff({repo: "hermes-multica-bridge", scope: "all"})` or CLI `ontoindex detect-changes --repo hermes-multica-bridge` to confirm only expected symbols and execution flows changed.
+4. **Verify scope before commit** — MCP `audit({action: "verify_diff", repo: "hermes-multica-bridge", scope: "all"})` or CLI `ontoindex detect-changes --repo hermes-multica-bridge` to confirm only expected symbols and execution flows changed.
 
 ## Never Do
 
 - NEVER edit a function, class, or method without first running MCP `impact` or CLI `ontoindex impact` on it.
 - NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
 - NEVER rename symbols with find-and-replace — use MCP `refactor({action: "rename", ...})` which understands the call graph.
-- NEVER commit changes without running MCP `gn_verify_diff` or CLI `ontoindex detect-changes` to check affected scope.
+- NEVER commit changes without step 4 verification.
 
 ## Resources
 

@@ -36,6 +36,7 @@ Bridge соединяет доверенный контекст Hermes Kanban с
 - Workspace route всегда требует настроенные `workspace_id` и `project_id`; каждый читаемый или изменяемый issue проверяется по обоим ID. Parent issue подзадачи проверяется по той же паре.
 - Assignee и status ограничены route allowlist. Создание подзадачи требует разрешённого человеческого assignee. Инструмент не приглашает пользователей и не изменяет доступ к пространствам.
 - Workspace доступен только в Standard с профильным PAT. Профильные записи, инструменты и локальный ledger не читают прежние development-конфиги или state stores.
+- `requester` и `source_message_id` в Multica metadata являются HMAC-SHA-256 pseudonym с domain-separated ключом, производным от профильного PAT маршрута; raw user/chat/message ID в metadata не записываются.
 - Каждая операция записи привязана к профилю, маршруту, источнику и типу операции. Повтор подтверждённой операции возвращает сохранённый ответ; изменённый payload для той же source operation отклоняется. Только ответ, доказывающий отказ до принятия, допускает новую попытку. Transport/5xx/невалидный ответ фиксируется как `operation_unknown`, POST не повторяется автоматически.
 
 ## Вложения текущего сообщения
@@ -67,7 +68,7 @@ Bridge не читает `.env` напрямую и не создаёт собс
 
 Isolated предназначен для случая, когда plugin process не должен иметь доступ к Multica secrets.
 
-Isolated 0.1.0 требует Linux **6.5+** с `SO_PEERPIDFD` и unified **cgroup v2**. `SO_PEERPIDFD` закрепляет worker process, а отдельный `pidfd_open()` закрепляет его непосредственного Gateway parent на время проверки; после чтения cgroup sender повторно сверяет PPID worker и liveness parent. При невозможности получить pidfd или подтвердить прежнюю связь sender fail closed. Sender также проверяет наличие v2 controller root и fail closed на cgroup v1/hybrid layout, потому что авторизация корневого процесса worker scope опирается на единый `cgroup.procs` путь.
+Isolated mode требует Linux **6.5+** с `SO_PEERPIDFD` и unified **cgroup v2**. `SO_PEERPIDFD` закрепляет worker process, а отдельный `pidfd_open()` закрепляет его непосредственного Gateway parent на время проверки; после чтения cgroup sender повторно сверяет PPID worker и liveness parent. При невозможности получить pidfd или подтвердить прежнюю связь sender fail closed. Sender также проверяет наличие v2 controller root и fail closed на cgroup v1/hybrid layout, потому что авторизация корневого процесса worker scope опирается на единый `cgroup.procs` путь.
 
 Sender использует:
 
@@ -191,7 +192,7 @@ Profile/generation guards отбрасывают stale status/save/credential re
 
 ## Lifecycle конфигурации
 
-Номер версии остаётся 0.1.0. Текущий Registry и пустые state stores создаются для этой архитектуры; неизвестные поля и несовместимые SQLite schema отклоняются без migration path или внутреннего API version field.
+Версия продукта — 0.2.0. Registry и пустые state stores создаются для текущей архитектуры; неизвестные поля и несовместимые SQLite schema отклоняются без migration path или внутренних версий API/state.
 
 Переход Standard ↔ Isolated не переносит секреты автоматически. Новый Route/режим включается только после отдельной readiness-проверки. Ledger сохраняет immutable delivery snapshot, поэтому rename/disable/tombstone текущего Route не меняет destination уже созданной delivery.
 

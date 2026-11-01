@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import math
 import re
 import secrets
 import ssl
@@ -31,7 +32,13 @@ MAX_WRITE_BODY_BYTES = MAX_ATTACHMENT_BYTES + 262_144
 MAX_COMMENT_CHARS = 16_000
 MAX_TITLE_CHARS = 4_096
 MAX_DESCRIPTION_CHARS = 65_536
+MAX_METADATA_KEYS = 50
+MAX_METADATA_BYTES = 8_192
+MAX_METADATA_VALUE_CHARS = 1_024
 _ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_METADATA_KEY_RE = re.compile(r"\A[a-z][a-z0-9_.-]{0,63}\Z")
+_UPSTREAM_METADATA_KEY_RE = re.compile(r"\A[a-zA-Z_][a-zA-Z0-9_.-]{0,63}\Z")
+_ASSIGNEE_TYPES = frozenset({"member", "agent", "squad"})
 
 
 class WorkspaceApiFailure(BridgeError):
@@ -68,6 +75,45 @@ def _json_object(raw: bytes, *, expected: str) -> dict[str, Any]:
     return value
 
 
+def _metadata_key(value: Any) -> str:
+    if not isinstance(value, str) or not _METADATA_KEY_RE.fullmatch(value):
+        raise BridgeError("invalid_arguments", "Metadata key is invalid.")
+    return value
+
+
+def _metadata_primitive(value: Any) -> str | int | float | bool:
+    if isinstance(value, str):
+        if len(value) > MAX_METADATA_VALUE_CHARS:
+            raise BridgeError("invalid_arguments", "Metadata value is too long.")
+        return value
+    if type(value) is bool or type(value) is int:
+        return value
+    if type(value) is float and math.isfinite(value):
+        return value
+    raise BridgeError("invalid_arguments", "Metadata values must be strings, numbers, or booleans.")
+
+
+def _metadata_response(raw: bytes) -> dict[str, Any]:
+    try:
+        response = strict_json_loads(raw)
+    except (ValueError, json.JSONDecodeError):
+        raise WorkspaceApiFailure("invalid_api_response", "Multica returned invalid issue metadata.", outcome="unknown") from None
+    metadata = response.get("metadata") if isinstance(response, dict) else None
+    if not isinstance(metadata, dict) or len(metadata) > MAX_METADATA_KEYS:
+        raise WorkspaceApiFailure("invalid_api_response", "Multica returned invalid issue metadata.", outcome="unknown")
+    try:
+        for key, value in metadata.items():
+            if not isinstance(key, str) or not _UPSTREAM_METADATA_KEY_RE.fullmatch(key):
+                raise ValueError("invalid upstream metadata key")
+            _metadata_primitive(value)
+        encoded = json.dumps(metadata, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    except (BridgeError, TypeError, ValueError):
+        raise WorkspaceApiFailure("invalid_api_response", "Multica returned invalid issue metadata.", outcome="unknown") from None
+    if len(encoded) > MAX_METADATA_BYTES:
+        raise WorkspaceApiFailure("invalid_api_response", "Multica returned oversized issue metadata.", outcome="unknown")
+    return metadata
+
+
 class WorkspaceApiClient:
     """No redirect following, no proxy inheritance, bounded bodies, and no write retries."""
 
@@ -100,9 +146,9 @@ class WorkspaceApiClient:
             "Accept": "application/json",
             "Authorization": f"Bearer {self._pat}",
             "X-Workspace-ID": self.workspace_id,
-            "User-Agent": "hermes-multica-bridge/0.1.0",
+            "User-Agent": "hermes-multica-bridge/0.2.0",
             "X-Client-Platform": "daemon",
-            "X-Client-Version": "0.1.0",
+            "X-Client-Version": "0.2.0",
         }
         if body is not None:
             headers["Content-Type"] = content_type
@@ -189,7 +235,8 @@ class WorkspaceApiClient:
         return result
 
     def create_issue(self, *, title: str, description: str, project_id: str, status: str,
-                     parent_issue_id: str | None = None, assignee_id: str | None = None) -> dict[str, Any]:
+                     parent_issue_id: str | None = None, assignee_id: str | None = None,
+                     assignee_type: str | None = None) -> dict[str, Any]:
         if not isinstance(title, str) or not title.strip() or len(title) > MAX_TITLE_CHARS:
             raise BridgeError("invalid_arguments", "Issue title is empty or too long.")
         if not isinstance(description, str) or len(description) > MAX_DESCRIPTION_CHARS:
@@ -201,8 +248,12 @@ class WorkspaceApiClient:
         }
         if parent_issue_id:
             payload["parent_issue_id"] = _identifier(parent_issue_id, "parent_issue_id")
-        if assignee_id:
-            payload.update(assignee_type="member", assignee_id=_identifier(assignee_id, "assignee_id"))
+        if (assignee_id is None) != (assignee_type is None):
+            raise BridgeError("invalid_arguments", "assignee_id and assignee_type must be provided together.")
+        if assignee_id is not None:
+            if not isinstance(assignee_type, str) or assignee_type not in _ASSIGNEE_TYPES:
+                raise BridgeError("invalid_arguments", "assignee_type must be member, agent, or squad.")
+            payload.update(assignee_type=assignee_type, assignee_id=_identifier(assignee_id, "assignee_id"))
         result = self._request("POST", "/api/issues", body=json.dumps(payload, ensure_ascii=False).encode(), write=True, expected="issue")
         if not isinstance(result, dict):
             raise BridgeError("invalid_api_response", "Multica returned an invalid issue response.")
@@ -255,10 +306,19 @@ class WorkspaceApiClient:
             raise BridgeError("invalid_arguments", "Issue description is too long.")
         if "status" in clean_updates:
             clean_updates["status"] = _identifier(clean_updates["status"], "status")
-        if "assignee_id" in clean_updates:
+        if "assignee_id" in clean_updates and clean_updates["assignee_id"] is not None:
             clean_updates["assignee_id"] = _identifier(clean_updates["assignee_id"], "assignee_id")
-        if "assignee_type" in clean_updates and clean_updates["assignee_type"] != "member":
-            raise BridgeError("invalid_arguments", "Only human member assignees are supported.")
+        if ("assignee_type" in clean_updates and clean_updates["assignee_type"] is not None
+                and clean_updates["assignee_type"] not in _ASSIGNEE_TYPES):
+            raise BridgeError("invalid_arguments", "assignee_type must be member, agent, or squad.")
+        has_id = "assignee_id" in clean_updates
+        has_type = "assignee_type" in clean_updates
+        if ((has_id and clean_updates["assignee_id"] is None)
+                or (has_type and clean_updates["assignee_type"] is None)) and not (
+                    has_id and has_type and clean_updates["assignee_id"] is None
+                    and clean_updates["assignee_type"] is None
+                ):
+            raise BridgeError("invalid_arguments", "Removing an assignee requires null assignee_id and assignee_type.")
         result = self._request(
             "PUT", f"/api/issues/{urllib.parse.quote(issue_id, safe='')}",
             body=json.dumps(clean_updates, ensure_ascii=False).encode(), write=True, expected="issue",
@@ -266,6 +326,59 @@ class WorkspaceApiClient:
         if not isinstance(result, dict):
             raise BridgeError("invalid_api_response", "Multica returned an invalid issue response.")
         return result
+
+    def list_issue_metadata(self, issue_id: str) -> dict[str, Any]:
+        issue_id = _identifier(issue_id, "issue_id")
+        raw = self._request("GET", f"/api/issues/{urllib.parse.quote(issue_id, safe='')}/metadata")
+        if not isinstance(raw, bytes):
+            raise BridgeError("invalid_api_response", "Multica returned invalid issue metadata.")
+        return _metadata_response(raw)
+
+    def get_issue_metadata(self, issue_id: str, key: str) -> Any | None:
+        return self.list_issue_metadata(issue_id).get(_metadata_key(key))
+
+    def set_issue_metadata(self, issue_id: str, key: str, value: Any) -> dict[str, Any]:
+        issue_id = _identifier(issue_id, "issue_id")
+        key = _metadata_key(key)
+        clean_value = _metadata_primitive(value)
+        current = self.list_issue_metadata(issue_id)
+        if key not in current and len(current) >= MAX_METADATA_KEYS:
+            raise BridgeError("metadata_limit", "Multica issue metadata reached the key limit.")
+        candidate = {**current, key: clean_value}
+        try:
+            encoded = json.dumps(candidate, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+            body = json.dumps({"value": clean_value}, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        except (TypeError, ValueError):
+            raise BridgeError("invalid_arguments", "Metadata value cannot be encoded safely.") from None
+        if len(encoded) > MAX_METADATA_BYTES:
+            raise BridgeError("metadata_limit", "Multica issue metadata would exceed the 8 KB limit.")
+        raw = self._request(
+            "PUT", f"/api/issues/{urllib.parse.quote(issue_id, safe='')}/metadata/{urllib.parse.quote(key, safe='')}",
+            body=body, write=True,
+        )
+        if not isinstance(raw, bytes):
+            raise WorkspaceApiFailure("invalid_api_response", "Multica returned invalid issue metadata.", outcome="unknown")
+        metadata = _metadata_response(raw)
+        if metadata.get(key) != clean_value:
+            raise WorkspaceApiFailure("operation_unknown", "Multica did not confirm the metadata value.", outcome="unknown")
+        return metadata
+
+    def delete_issue_metadata(self, issue_id: str, key: str) -> dict[str, Any]:
+        issue_id = _identifier(issue_id, "issue_id")
+        key = _metadata_key(key)
+        current = self.list_issue_metadata(issue_id)
+        if key not in current:
+            return current
+        raw = self._request(
+            "DELETE", f"/api/issues/{urllib.parse.quote(issue_id, safe='')}/metadata/{urllib.parse.quote(key, safe='')}",
+            write=True,
+        )
+        if not isinstance(raw, bytes):
+            raise WorkspaceApiFailure("invalid_api_response", "Multica returned invalid issue metadata.", outcome="unknown")
+        metadata = _metadata_response(raw)
+        if key in metadata:
+            raise WorkspaceApiFailure("operation_unknown", "Multica did not confirm metadata deletion.", outcome="unknown")
+        return metadata
 
     def upload_issue_attachment(self, issue_id: str, filename: str, media_type: str, data: bytes) -> dict[str, Any]:
         issue_id = _identifier(issue_id, "issue_id")

@@ -430,6 +430,21 @@ class PluginRuntime:
                         "project_id": route.project_id,
                         "platforms": list(route.source_platforms),
                         "watcher_enabled": route.watcher_enabled,
+                        "assignees": [
+                            {
+                                "id": item.id,
+                                "type": item.type,
+                                "label": item.label,
+                                "default": bool(
+                                    route.default_assignee
+                                    and (route.default_assignee.id, route.default_assignee.type) == (item.id, item.type)
+                                ),
+                            }
+                            for item in route.workspace_assignees
+                        ],
+                        "require_assignee": route.require_assignee,
+                        "test": route.test,
+                        "warnings": list(route.config_warnings),
                         "security_mode": connection.security_mode,
                     })
             try:
@@ -449,6 +464,7 @@ class PluginRuntime:
                         "workspace": workspace.name,
                         "security_mode": connection.security_mode,
                         "result_tracking_enabled": route.result_tracking_enabled,
+                        "warnings": list(route.config_warnings),
                     })
             return _json_result({"ok": True, "routes": rows})
         except BridgeError as exc:

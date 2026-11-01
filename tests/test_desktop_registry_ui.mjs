@@ -95,6 +95,20 @@ test('cloneRegistry and csvToList do not share mutable state', () => {
   assert.deepEqual(csvToList('board-a, board-b, , board-a'), ['board-a', 'board-b', 'board-a'])
 })
 
+test('new Workspace routes expose typed-assignee settings and nested values survive cloning', () => {
+  const route = newRoute('route-a', 'connection-a', 'workspace-a')
+  assert.equal(route.default_assignee, null)
+  assert.equal(route.require_assignee, false)
+  assert.equal(route.test, false)
+  route.route_type = 'workspace'
+  route.require_assignee = true
+  route.allowed_assignees = [{ id: '00000000-0000-4000-8000-000000000003', type: 'squad', label: 'Ops' }]
+  route.default_assignee = { ...route.allowed_assignees[0] }
+  const cloned = cloneRegistry({ routes: [route] })
+  assert.deepEqual(cloned.routes[0].allowed_assignees, route.allowed_assignees)
+  assert.deepEqual(cloned.routes[0].default_assignee, route.default_assignee)
+})
+
 test('routeStatus selects readiness for the requested route only', () => {
   const status = {
     routes: [

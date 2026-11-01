@@ -7,7 +7,7 @@ import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from .configuration import (
     DEFAULT_EVENT,
@@ -23,6 +23,7 @@ PLUGIN_ID = "hermes-multica-bridge"
 UUID7_RE = re.compile(
     r"\A[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z"
 )
+UUID_RE = re.compile(r"\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
 IDENTIFIER_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 CHAT_ID_RE = re.compile(r"\A-?[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 BOARD_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
@@ -80,9 +81,14 @@ ROUTE_FIELDS = frozenset(
         "allowed_mime_types",
         "allowed_extensions",
         "watcher_enabled",
+        "require_assignee",
+        "default_assignee",
+        "test",
     }
 )
 GRANT_FIELDS = frozenset({"board", "task_id", "route_id"})
+ASSIGNEE_FIELDS = frozenset({"id", "type", "label"})
+ASSIGNEE_TYPES = frozenset({"member", "agent", "squad"})
 
 
 def _fail(message: str) -> BridgeError:
@@ -163,6 +169,13 @@ class RegistryWorkspace:
 
 
 @dataclass(frozen=True)
+class WorkspaceAssignee:
+    id: str
+    type: Literal["member", "agent", "squad"]
+    label: str = ""
+
+
+@dataclass(frozen=True)
 class RegistryRoute:
     route_id: str
     connection_id: str
@@ -178,7 +191,14 @@ class RegistryRoute:
     destination_locked: bool
     source_boards: tuple[str, ...]
     allowed_profiles: tuple[str, ...]
+    # Autopilot keeps its string-valued Hermes worker allowlist. Workspace
+    # assignment policy is represented separately as typed Multica identities.
     allowed_assignees: tuple[str, ...]
+    workspace_assignees: tuple[WorkspaceAssignee, ...]
+    default_assignee: WorkspaceAssignee | None
+    require_assignee: bool
+    test: bool
+    config_warnings: tuple[str, ...]
     operator_grant_required: bool
     result_tracking_enabled: bool
     source_platforms: tuple[str, ...]
@@ -369,6 +389,20 @@ def route_policy_fingerprint(registry: ConnectionRegistry, route: RegistryRoute)
         "allowed_extensions": list(route.allowed_extensions),
         "watcher_enabled": route.watcher_enabled,
     }
+    if route.route_type == "workspace":
+        payload.update(
+            assignees=[
+                {"id": item.id, "type": item.type, "label": item.label}
+                for item in route.workspace_assignees
+            ],
+            default_assignee=(
+                {"id": route.default_assignee.id, "type": route.default_assignee.type,
+                 "label": route.default_assignee.label}
+                if route.default_assignee is not None else None
+            ),
+            require_assignee=route.require_assignee,
+            test=route.test,
+        )
     return (
         "route-policy-"
         + hashlib.sha256(
@@ -498,6 +532,8 @@ def _parse_route(row: Any) -> RegistryRoute:
         "allow_groups",
         "require_source_attachment",
         "watcher_enabled",
+        "require_assignee",
+        "test",
     )
     for field in bool_fields:
         if field in row and type(row[field]) is not bool:
@@ -525,6 +561,53 @@ def _parse_route(row: Any) -> RegistryRoute:
     allowed_extensions = _string_list(
         row.get("allowed_extensions"), "route.allowed_extensions", EXTENSION_RE, maximum=64
     )
+    config_warnings: list[str] = []
+    raw_assignees = row.get("allowed_assignees")
+    if route_type == "autopilot":
+        allowed_assignees = _string_list(
+            raw_assignees, "route.allowed_assignees", PROFILE_RE
+        )
+        workspace_assignees: tuple[WorkspaceAssignee, ...] = ()
+        default_assignee = None
+        if row.get("default_assignee") is not None:
+            raise _fail("Autopilot routes cannot contain default_assignee.")
+        if row.get("require_assignee", False):
+            raise _fail("Autopilot routes cannot require a Workspace assignee.")
+        if row.get("test", False):
+            raise _fail("Autopilot routes cannot be marked as test routes.")
+        require_assignee = False
+    else:
+        allowed_assignees = ()
+        if raw_assignees in (None, ""):
+            raw_assignees = []
+        if not isinstance(raw_assignees, list) or len(raw_assignees) > 64:
+            raise _fail("route.allowed_assignees must be a bounded list of assignees.")
+        parsed_assignees: list[WorkspaceAssignee] = []
+        for item in raw_assignees:
+            if isinstance(item, str):
+                config_warnings.append("legacy_assignee_entry")
+                item = {"id": item, "type": "member"}
+            parsed_assignees.append(_parse_workspace_assignee(item, "route.allowed_assignees item"))
+        pairs = [(item.id, item.type) for item in parsed_assignees]
+        if len(pairs) != len(set(pairs)):
+            raise _fail("route.allowed_assignees contains duplicate id/type pairs.")
+        workspace_assignees = tuple(parsed_assignees)
+        require_assignee = row.get("require_assignee", True)
+        default_assignee_raw = row.get("default_assignee")
+        default_assignee = (
+            _parse_workspace_assignee(default_assignee_raw, "route.default_assignee")
+            if default_assignee_raw is not None else None
+        )
+        if default_assignee is not None:
+            matched_default = next(
+                (item for item in workspace_assignees
+                 if (item.id, item.type) == (default_assignee.id, default_assignee.type)),
+                None,
+            )
+            if matched_default is None:
+                raise _fail("route.default_assignee must be present in route.allowed_assignees.")
+            default_assignee = matched_default
+    test_route = row.get("test", False)
     max_attachments = _bounded_int(row.get("max_attachments"), "route.max_attachments", 0, 0, 16)
     max_attachment_bytes = _bounded_int(
         row.get("max_attachment_bytes"), "route.max_attachment_bytes", 0, 0, 10_485_760
@@ -565,9 +648,12 @@ def _parse_route(row: Any) -> RegistryRoute:
         allowed_profiles=_string_list(
             row.get("allowed_profiles"), "route.allowed_profiles", PROFILE_RE
         ),
-        allowed_assignees=_string_list(
-            row.get("allowed_assignees"), "route.allowed_assignees", PROFILE_RE
-        ),
+        allowed_assignees=allowed_assignees,
+        workspace_assignees=workspace_assignees,
+        default_assignee=default_assignee,
+        require_assignee=require_assignee,
+        test=test_route,
+        config_warnings=tuple(dict.fromkeys(config_warnings)),
         operator_grant_required=row.get("operator_grant_required", False),
         result_tracking_enabled=row.get("result_tracking_enabled", False),
         source_platforms=source_platforms,
@@ -582,6 +668,22 @@ def _parse_route(row: Any) -> RegistryRoute:
         allowed_extensions=allowed_extensions,
         watcher_enabled=row.get("watcher_enabled", False),
     )
+
+
+def _parse_workspace_assignee(value: Any, field: str) -> WorkspaceAssignee:
+    if not isinstance(value, Mapping):
+        raise _fail(f"{field} must be an assignee object.")
+    _reject_unknown_fields(value, ASSIGNEE_FIELDS, field)
+    assignee_id = value.get("id")
+    assignee_type = value.get("type")
+    label = value.get("label", "")
+    if not isinstance(assignee_id, str) or not UUID_RE.fullmatch(assignee_id):
+        raise _fail(f"{field}.id must be a canonical UUID.")
+    if not isinstance(assignee_type, str) or assignee_type not in ASSIGNEE_TYPES:
+        raise _fail(f"{field}.type must be member, agent, or squad.")
+    if not isinstance(label, str) or len(label) > 128:
+        raise _fail(f"{field}.label must be a string of at most 128 characters.")
+    return WorkspaceAssignee(assignee_id, assignee_type, label.strip())
 
 
 def _parse_grant(row: Any) -> OperatorGrant:

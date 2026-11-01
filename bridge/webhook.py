@@ -460,7 +460,7 @@ class MulticaWebhookClient:
             "Content-Type": "application/json",
             "Accept": "application/json",
             "Idempotency-Key": idempotency_key,
-            "User-Agent": "hermes-multica-bridge/0.1.0",
+            "User-Agent": "hermes-multica-bridge/0.2.0",
         }
         if hmac_secret:
             headers["X-Hub-Signature-256"] = hmac_signature(body, hmac_secret)
