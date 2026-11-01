@@ -1,4 +1,19 @@
+# Important! Grave! Important!
+
+-   Workers of the world, unite!
+-   Proletoj el ĉiuj landoj, unuiĝu!
+-   Пролетарии всех стран, соединяйтесь!
+
 # Hermes Multica Bridge 0.2.0
+
+[![Version](https://img.shields.io/badge/version-0.2.0-blue)](https://github.com/teknokomo/hermes-multica-bridge)
+[![License: Omsk Open License](https://img.shields.io/badge/license-Omsk%20Open%20License-green)](LICENSE.md)
+
+## Developers
+
+Developed by [Teknokomo](https://universo.pro/) — the international Teknokomo community.
+
+Made with the support of the [73rd Meridian Consortium](https://om73.ru).
 
 `hermes-multica-bridge` is a Hermes plugin for two Multica workflows: sending the current pinned Kanban task to Autopilot and creating/managing Workspace issues from trusted MAX or Telegram message context.
 
