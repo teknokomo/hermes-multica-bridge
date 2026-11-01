@@ -4,7 +4,7 @@
 -   Proletoj el ĉiuj landoj, unuiĝu!
 -   Пролетарии всех стран, соединяйтесь!
 
-# Hermes Multica Bridge 0.2.0
+# Hermes Multica Bridge
 
 [![Version](https://img.shields.io/github/v/release/teknokomo/hermes-multica-bridge?label=version&color=blue&sort=semver)](https://github.com/teknokomo/hermes-multica-bridge/releases/latest)
 [![License: Omsk Open License](https://img.shields.io/badge/license-Omsk%20Open%20License-green)](LICENSE.md)
