@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -383,16 +384,32 @@ class WorkspaceRuntime:
         return warnings
 
     @staticmethod
+    def _metadata_pseudonym_key(route: RegistryRoute) -> bytes:
+        secrets = standard_route_secrets(route, require_webhook=False)
+        if not secrets.multica_pat:
+            raise BridgeError("credential_unavailable", "The Workspace route has no Multica API credential.")
+        return hmac.new(
+            secrets.multica_pat.encode("utf-8"),
+            b"hermes-multica-bridge|workspace-metadata-pseudonym|v1",
+            hashlib.sha256,
+        ).digest()
+
+    @staticmethod
     def _metadata_for_source(
         route: RegistryRoute, source: dict[str, Any], related_ids_json: str | None,
+        pseudonym_key: bytes,
     ) -> dict[str, Any]:
-        requester = hashlib.sha256(
-            _json({"platform": source["platform"], "user_id": source["user_id"], "route_id": route.route_id}).encode()
+        requester = hmac.new(
+            pseudonym_key,
+            _json({"platform": source["platform"], "user_id": source["user_id"], "route_id": route.route_id}).encode(),
+            hashlib.sha256,
         ).hexdigest()
-        source_message = hashlib.sha256(
+        source_message = hmac.new(
+            pseudonym_key,
             _json({key: source[key] for key in (
                 "platform", "user_id", "chat_id", "thread_id", "message_id", "chat_type",
-            )}).encode()
+            )}).encode(),
+            hashlib.sha256,
         ).hexdigest()
         result: dict[str, Any] = {
             "requester": requester,
@@ -608,6 +625,7 @@ class WorkspaceRuntime:
                 raise BridgeError("invalid_arguments", "Issue description is too long.")
             parent_id = args.get("parent_issue_id")
             api = self._api(registry, route)
+            pseudonym_key = self._metadata_pseudonym_key(route)
             if parent_id is not None:
                 parent = api.get_issue(parent_id)
                 self._issue_in_route(parent, registry, route)
@@ -662,7 +680,7 @@ class WorkspaceRuntime:
                 mapping_status = "registered"
             metadata_warnings = self._write_metadata(
                 state=state, route=route, context=tool_context, api=api, issue_id=issue_id,
-                values=self._metadata_for_source(route, source, related_ids_json),
+                values=self._metadata_for_source(route, source, related_ids_json, pseudonym_key),
             )
             files = self._upload_attachments(state=state, api=api, route=route, context=tool_context,
                                              issue_id=issue_id, attachments=attachments)

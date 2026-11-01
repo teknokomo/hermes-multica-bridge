@@ -6,6 +6,7 @@
 - Добавлены default assignee, проверка принадлежности typed allowlist, controlled unassign и диагностика legacy Workspace strings.
 - После Workspace create/update выполняется отдельный readback; подтверждённый POST/PUT не повторяется при ошибке проверки.
 - Добавлены pseudonymous issue metadata и validated related issue IDs, хранящиеся в primitive metadata value.
+- Pseudonymous `requester` и `source_message_id` усилены до HMAC-SHA-256 с domain-separated ключом, производным от профильного Multica PAT маршрута.
 - Неназначенная issue возвращает `ok:false` и получает одну terminal notification attempt через публичный Hermes `ctx.post_message()`.
 - Desktop, Dashboard, route listing, examples и release metadata показывают typed assignees без раскрытия credentials.
 - Удалено неиспользуемое `api_version`; Hermes manifest остаётся формата `manifest_version: 2`.

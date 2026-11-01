@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import sys
 import tempfile
@@ -114,8 +115,14 @@ class WorkspaceToolsTests(unittest.TestCase):
         self.api = _Api()
         self.runtime._state = lambda: self.state
         self.runtime._api = lambda registry, route: self.api
+        self.secrets_patcher = patch(
+            "bridge.workspace_tools.standard_route_secrets",
+            return_value=SimpleNamespace(multica_pat="test-profile-multica-pat"),
+        )
+        self.secrets_patcher.start()
 
     def tearDown(self) -> None:
+        self.secrets_patcher.stop()
         self.temp.cleanup()
 
     def _gateway_modules(self, source=None, *, attachments=(), bound=None, env=None):
@@ -549,6 +556,14 @@ class WorkspaceToolsTests(unittest.TestCase):
         self.assertEqual(self.api.metadata["origin_test"], True)
         self.assertRegex(self.api.metadata["requester"], r"^[0-9a-f]{64}$")
         self.assertRegex(self.api.metadata["source_message_id"], r"^[0-9a-f]{64}$")
+        plain_requester = hashlib.sha256(
+            json.dumps(
+                {"platform": "telegram", "user_id": "user-1", "route_id": self.route_id},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        self.assertNotEqual(self.api.metadata["requester"], plain_requester)
         serialized = json.dumps(self.api.metadata)
         for raw in ("user-1", "chat-1", "message-1"):
             self.assertNotIn(raw, serialized)

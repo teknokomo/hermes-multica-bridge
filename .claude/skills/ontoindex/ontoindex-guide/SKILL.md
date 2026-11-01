@@ -5,7 +5,7 @@ description: 'Consult for OntoIndex tool families, resource URIs, graph schema, 
 
 # OntoIndex Reference
 
-Read [ontoindex-navigation](ontoindex-navigation.md) first; then choose the exploring, debugging, impact-analysis, pr-review, refactoring, or cli recipe skill for the task.
+Read ontoindex-navigation first; then choose the exploring, debugging, impact-analysis, pr-review, refactoring, or cli recipe skill for the task.
 Pass `repo: '<repo>'` in every tool call.
 
 | Family              | Tools and actions                                                                                                                                                                                    |
