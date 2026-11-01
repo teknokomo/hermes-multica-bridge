@@ -213,7 +213,7 @@ The SQLite ledger stores only the delivery and result state that is needed:
 - request/delivery/run/issue/task IDs;
 - fingerprint/idempotency state;
 - attempts/rate-limit state;
-- result fingerprint and comment reservation state.
+- result fingerprint and comment reservation state;
 - the latest server-side Issue revision used to order result snapshots.
 
 Webhook URLs, PATs, HMAC secrets, and secret response bodies are not stored in the ledger.
@@ -244,7 +244,7 @@ node --test tests/test_desktop_profile_guard.mjs tests/test_desktop_registry_ui.
 python3 -m compileall -q bridge dashboard deploy tests
 ```
 
-The release gate also includes Ruff, Bandit, package build/metadata checks, Hermes plugin validate/doctor on a clean staging copy, `systemd-analyze verify`, a secret/personal-data scan, and project Thermos/Autoreview.
+The release gate also includes Ruff, Bandit, package build/metadata checks, `hermes plugins validate` and `doctor` on a clean staging copy, `systemd-analyze verify`, a secret/personal-data scan, and project Thermos/Autoreview.
 
 ## Development status
 
