@@ -1,4 +1,4 @@
-# Развёртывание Hermes Multica Bridge 0.1.0
+# Развёртывание Hermes Multica Bridge 0.2.0
 
 Эта инструкция описывает настройку после копирования публичного пакета на целевой хост. Она не выполняет deployment автоматически.
 
@@ -21,7 +21,7 @@ Standard не требует отдельного systemd sender.
 ### Isolated
 
 Isolated хранит Multica secrets вне plugin process и требует root/systemd настройки.
-Для Isolated 0.1.0 требуется Linux 6.5+ с `SO_PEERPIDFD` и unified cgroup v2; cgroup v1/hybrid не поддерживается и будет отклонён fail closed. На старом ядре sender откажет до чтения IPC-запроса.
+Для Isolated требуется Linux 6.5+ с `SO_PEERPIDFD` и unified cgroup v2; cgroup v1/hybrid не поддерживается и будет отклонён fail closed. На старом ядре sender откажет до чтения IPC-запроса.
 
 Isolated Route использует отдельную template instance на каждый Route:
 
@@ -94,7 +94,7 @@ Workspace tools не требуют изменений `PluginContext.register_t
 
 ```bash
 sudo python3 -m venv /opt/hermes-multica-bridge/watcher-venv
-sudo /opt/hermes-multica-bridge/watcher-venv/bin/pip install /path/to/hermes_multica_bridge-0.1.0-py3-none-any.whl
+sudo /opt/hermes-multica-bridge/watcher-venv/bin/pip install /path/to/hermes_multica_bridge-0.2.0-py3-none-any.whl
 sudo install -m 0644 deploy/systemd/hermes-multica-watcher.service \
   /etc/systemd/system/hermes-multica-watcher.service
 ```
@@ -256,7 +256,7 @@ sudo systemctl stop hermes-multica-bridge@<instance>.service
 
 ## Чистая установка профиля
 
-Версия остаётся 0.1.0. ConnectionRegistry, Workspace watcher config и оба state stores создаются для текущей архитектуры с нуля. Неизвестные поля и несовместимые базы отклоняются; миграция внутренних форматов отсутствует. Credentials задаются заново через предназначенные для них Hermes/systemd интерфейсы и не выводятся в терминал или отчёты.
+Версия продукта — 0.2.0. ConnectionRegistry, Workspace watcher config и оба state stores создаются для текущей архитектуры с нуля. Неизвестные поля и несовместимые базы отклоняются; миграция внутренних форматов отсутствует. Credentials задаются заново через предназначенные для них Hermes/systemd интерфейсы и не выводятся в терминал или отчёты.
 
 При первом включении Route его destination фиксируется. После появления deliveries нельзя удалять ledger или переиспользовать их `route_id` для другого назначения. Включённый или использованный Route должен остаться в registry и при выводе из эксплуатации перейти в disable + tombstone: result lookup использует immutable snapshot исходной доставки.
 

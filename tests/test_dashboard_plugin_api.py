@@ -139,6 +139,24 @@ class DashboardPluginApiTests(unittest.TestCase):
         self.assertFalse(row["secrets"]["multica_pat"])
         self.assertIn("multica_pat", row["readiness_errors"])
 
+    def test_workspace_status_reports_normalized_typed_assignees_and_legacy_warning(self) -> None:
+        payload = workspace_registry_payload()
+        payload["routes"][0]["allowed_assignees"] = [payload["routes"][0]["default_assignee"]["id"]]
+        registry = registry_from_mapping(payload)
+        with (
+            patch.object(PLUGIN_API, "standard_route_secrets", return_value=types.SimpleNamespace(
+                webhook_url="", hmac_signing_secret=None, multica_pat="fake-pat",
+            )),
+            patch("bridge.watcher_ipc.WatcherIpcClient") as watcher_client,
+        ):
+            watcher_client.return_value.readiness.return_value = {"ready": True}
+            row = PLUGIN_API._route_status(registry, registry.routes[0])
+        self.assertEqual(row["assignees"][0]["type"], "member")
+        self.assertTrue(row["assignees"][0]["default"])
+        self.assertTrue(row["require_assignee"])
+        self.assertFalse(row["test"])
+        self.assertEqual(row["warnings"], ["legacy_assignee_entry"])
+
     def test_registry_update_uses_workspace_readiness_contract(self) -> None:
         current = workspace_registry_payload()
         current["routes"][0]["enabled"] = False
@@ -166,6 +184,14 @@ class DashboardPluginApiTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["registry"]["routes"][0]["enabled"])
         self.assertTrue(result["registry"]["routes"][0]["destination_locked"])
+        self.assertEqual(
+            result["registry"]["routes"][0]["allowed_assignees"],
+            requested["routes"][0]["allowed_assignees"],
+        )
+        self.assertEqual(
+            result["registry"]["routes"][0]["default_assignee"],
+            requested["routes"][0]["default_assignee"],
+        )
 
     def test_registry_update_rejects_workspace_route_when_workspace_readiness_fails(self) -> None:
         current = workspace_registry_payload()

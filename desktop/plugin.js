@@ -86,6 +86,20 @@ function Row({ label, value }) {
 }
 
 function FormField({ label, value, onChange, type = 'text', disabled = false }) {
+  if (type === 'textarea') {
+    return jsxs('label', {
+      style: { display: 'grid', gap: '5px' },
+      children: [
+        jsx('span', { children: label }),
+        jsx('textarea', {
+          style: { ...inputStyle, minHeight: '90px', resize: 'vertical' },
+          value: value ?? '',
+          disabled,
+          onChange: event => onChange(event.target.value)
+        })
+      ]
+    })
+  }
   if (type === 'checkbox') {
     return jsxs('label', {
       style: { alignItems: 'center', display: 'flex', gap: '8px' },
@@ -715,6 +729,14 @@ function RegistryEditor({ ctx, profile }) {
   }
 
   function updateRoute(key, value) {
+    if (key === 'route_type') {
+      setListDrafts(current => {
+        const next = { ...current }
+        delete next[selectedRoute + ':json:allowed_assignees']
+        delete next[selectedRoute + ':json:default_assignee']
+        return next
+      })
+    }
     mutate(next => {
       const item = next.routes.find(row => row.route_id === selectedRoute)
       if (!item) return
@@ -725,15 +747,19 @@ function RegistryEditor({ ctx, profile }) {
           Object.assign(item, {
             autopilot_id: '', trigger_id: '', event: 'hermes.task.dispatched',
             source_boards: [], allowed_profiles: [], operator_grant_required: false,
-            result_tracking_enabled: false
+            result_tracking_enabled: false, allowed_assignees: [], default_assignee: null,
+            require_assignee: true, test: false
           })
         } else {
           Object.assign(item, {
             project_id: '', source_platforms: [], allowed_user_ids: [], allowed_chat_ids: [],
             allow_groups: false, allowed_statuses: [], require_source_attachment: false,
             max_attachments: 0, max_attachment_bytes: 0, allowed_mime_types: [],
-            allowed_extensions: [], watcher_enabled: false
+            allowed_extensions: [], watcher_enabled: false, allowed_assignees: []
           })
+          delete item.default_assignee
+          delete item.require_assignee
+          delete item.test
         }
         return
       }
@@ -763,6 +789,29 @@ function RegistryEditor({ ctx, profile }) {
     const draftKey = `${route.route_id}:${key}`
     setListDrafts(current => ({ ...current, [draftKey]: value }))
     updateRoute(key, csvToList(value))
+  }
+
+  function routeJsonDraft(key, fallback) {
+    if (!route) return ''
+    const draftKey = route.route_id + ':json:' + key
+    return Object.prototype.hasOwnProperty.call(listDrafts, draftKey)
+      ? listDrafts[draftKey]
+      : JSON.stringify(route[key] ?? fallback, null, 2)
+  }
+
+  function updateRouteJson(key, value, expectedType) {
+    if (!route) return
+    const draftKey = route.route_id + ':json:' + key
+    setListDrafts(current => ({ ...current, [draftKey]: value }))
+    try {
+      const parsed = JSON.parse(value)
+      const validType = expectedType === 'array' ? Array.isArray(parsed) : parsed === null || (
+        typeof parsed === 'object' && !Array.isArray(parsed)
+      )
+      updateRoute(key, validType ? parsed : value)
+    } catch {
+      updateRoute(key, value)
+    }
   }
 
   function removeRoute() {
@@ -942,7 +991,10 @@ function RegistryEditor({ ctx, profile }) {
                   jsx(FormField, { label: 'Разрешённые user ID', value: routeListDraft('allowed_user_ids'), onChange: value => updateRouteList('allowed_user_ids', value) }),
                   jsx(FormField, { label: 'Разрешённые chat ID', value: routeListDraft('allowed_chat_ids'), onChange: value => updateRouteList('allowed_chat_ids', value) }),
                   jsx(FormField, { label: 'Разрешить группы', type: 'checkbox', value: route.allow_groups, onChange: value => updateRoute('allow_groups', value) }),
-                  jsx(FormField, { label: 'Разрешённые исполнители', value: routeListDraft('allowed_assignees'), onChange: value => updateRouteList('allowed_assignees', value) }),
+                  jsx(FormField, { label: 'Разрешённые исполнители (JSON: id, type, label)', type: 'textarea', value: routeJsonDraft('allowed_assignees', []), onChange: value => updateRouteJson('allowed_assignees', value, 'array') }),
+                  jsx(FormField, { label: 'Исполнитель по умолчанию (JSON или null)', type: 'textarea', value: routeJsonDraft('default_assignee', null), onChange: value => updateRouteJson('default_assignee', value, 'object') }),
+                  jsx(FormField, { label: 'Требовать исполнителя', type: 'checkbox', value: route.require_assignee ?? true, onChange: value => updateRoute('require_assignee', value) }),
+                  jsx(FormField, { label: 'Тестовый маршрут', type: 'checkbox', value: route.test ?? false, onChange: value => updateRoute('test', value) }),
                   jsx(FormField, { label: 'Разрешённые статусы', value: routeListDraft('allowed_statuses'), onChange: value => updateRouteList('allowed_statuses', value) }),
                   jsx(FormField, { label: 'Требовать вложение источника', type: 'checkbox', value: route.require_source_attachment, onChange: value => updateRoute('require_source_attachment', value) }),
                   jsx(FormField, { label: 'Максимум вложений', type: 'number', value: route.max_attachments, onChange: value => updateRoute('max_attachments', value) }),

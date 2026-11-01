@@ -48,6 +48,10 @@
             React.createElement('dt', null, 'Режим'), React.createElement('dd', null, route.security_mode || '—'),
             React.createElement('dt', null, 'Project ID'), React.createElement('dd', null, route.project_id || '—'),
             React.createElement('dt', null, 'Watcher'), React.createElement('dd', null, route.route_type === 'workspace' ? (route.watcher_ready ? 'готов' : 'недоступен') : '—'),
+            React.createElement('dt', null, 'Исполнители'), React.createElement('dd', null, (route.assignees || []).map(function (item) { return (item.label || item.id) + ' (' + item.type + ')' + (item.default ? ' · default' : '') }).join(', ') || '—'),
+            React.createElement('dt', null, 'Требовать исполнителя'), React.createElement('dd', null, route.route_type === 'workspace' ? (route.require_assignee ? 'да' : 'нет') : '—'),
+            React.createElement('dt', null, 'Тестовый маршрут'), React.createElement('dd', null, route.route_type === 'workspace' ? (route.test ? 'да' : 'нет') : '—'),
+            React.createElement('dt', null, 'Диагностика'), React.createElement('dd', null, (route.warnings || []).join(', ') || '—'),
             React.createElement('dt', null, 'Readiness'), React.createElement('dd', null, route.configured ? 'готов' : (readiness.join(', ') || 'требует настройки')),
             React.createElement('dt', null, 'Isolated socket'), React.createElement('dd', null, route.isolated_socket_path || '—')
           )

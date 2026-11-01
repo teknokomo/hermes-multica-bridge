@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.0
+
+- Workspace assignees теперь используют типизированные Multica identities `member`, `agent` и `squad`; Autopilot сохраняет строковый Hermes assignee allowlist.
+- Добавлены default assignee, проверка принадлежности typed allowlist, controlled unassign и диагностика legacy Workspace strings.
+- После Workspace create/update выполняется отдельный readback; подтверждённый POST/PUT не повторяется при ошибке проверки.
+- Добавлены pseudonymous issue metadata и validated related issue IDs, хранящиеся в primitive metadata value.
+- Неназначенная issue возвращает `ok:false` и получает одну terminal notification attempt через публичный Hermes `ctx.post_message()`.
+- Desktop, Dashboard, route listing, examples и release metadata показывают typed assignees без раскрытия credentials.
+- Удалено неиспользуемое `api_version`; Hermes manifest остаётся формата `manifest_version: 2`.
+
 ## 0.1.0
 
 - Добавлен `ConnectionRegistry`: один Hermes profile поддерживает несколько независимых Connections, Workspaces и Routes; entity IDs используют UUIDv7.

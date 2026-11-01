@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import unittest
 from pathlib import Path
@@ -15,6 +16,10 @@ from bridge.registry import (
     standard_route_secrets,
 )
 from tests.helpers import TEST_ORIGIN, TEST_WEBHOOK_URL
+
+MEMBER_UUID = "00000000-0000-4000-8000-000000000001"
+AGENT_UUID = "00000000-0000-4000-8000-000000000002"
+SQUAD_UUID = "00000000-0000-4000-8000-000000000003"
 
 
 def registry_payload(*, route_count: int = 10, security_mode: str = "standard") -> dict:
@@ -84,7 +89,14 @@ def workspace_registry_payload(*, allow_groups: bool = False, security_mode: str
         "allowed_chat_ids": ["chat-1"],
         "allow_groups": allow_groups,
         "allowed_statuses": ["todo", "in_progress", "done"],
-        "allowed_assignees": ["member-1"],
+        "allowed_assignees": [
+            {"id": MEMBER_UUID, "type": "member", "label": "Example member"},
+            {"id": AGENT_UUID, "type": "agent", "label": "Example agent"},
+            {"id": SQUAD_UUID, "type": "squad", "label": "Example squad"},
+        ],
+        "default_assignee": {"id": MEMBER_UUID, "type": "member"},
+        "require_assignee": True,
+        "test": False,
         "require_source_attachment": False,
         "max_attachments": 4,
         "max_attachment_bytes": 4_000_000,
@@ -96,6 +108,105 @@ def workspace_registry_payload(*, allow_groups: bool = False, security_mode: str
 
 
 class RegistryTests(unittest.TestCase):
+    def test_workspace_typed_assignees_legacy_strings_and_default_membership(self) -> None:
+        typed = registry_from_mapping(workspace_registry_payload()).routes[0]
+        self.assertEqual([(item.id, item.type) for item in typed.workspace_assignees], [
+            (MEMBER_UUID, "member"), (AGENT_UUID, "agent"), (SQUAD_UUID, "squad"),
+        ])
+        self.assertEqual(typed.default_assignee, typed.workspace_assignees[0])
+        self.assertTrue(typed.require_assignee)
+        self.assertFalse(typed.test)
+
+        typed_payload = workspace_registry_payload()
+        legacy_payload = copy.deepcopy(typed_payload)
+        legacy_payload["routes"][0]["allowed_assignees"] = [MEMBER_UUID]
+        legacy_registry = registry_from_mapping(legacy_payload)
+        legacy = legacy_registry.routes[0]
+        self.assertEqual(legacy.workspace_assignees[0].type, "member")
+        self.assertEqual(legacy.config_warnings, ("legacy_assignee_entry",))
+        typed_payload["routes"][0]["allowed_assignees"] = [{"id": MEMBER_UUID, "type": "member"}]
+        typed_registry = registry_from_mapping(typed_payload)
+        self.assertEqual(
+            route_policy_fingerprint(legacy_registry, legacy),
+            route_policy_fingerprint(typed_registry, typed_registry.routes[0]),
+        )
+
+    def test_workspace_assignee_duplicate_pair_is_rejected_but_same_id_different_type_is_valid(self) -> None:
+        payload = workspace_registry_payload()
+        payload["routes"][0]["allowed_assignees"] = [
+            {"id": MEMBER_UUID, "type": "member"},
+            {"id": MEMBER_UUID, "type": "member"},
+        ]
+        with self.assertRaises(BridgeError):
+            registry_from_mapping(payload)
+        payload["routes"][0]["allowed_assignees"] = [
+            {"id": MEMBER_UUID, "type": "member"},
+            {"id": MEMBER_UUID, "type": "agent"},
+        ]
+        route = registry_from_mapping(payload).routes[0]
+        self.assertEqual({item.type for item in route.workspace_assignees}, {"member", "agent"})
+
+    def test_workspace_assignee_validation_and_default_allowlist(self) -> None:
+        invalid_objects = [
+            {"id": "member-1", "type": "member"},
+            {"id": MEMBER_UUID, "type": "squadron"},
+            {"id": MEMBER_UUID, "type": "member", "label": "x" * 129},
+            {"id": MEMBER_UUID, "type": "member", "extra": "field"},
+        ]
+        for assignee in invalid_objects:
+            with self.subTest(assignee=assignee):
+                payload = workspace_registry_payload()
+                payload["routes"][0]["allowed_assignees"] = [assignee]
+                payload["routes"][0]["default_assignee"] = None
+                with self.assertRaises(BridgeError):
+                    registry_from_mapping(payload)
+        payload = workspace_registry_payload()
+        payload["routes"][0]["allowed_assignees"] = [{"id": MEMBER_UUID, "type": "member"}]
+        payload["routes"][0]["default_assignee"] = {"id": AGENT_UUID, "type": "agent"}
+        with self.assertRaises(BridgeError):
+            registry_from_mapping(payload)
+
+    def test_autopilot_rejects_workspace_assignee_objects_and_test_mode(self) -> None:
+        for field, value in (
+            ("allowed_assignees", [{"id": MEMBER_UUID, "type": "member"}]),
+            ("test", True),
+        ):
+            payload = registry_payload(route_count=1)
+            payload["routes"][0][field] = value
+            with self.subTest(field=field), self.assertRaises(BridgeError):
+                registry_from_mapping(payload)
+
+    def test_autopilot_route_fingerprint_keeps_the_existing_shape(self) -> None:
+        registry = registry_from_mapping(registry_payload(route_count=1))
+        route = registry.routes[0]
+        cfg = registry.route_config(route)
+        old_shape = {
+            "route_id": route.route_id,
+            "connection_id": route.connection_id,
+            "workspace_key": route.workspace_key,
+            "policy": cfg.policy_fingerprint,
+            "profiles": list(route.allowed_profiles),
+            "assignees": list(route.allowed_assignees),
+            "grant_required": route.operator_grant_required,
+            "route_type": route.route_type,
+            "project_id": route.project_id,
+            "source_platforms": list(route.source_platforms),
+            "allowed_user_ids": list(route.allowed_user_ids),
+            "allowed_chat_ids": list(route.allowed_chat_ids),
+            "allow_groups": route.allow_groups,
+            "allowed_statuses": list(route.allowed_statuses),
+            "require_source_attachment": route.require_source_attachment,
+            "max_attachments": route.max_attachments,
+            "max_attachment_bytes": route.max_attachment_bytes,
+            "allowed_mime_types": list(route.allowed_mime_types),
+            "allowed_extensions": list(route.allowed_extensions),
+            "watcher_enabled": route.watcher_enabled,
+        }
+        expected = "route-policy-" + hashlib.sha256(
+            json.dumps(old_shape, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        self.assertEqual(route_policy_fingerprint(registry, route), expected)
+
     def test_negative_telegram_group_chat_id_requires_group_opt_in(self) -> None:
         payload = workspace_registry_payload(allow_groups=True)
         payload["routes"][0]["allowed_chat_ids"] = ["-1001234567890"]

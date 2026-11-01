@@ -67,7 +67,7 @@ Bridge не читает `.env` напрямую и не создаёт собс
 
 Isolated предназначен для случая, когда plugin process не должен иметь доступ к Multica secrets.
 
-Isolated 0.1.0 требует Linux **6.5+** с `SO_PEERPIDFD` и unified **cgroup v2**. `SO_PEERPIDFD` закрепляет worker process, а отдельный `pidfd_open()` закрепляет его непосредственного Gateway parent на время проверки; после чтения cgroup sender повторно сверяет PPID worker и liveness parent. При невозможности получить pidfd или подтвердить прежнюю связь sender fail closed. Sender также проверяет наличие v2 controller root и fail closed на cgroup v1/hybrid layout, потому что авторизация корневого процесса worker scope опирается на единый `cgroup.procs` путь.
+Isolated mode требует Linux **6.5+** с `SO_PEERPIDFD` и unified **cgroup v2**. `SO_PEERPIDFD` закрепляет worker process, а отдельный `pidfd_open()` закрепляет его непосредственного Gateway parent на время проверки; после чтения cgroup sender повторно сверяет PPID worker и liveness parent. При невозможности получить pidfd или подтвердить прежнюю связь sender fail closed. Sender также проверяет наличие v2 controller root и fail closed на cgroup v1/hybrid layout, потому что авторизация корневого процесса worker scope опирается на единый `cgroup.procs` путь.
 
 Sender использует:
 
@@ -191,7 +191,7 @@ Profile/generation guards отбрасывают stale status/save/credential re
 
 ## Lifecycle конфигурации
 
-Номер версии остаётся 0.1.0. Текущий Registry и пустые state stores создаются для этой архитектуры; неизвестные поля и несовместимые SQLite schema отклоняются без migration path или внутреннего API version field.
+Версия продукта — 0.2.0. Registry и пустые state stores создаются для текущей архитектуры; неизвестные поля и несовместимые SQLite schema отклоняются без migration path или внутренних версий API/state.
 
 Переход Standard ↔ Isolated не переносит секреты автоматически. Новый Route/режим включается только после отдельной readiness-проверки. Ledger сохраняет immutable delivery snapshot, поэтому rename/disable/tombstone текущего Route не меняет destination уже созданной delivery.
 

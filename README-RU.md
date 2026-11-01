@@ -1,8 +1,8 @@
-# Hermes Multica Bridge 0.1.0
+# Hermes Multica Bridge 0.2.0
 
 `hermes-multica-bridge` — плагин Hermes для двух сценариев работы с Multica: отправки текущей pinned Kanban-задачи в Autopilot и создания/ведения Workspace-задач из доверенного контекста сообщения MAX или Telegram.
 
-Версия 0.1.0 поддерживает два режима безопасности:
+Версия 0.2.0 поддерживает два режима безопасности:
 
 - **Standard** — плагин отправляет HTTPS-запрос сам. Non-secret topology хранится в профильном `ConnectionRegistry`, а webhook/HMAC/PAT каждого Route — через публичный Hermes plugin credential API и читаются runtime только через `agent.secret_scope`.
 - **Isolated** — плагин не получает секреты Multica. Каждый новый Route использует отдельный socket-activated systemd sender instance с root-owned конфигурацией и systemd credentials.
@@ -87,13 +87,17 @@ Workspace-маршрут всегда привязан конфигурацие�
 
 Redacted-шаблон одного профиля с четырьмя отключёнными Workspace-маршрутами и отдельным Autopilot-примером находится в [config/registry.om73.example.json](config/registry.om73.example.json). Значения `REPLACE-*` заменяются только в локальной конфигурации.
 
-Маршруты Workspace работают в Standard и имеют отдельные профильные Multica PAT credentials. `multica_workspace_send` создаёт issue; parent должен принадлежать тому же workspace/project, а подзадача обязательно назначается на разрешённого человека. Чтение, комментарий и обновление повторно проверяют принадлежность issue маршруту. Исполнитель и статус ограничиваются route allowlist; приглашение участников не предоставляется.
+Маршруты Workspace работают в Standard и имеют отдельные профильные Multica PAT credentials. `allowed_assignees` задаётся объектами `{id,type,label}` с типом `member`, `agent` или `squad`; внешний ID должен быть canonical UUID. `default_assignee` обязан совпадать с разрешённой парой. Legacy-строки загружаются как `member` и показывают `legacy_assignee_entry` в `multica_list_routes` и Dashboard. Autopilot продолжает принимать прежние строки Hermes assignee.
+
+`multica_workspace_send` создаёт issue; parent должен принадлежать тому же workspace/project, а исполнитель подзадачи выбирается из typed allowlist. ID без типа выводит тип только при единственном совпадении. При отсутствии назначения операция отклоняется до POST, если не передан `allow_unassigned=true`; неназначенная issue возвращает `ok:false`, один раз уведомляет текущий чат через публичный `ctx.post_message()` и не считается начатой работой. Чтение, комментарий и обновление повторно проверяют принадлежность issue маршруту. При `require_assignee=true` снимать назначение нельзя; приглашение участников не предоставляется.
 
 К сообщению автоматически добавляются только файлы из `get_current_attachments()` текущего Hermes turn. Плагин проверяет совпадение platform/chat/author/message ID, MIME, расширение, количество и размер. Путь берётся только из доверенного descriptor Hermes, не из аргументов модели; файл открывается без следования symlink, сверяются identity и метаданные до и после чтения. Данные передаются в Multica из памяти, временный файл не создаётся, путь не попадает в ответ или лог. В этой сборке Hermes изображения не выдаются этим helper-ом и не могут быть прикреплены; маршрут с `require_source_attachment=true` отклонит сообщение, если подходящего файла нет.
 
 Получение session context и attachment descriptors использует внутренний `gateway.session_context` Hermes и отслеживается как `T38-DEBT-3`: после каждого обновления Hermes нужно перепроверить контракт и прогнать регрессионные тесты контекста и вложений. Плагин не требует локальных изменений `register_tool()` или `model_tools` и не передаёт `pass_context`.
 
-Ledger привязывает запись к профилю, маршруту и исходному сообщению. Подтверждённая операция возвращает сохранённый результат. При неизвестном исходе POST повторно не отправляется; оператор получает код `operation_unknown` и идентификаторы маршрута/чата/сообщения для ручной сверки.
+Ledger привязывает запись к профилю, маршруту и исходному сообщению. После create/update плагин отдельным GET сверяет состояние с запросом; при несовпадении или недоступности readback возвращается `assignee_verification_failed`, а повтор делает только GET и никогда второй POST. Подтверждённая операция возвращает сохранённый результат.
+
+После создания issue плагин записывает metadata `origin`, `origin_route`, `created_by`, а также SHA-256 pseudonym автора и исходного сообщения без raw user/chat/message IDs. `related_issue_ids` проверяется локально и хранится как compact JSON string. Для `test=true` записывается `origin_test=true`; сбой metadata не отменяет issue и возвращает один warning `metadata_incomplete`. Неизвестный исход любой metadata-записи не повторяется автоматически.
 
 Watcher — отдельный процесс `hermes-multica-watcher.service` под `om73-watcher`. Он использует собственный root-owned конфиг, systemd credentials и приватный SQLite state; доступа к Hermes home у него нет. Плагин регистрирует проверенную связь issue с исходным сообщением через Unix socket, peer UID сверяется через `SO_PEERCRED`. Watcher переподключает WebSocket с backoff и дополнительно сверяет issue/comments polling раз в 30–60 секунд. При первой сверке он подавляет комментарии, созданные до регистрации связи с чатом; дальнейшие новые комментарии и изменения доставляются только при наличии mapping.
 
@@ -199,7 +203,7 @@ Webhook URL, PAT, HMAC secret и тела секретных ответов в l
 
 ## Lifecycle конфигурации
 
-Плагин остаётся на версии 0.1.0. Registry принимает только текущую каноническую структуру; state stores создаются с нуля, а несовместимая SQLite schema отклоняется без миграции.
+Плагин имеет версию 0.2.0. Registry принимает текущую каноническую структуру; state stores создаются с нуля, а несовместимая SQLite schema отклоняется без миграции или внутреннего versioning.
 
 Смена Standard ↔ Isolated не переносит секреты автоматически. Новый режим включается только после собственной readiness-проверки. При включении Route его destination фиксируется; для другого destination создаётся новый Route, а прежний переводится в disable + tombstone.
 
@@ -227,7 +231,7 @@ Release gate также включает Ruff, Bandit, package build/metadata, H
 
 ## Состояние разработки
 
-Номер версии остаётся 0.1.0 на время этой доработки. Установка на сервер, live-записи в Multica, commit/push и публикация выполняются отдельным этапом.
+Версия продукта — 0.2.0. Это развитие первой версии плагина без внутренних версий Registry, state store или API. Установка на сервер, live-записи в Multica, commit/push и публикация выполняются отдельным этапом.
 
 ## Лицензия
 

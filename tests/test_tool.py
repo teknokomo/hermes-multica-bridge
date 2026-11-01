@@ -130,7 +130,28 @@ class ToolTests(unittest.TestCase):
         route = result["routes"][0]
         self.assertEqual(route["type"], "workspace")
         self.assertEqual(route["purpose"], "Create and track issues in the configured project.")
+        self.assertEqual(route["assignees"][0]["type"], "member")
+        self.assertTrue(route["assignees"][0]["default"])
+        self.assertTrue(route["require_assignee"])
+        self.assertFalse(route["test"])
+        self.assertEqual(route["warnings"], [])
         self.assertNotIn("pat", json.dumps(result).lower())
+        self.assertNotIn("credential", json.dumps(result).lower())
+
+    def test_list_routes_reports_legacy_assignee_diagnostic_without_secrets(self) -> None:
+        registry = workspace_registry_payload()
+        route_config = registry["routes"][0]
+        route_config["allowed_assignees"] = [route_config["default_assignee"]["id"]]
+        runtime = PluginRuntime(FakeContext({"registry": registry}))
+        source = types.SimpleNamespace(
+            platform="telegram", user_id="user-1", chat_id="chat-1", thread_id=None,
+            message_id="message-1", chat_type="dm",
+        )
+        with patch("bridge.tool.read_current_task_with_context",
+                   side_effect=BridgeError("source_unavailable", "no kanban source")):
+            result = json.loads(runtime.handle_list_routes({}, tool_context=source))
+        self.assertEqual(result["routes"][0]["warnings"], ["legacy_assignee_entry"])
+        self.assertEqual(result["routes"][0]["assignees"][0]["type"], "member")
         self.assertNotIn("credential", json.dumps(result).lower())
 
     def test_list_routes_uses_bound_session_source_without_tool_context(self) -> None:

@@ -1,8 +1,8 @@
-# Hermes Multica Bridge 0.1.0
+# Hermes Multica Bridge 0.2.0
 
 `hermes-multica-bridge` is a Hermes plugin for two Multica workflows: sending the current pinned Kanban task to Autopilot and creating/managing Workspace issues from trusted MAX or Telegram message context.
 
-Version 0.1.0 supports two security modes:
+Version 0.2.0 supports two security modes:
 
 - **Standard** — the plugin sends HTTPS requests itself. Non-secret topology is stored in the profile's `ConnectionRegistry`; each Route's webhook/HMAC/PAT credentials are managed through the public Hermes plugin credential API and read at runtime only through `agent.secret_scope`.
 - **Isolated** — the plugin never receives Multica secrets. Each new Route uses a separate socket-activated systemd sender instance with root-owned configuration and systemd credentials.
@@ -87,13 +87,17 @@ A Workspace route is always bound by configuration to one `workspace_id` and a r
 
 A redacted single-profile template with four disabled Workspace routes and a separate Autopilot example is in [config/registry.om73.example.json](config/registry.om73.example.json). Replace `REPLACE-*` values only in local configuration.
 
-Workspace routes run in Standard mode and use separate profile-scoped Multica PAT credentials. `multica_workspace_send` creates an issue; a parent must belong to the same Workspace/project, and a subtask must be assigned to an allowed human. Reads, comments, and updates recheck that the issue belongs to the route. Assignees and statuses are restricted by route allowlists; inviting members is not supported.
+Workspace routes run in Standard mode and use separate profile-scoped Multica PAT credentials. `allowed_assignees` uses `{id,type,label}` objects with type `member`, `agent`, or `squad`; external IDs must be canonical UUIDs. `default_assignee` must match an allowed pair. Legacy strings load as `member` and expose `legacy_assignee_entry` in `multica_list_routes` and the Dashboard. Autopilot continues to accept its existing string Hermes assignees.
+
+`multica_workspace_send` creates an issue; a parent must belong to the same Workspace/project, and a subtask assignee is selected from the typed allowlist. An ID without a type is resolved only when exactly one match exists. Without an assignment, the operation is rejected before POST unless `allow_unassigned=true`; an unassigned issue returns `ok:false`, sends one notice to the current chat through public `ctx.post_message()`, and is not reported as started work. Reads, comments, and updates recheck that the issue belongs to the route. With `require_assignee=true`, an assignment cannot be removed; inviting members is not supported.
 
 Only files from `get_current_attachments()` for the current Hermes turn are attached automatically. The plugin checks platform/chat/author/message ID, MIME type, extension, count, and size. The path comes only from a trusted Hermes descriptor, never from model arguments; the file is opened without following symlinks, and its identity and metadata are checked before and after reading. Data is sent to Multica from memory, no temporary file is created, and the path is not included in a response or log. This Hermes build's helper does not provide images, so they cannot be attached; a route with `require_source_attachment=true` rejects a message if no suitable file is available.
 
 Session context and attachment descriptors come from Hermes's internal `gateway.session_context` and are tracked as `T38-DEBT-3`: after each Hermes update, recheck the contract and run context/attachment regression tests. The plugin does not require local changes to `register_tool()` or `model_tools` and does not pass `pass_context`.
 
-The ledger binds each write to a profile, route, and source message. A confirmed operation returns its saved result. If a POST outcome is unknown, it is not sent again; the operator receives `operation_unknown` and the route/chat/message IDs for manual reconciliation.
+The ledger binds each write to a profile, route, and source message. After create/update, the plugin uses a separate GET to compare actual state with the request; if readback differs or is unavailable, it returns `assignee_verification_failed`, and a retry performs only GET, never a second POST. A confirmed operation returns its saved result.
+
+After issue creation, the plugin writes `origin`, `origin_route`, and `created_by` metadata, plus SHA-256 pseudonyms of the author and source message without raw user/chat/message IDs. `related_issue_ids` is validated locally and stored as a compact JSON string. For `test=true`, it writes `origin_test=true`; metadata failure does not undo the issue and returns one `metadata_incomplete` warning. An unknown metadata write outcome is never retried automatically.
 
 The watcher is a separate `hermes-multica-watcher.service` process running as `om73-watcher`. It uses its own root-owned configuration, systemd credentials, and private SQLite state, and cannot access the Hermes home directory. The plugin registers a verified issue-to-source-message mapping through a Unix socket, where the peer UID is checked with `SO_PEERCRED`. The watcher reconnects to the WebSocket with backoff and also reconciles issues/comments by polling every 30–60 seconds. On the first reconciliation it suppresses comments created before the chat mapping was registered; later comments and changes are delivered only when a mapping exists.
 
@@ -199,7 +203,7 @@ Webhook URLs, PATs, HMAC secrets, and secret response bodies are not stored in t
 
 ## Configuration lifecycle
 
-The plugin remains at version 0.1.0. The registry accepts only the current canonical structure; state stores are created from scratch, and incompatible SQLite schemas are rejected without migration.
+The plugin is version 0.2.0. The registry accepts the current canonical structure; state stores are created from scratch, and incompatible SQLite schemas are rejected without migration or internal versioning.
 
 Switching between Standard and Isolated does not transfer secrets automatically. A new mode is enabled only after its own readiness check. Enabling a Route locks its destination; use a new Route for another destination and disable + tombstone the previous one.
 
@@ -227,7 +231,7 @@ The release gate also includes Ruff, Bandit, package build/metadata checks, Herm
 
 ## Development status
 
-The version remains 0.1.0 during this development step. Server installation, live Multica writes, commit/push, and publication are separate stages.
+The product version is 0.2.0. This extends the first plugin release without internal Registry, state-store, or API versions. Server installation, live Multica writes, commit/push, and publication are separate stages.
 
 ## License
 
