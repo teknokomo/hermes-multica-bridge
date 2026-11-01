@@ -17,57 +17,57 @@
 
 ## Обзор
 
-`hermes-multica-bridge` — плагин Hermes для двух сценариев работы с Multica: отправки текущей pinned Kanban-задачи в Autopilot и создания/ведения Workspace-задач из доверенного контекста сообщения MAX или Telegram.
+`hermes-multica-bridge` — плагин Hermes для двух сценариев работы с Multica: отправки текущей закреплённой (pinned) Kanban-задачи в Autopilot и создания и ведения задач рабочего пространства (Workspace) из доверенного контекста сообщения MAX или Telegram.
 
 Версия 0.2.0 поддерживает два режима безопасности:
 
-- **Standard** — плагин отправляет HTTPS-запрос сам. Non-secret topology хранится в профильном `ConnectionRegistry`, а webhook/HMAC/PAT каждого Route — через публичный Hermes plugin credential API и читаются runtime только через `agent.secret_scope`.
-- **Isolated** — плагин не получает секреты Multica. Каждый новый Route использует отдельный socket-activated systemd sender instance с root-owned конфигурацией и systemd credentials.
+- **Стандартный режим (Standard)** — плагин сам отправляет HTTPS-запрос. Несекретная топология хранится в профильном `ConnectionRegistry`, а webhook, HMAC и PAT каждого маршрута — через публичный API учётных данных плагинов Hermes; во время работы они читаются только через `agent.secret_scope`.
+- **Изолированный режим (Isolated)** — плагин не получает секреты Multica. Каждый новый маршрут использует отдельный экземпляр systemd-отправителя с активацией по сокету, конфигурацией, принадлежащей root, и учётными данными systemd.
 
-Bridge закрыт по умолчанию: `enabled=false`. Модель не может подменить источник сообщения, выбрать произвольный Workspace/project, передать credentials, URL или путь к вложению.
+Bridge по умолчанию закрыт: `enabled=false`. Модель не может подменить источник сообщения, выбрать произвольное рабочее пространство или проект, передать учётные данные, URL или путь к вложению.
 
 ## Возможности
 
 - инструменты Hermes с узким контрактом:
-  - `multica_list_routes` — без аргументов перечисляет только Route, разрешённые текущему источнику сообщения и/или pinned Kanban worker;
-  - `multica_send_task` — отправляет текущую pinned Kanban-задачу и принимает только необязательный `route_id`;
-  - `multica_check_task_result` — читает результат только для ранее сохранённой delivery и принимает только необязательный `route_id`;
-- Workspace-маршруты с инструментами `multica_workspace_send`, `multica_workspace_get`, `multica_workspace_comment` и `multica_workspace_update`;
-- автоматическое создание задачи в настроенных Workspace/project и добавление доступных файлов из текущего сообщения Hermes;
-- отдельный ограниченный watcher, который получает события Multica и отправляет изменения в точный исходный чат/тред MAX или Telegram;
+  - `multica_list_routes` — без аргументов перечисляет только маршруты, разрешённые текущему источнику сообщения и/или закреплённому Kanban-worker;
+  - `multica_send_task` — отправляет текущую закреплённую Kanban-задачу и принимает только необязательный `route_id`;
+  - `multica_check_task_result` — читает результат только для ранее сохранённой доставки и принимает только необязательный `route_id`;
+- маршруты Workspace с инструментами `multica_workspace_send`, `multica_workspace_get`, `multica_workspace_comment` и `multica_workspace_update`;
+- автоматическое создание задачи в настроенном рабочем пространстве и проекте и добавление доступных файлов из текущего сообщения Hermes;
+- отдельный ограниченный watcher, который получает события Multica и отправляет изменения в точный исходный чат или тред MAX либо Telegram;
 - HMAC-SHA256 в заголовке `X-Hub-Signature-256`, рассчитанный по точным отправляемым байтам;
 - стабильный `Idempotency-Key` для одной логической версии карточки;
-- bounded retries и локальный SQLite ledger;
-- строгая проверка HTTPS origin и webhook path, запрет redirects и proxy environment;
-- произвольное количество Connections, Workspaces и Routes внутри одного Hermes profile; тестами покрыто не менее 10 Routes;
-- отдельные Standard credentials на каждый Route;
-- отдельные Isolated instances с собственными socket/config/state/credentials на каждый новый Route;
-- возврат новых состояний результата в ту же Hermes Kanban-задачу как deduplicated comment;
-- чистое создание профильных state stores; неизвестные и прежние внутренние схемы отклоняются без миграции.
+- ограниченное число повторов и локальный журнал SQLite;
+- строгая проверка источника HTTPS и пути webhook, запрет перенаправлений и прокси из окружения;
+- произвольное число подключений, рабочих пространств и маршрутов в одном профиле Hermes; тестами покрыто не менее 10 маршрутов;
+- отдельные учётные данные Standard для каждого маршрута;
+- отдельные экземпляры Isolated с собственными сокетом, конфигурацией, состоянием и учётными данными на каждый новый маршрут;
+- возврат новых состояний результата в ту же задачу Hermes Kanban в виде комментария без дублей;
+- чистое создание профильных хранилищ состояния; неизвестные и прежние внутренние схемы отклоняются без миграции.
 
 ## Архитектура
 
 ```mermaid
 flowchart LR
-  K[Hermes Kanban Worker] --> P[hermes-multica-bridge]
+  K[Worker Kanban Hermes] --> P[hermes-multica-bridge]
   P -->|Autopilot Standard| H[HTTPS + HMAC]
-  P -->|Autopilot Isolated IPC| S[systemd sender]
+  P -->|Autopilot Isolated IPC| S[systemd-отправитель]
   S --> M[Multica Autopilot]
   H --> M
-  C[MAX / Telegram message] -->|trusted Hermes source| W[Workspace tools]
-  W -->|configured workspace + project| I[Multica issue]
-  I --> E[Multica events / polling]
-  E --> X[Isolated watcher]
-  X -->|exact source reply| C
+  C[Сообщение MAX / Telegram] -->|доверенный источник Hermes| W[Инструменты Workspace]
+  W -->|настроенное workspace + project| I[Задача Multica]
+  I --> E[События / опрос Multica]
+  E --> X[Изолированный watcher]
+  X -->|ответ в точный источник| C
 ```
 
-В Isolated mode sender проверяет Linux `SO_PEERCRED` и `SO_PEERPIDFD`, допустимый UID, точный Hermes user-systemd путь task/run-specific worker cgroup (`user-<uid>.slice/user@<uid>.service/app.slice/...scope`), task ID из launch argv самого Hermes worker, корневой процесс этой cgroup и его непосредственного родителя в точно настроенном Gateway systemd unit до выполнения внешнего запроса. Pidfd фиксирует исходный peer и его Gateway parent на время проверок; после чтения cgroup sender повторно сверяет PPID worker и liveness родителя. Модельные subprocess не проходят эту границу: их PID/parent/launch argv отличаются от доверенного worker process.
+В режиме Isolated отправитель до выполнения внешнего запроса проверяет Linux `SO_PEERCRED` и `SO_PEERPIDFD`, допустимый UID, точный путь Hermes к cgroup конкретной задачи и запуска worker в user-systemd (`user-<uid>.slice/user@<uid>.service/app.slice/...scope`), task ID из launch argv самого Hermes worker, корневой процесс этой cgroup и его непосредственного родителя в точно настроенном systemd-модуле Gateway. Pidfd фиксирует исходный peer и его родителя Gateway на время проверок; после чтения cgroup отправитель повторно сверяет PPID worker и живость родителя. Модельные подпроцессы не проходят эту границу: их PID, parent и launch argv отличаются от доверенного процесса worker.
 
-В текущей архитектуре отдельный ручной allowlist ID каждой карточки по умолчанию не нужен: разрешение относится к **текущей pinned Kanban task**, которую Hermes уже исполняет. Trusted context включает board, task ID, current run ID, `task_runs.profile`, assignee, состояние и записанный Gateway `worker_pid`; task и run обязаны указывать на PID текущего plugin process. Route policy ограничивает `source_boards`, profile/assignee и при необходимости требует точный OperatorGrant `(board, task_id, route_id)`. Standard читает canonical task из pinned Kanban state, а Isolated дополнительно сверяет `task_id` с неизменённым launch argv worker и `task_id`/`run_id` с точной worker cgroup.
+В текущей архитектуре отдельный ручной allowlist ID каждой карточки по умолчанию не нужен: разрешение относится к **текущей закреплённой задаче Kanban**, которую Hermes уже исполняет. Доверенный контекст включает доску (board), task ID, current run ID, `task_runs.profile`, исполнителя, состояние и записанный Gateway `worker_pid`; задача и запуск обязаны указывать на PID текущего процесса плагина. Политика маршрута ограничивает `source_boards`, профиль и исполнителя, а при необходимости требует точный OperatorGrant `(board, task_id, route_id)`. Standard читает каноническую задачу из закреплённого состояния Kanban, а Isolated дополнительно сверяет `task_id` с неизменённым launch argv worker и `task_id`/`run_id` с точной cgroup worker.
 
-## Доверенный payload
+## Доверенные данные сообщения (payload)
 
-Модель может передать только необязательный `route_id` инструментам send/result. URL, Workspace, Autopilot, trigger, credentials и тело задачи аргументами не принимаются. Bridge читает `HERMES_KANBAN_BOARD`, `HERMES_KANBAN_TASK`, `HERMES_KANBAN_RUN_ID` и pinned Kanban DB Hermes, после чего формирует:
+Модель может передать только необязательный `route_id` инструментам отправки и получения результата. URL, рабочее пространство, Autopilot, trigger, учётные данные и тело задачи аргументами не принимаются. Bridge читает `HERMES_KANBAN_BOARD`, `HERMES_KANBAN_TASK`, `HERMES_KANBAN_RUN_ID` и закреплённую базу Kanban Hermes, после чего формирует:
 
 ```json
 {
@@ -84,51 +84,51 @@ flowchart LR
 }
 ```
 
-`request_fingerprint` исключает worker `run_id`, поэтому повторный worker run той же неизменённой карточки сохраняет один логический запрос и тот же ключ идемпотентности. Если title/body карточки изменились после доставки, result lookup завершается `request_conflict`.
+`request_fingerprint` исключает `run_id` worker, поэтому повторный запуск worker с той же неизменённой карточкой сохраняет один логический запрос и тот же ключ идемпотентности. Если заголовок или тело карточки изменились после доставки, получение результата завершается ошибкой `request_conflict`.
 
-## Standard
+## Стандартный режим (Standard)
 
 ### Настройка
 
-Non-secret topology задаётся через native Desktop **Реестр**:
+Несекретная топология задаётся через нативное приложение Desktop, раздел **Реестр**:
 
-- Connection: `connection_id`, имя, `multica_origin`, security mode, общая HTTP/rate-limit/HMAC policy;
-- Workspace: `workspace_key`, `connection_id`, внешний `workspace_id`;
-- Route: `route_id`, Connection/Workspace, Autopilot, trigger, event, source/profile/assignee/grant policy и result tracking.
+- подключение (Connection): `connection_id`, имя, `multica_origin`, режим безопасности, общие политики HTTP, ограничения частоты и HMAC;
+- рабочее пространство (Workspace): `workspace_key`, `connection_id`, внешний `workspace_id`;
+- маршрут (Route): `route_id`, подключение и рабочее пространство, Autopilot, trigger, событие, политика источника, профиля, исполнителя и OperatorGrant, а также отслеживание результата.
 
-Каждый Route имеет собственные write-only credentials `webhook|hmac|pat`. Публичный `ctx.credentials` передаёт Hermes только plugin ID, UUIDv7 Route и фиксированный credential type; Hermes сам вычисляет opaque env name, сохраняет/удаляет значение в выбранном profile scope и возвращает только presence. Reveal и произвольный env name через этот API отсутствуют.
+Каждый маршрут имеет собственные учётные данные только для записи `webhook|hmac|pat`. Публичный `ctx.credentials` передаёт в Hermes только ID плагина, UUIDv7 маршрута и фиксированный тип учётных данных; Hermes сам вычисляет непрозрачное имя переменной окружения, сохраняет или удаляет значение в выбранной области профиля и возвращает только факт наличия. Показать значение или задать произвольное имя переменной через этот API нельзя.
 
-## Workspace Bridge
+## Мост рабочих пространств
 
-Workspace-маршрут всегда привязан конфигурацией к одному `workspace_id` и обязательному `project_id`. Инструменты не принимают `platform`, автора, чат, тред или message ID в аргументах модели. В целевой сборке Hermes плагин получает эти поля из привязанного к текущему Gateway turn session context и сверяет `get_session_env()` с `get_bound_session_env()`, чтобы не использовать устаревшие значения process environment. Неполный или несогласованный контекст закрывает операцию до запроса записи в Multica. Маршрут разрешается только при совпадении платформы, user ID и chat ID. Доступ из групп, каналов и тредов отключён, пока оператор явно не включит его в policy.
+Маршрут Workspace всегда привязан конфигурацией к одному `workspace_id` и обязательному `project_id`. Инструменты не принимают платформу, автора, чат, тред или message ID в аргументах модели. В целевой сборке Hermes плагин получает эти поля из контекста сессии, привязанного к текущему ходу Gateway, и сверяет `get_session_env()` с `get_bound_session_env()`, чтобы не использовать устаревшие значения переменных процесса. Неполный или несогласованный контекст закрывает операцию до запроса записи в Multica. Маршрут разрешается только при совпадении платформы, user ID и chat ID. Доступ из групп, каналов и тредов отключён, пока оператор явно не включит его в политике.
 
-Redacted-шаблон одного профиля с четырьмя отключёнными Workspace-маршрутами и отдельным Autopilot-примером находится в [config/registry.om73.example.json](config/registry.om73.example.json). Значения `REPLACE-*` заменяются только в локальной конфигурации.
+Шаблон с вырезанными секретами для одного профиля с четырьмя отключёнными маршрутами Workspace и отдельным примером Autopilot находится в [config/registry.om73.example.json](config/registry.om73.example.json). Значения `REPLACE-*` заменяются только в локальной конфигурации.
 
-Маршруты Workspace работают в Standard и имеют отдельные профильные Multica PAT credentials. `allowed_assignees` задаётся объектами `{id,type,label}` с типом `member`, `agent` или `squad`; внешний ID должен быть canonical UUID. `default_assignee` обязан совпадать с разрешённой парой. Legacy-строки загружаются как `member` и показывают `legacy_assignee_entry` в `multica_list_routes` и Dashboard. Autopilot продолжает принимать прежние строки Hermes assignee.
+Маршруты Workspace работают в режиме Standard и имеют отдельные профильные учётные данные Multica PAT. `allowed_assignees` задаётся объектами `{id,type,label}` с типом `member`, `agent` или `squad`; внешний ID должен быть каноническим UUID. `default_assignee` обязан совпадать с разрешённой парой. Строки старого формата загружаются как `member` и показывают предупреждение `legacy_assignee_entry` в `multica_list_routes` и на панели Dashboard. Autopilot продолжает принимать прежние строки Hermes assignee.
 
-`multica_workspace_send` создаёт issue; parent должен принадлежать тому же workspace/project, а исполнитель подзадачи выбирается из typed allowlist. ID без типа выводит тип только при единственном совпадении. При отсутствии назначения операция отклоняется до POST, если не передан `allow_unassigned=true`; неназначенная issue возвращает `ok:false`, один раз уведомляет текущий чат через публичный `ctx.post_message()` и не считается начатой работой. Чтение, комментарий и обновление повторно проверяют принадлежность issue маршруту. При `require_assignee=true` снимать назначение нельзя; приглашение участников не предоставляется.
+`multica_workspace_send` создаёт задачу; родительская задача должна принадлежать тому же рабочему пространству и проекту, а исполнитель подзадачи выбирается из типизированного списка допустимых. ID без типа определяет тип только при единственном совпадении. При отсутствии назначения операция отклоняется до POST, если не передан `allow_unassigned=true`; неназначенная задача возвращает `ok:false`, один раз уведомляет текущий чат через публичный `ctx.post_message()` и не считается начатой работой. Чтение, комментарий и обновление повторно проверяют принадлежность задачи маршруту. При `require_assignee=true` снять назначение нельзя; приглашение участников не поддерживается.
 
-К сообщению автоматически добавляются только файлы из `get_current_attachments()` текущего Hermes turn. Плагин проверяет совпадение platform/chat/author/message ID, MIME, расширение, количество и размер. Путь берётся только из доверенного descriptor Hermes, не из аргументов модели; файл открывается без следования symlink, сверяются identity и метаданные до и после чтения. Данные передаются в Multica из памяти, временный файл не создаётся, путь не попадает в ответ или лог. В этой сборке Hermes изображения не выдаются этим helper-ом и не могут быть прикреплены; маршрут с `require_source_attachment=true` отклонит сообщение, если подходящего файла нет.
+К сообщению автоматически добавляются только файлы из `get_current_attachments()` текущего хода Hermes. Плагин проверяет совпадение платформы, чата, автора и message ID, MIME-тип, расширение, количество и размер. Путь берётся только из доверенного дескриптора Hermes, а не из аргументов модели; файл открывается без перехода по symlink, до и после чтения сверяются идентичность и метаданные. Данные передаются в Multica из памяти, временный файл не создаётся, путь не попадает в ответ или журнал. В этой сборке Hermes изображения не выдаются этим вспомогательным методом и не могут быть прикреплены; маршрут с `require_source_attachment=true` отклонит сообщение, если подходящего файла нет.
 
-Получение session context и attachment descriptors использует внутренний `gateway.session_context` Hermes и отслеживается как `T38-DEBT-3`: после каждого обновления Hermes нужно перепроверить контракт и прогнать регрессионные тесты контекста и вложений. Плагин не требует локальных изменений `register_tool()` или `model_tools` и не передаёт `pass_context`.
+Получение контекста сессии и дескрипторов вложений использует внутренний `gateway.session_context` Hermes и отслеживается как `T38-DEBT-3`: после каждого обновления Hermes нужно перепроверить контракт и прогнать регрессионные тесты контекста и вложений. Плагин не требует локальных изменений `register_tool()` или `model_tools` и не передаёт `pass_context`.
 
-Ledger привязывает запись к профилю, маршруту и исходному сообщению. После create/update плагин отдельным GET сверяет состояние с запросом; при несовпадении или недоступности readback возвращается `assignee_verification_failed`, а повтор делает только GET и никогда второй POST. Подтверждённая операция возвращает сохранённый результат.
+Журнал привязывает запись к профилю, маршруту и исходному сообщению. После создания или обновления плагин отдельным GET сверяет состояние с запросом; при несовпадении или недоступности повторного чтения возвращается `assignee_verification_failed`, а повтор делает только GET и никогда второй POST. Подтверждённая операция возвращает сохранённый результат.
 
-После создания issue плагин записывает metadata `origin`, `origin_route`, `created_by`, а также HMAC-SHA-256 pseudonym автора и исходного сообщения с ключом, производным от профильного Multica PAT маршрута, без raw user/chat/message IDs. `related_issue_ids` проверяется локально и хранится как compact JSON string. Для `test=true` записывается `origin_test=true`; сбой metadata не отменяет issue и возвращает один warning `metadata_incomplete`. Неизвестный исход любой metadata-записи не повторяется автоматически.
+После создания задачи плагин записывает метаданные `origin`, `origin_route`, `created_by`, а также HMAC-SHA-256-псевдоним автора и исходного сообщения с ключом, производным от профильного Multica PAT маршрута, без raw user/chat/message ID. `related_issue_ids` проверяется локально и хранится как компактная JSON-строка. Для `test=true` записывается `origin_test=true`; сбой записи метаданных не отменяет задачу и возвращает одно предупреждение `metadata_incomplete`. Неизвестный исход любой записи метаданных автоматически не повторяется.
 
-Watcher — отдельный процесс `hermes-multica-watcher.service` под `om73-watcher`. Он использует собственный root-owned конфиг, systemd credentials и приватный SQLite state; доступа к Hermes home у него нет. Плагин регистрирует проверенную связь issue с исходным сообщением через Unix socket, peer UID сверяется через `SO_PEERCRED`. Watcher переподключает WebSocket с backoff и дополнительно сверяет issue/comments polling раз в 30–60 секунд. При первой сверке он подавляет комментарии, созданные до регистрации связи с чатом; дальнейшие новые комментарии и изменения доставляются только при наличии mapping.
+Watcher — отдельный процесс `hermes-multica-watcher.service` под пользователем `om73-watcher`. Он использует собственный конфиг, принадлежащий root, учётные данные systemd и приватное состояние SQLite; доступа к домашнему каталогу Hermes у него нет. Плагин регистрирует проверенную связь задачи с исходным сообщением через Unix-сокет, UID peer сверяется через `SO_PEERCRED`. Watcher переподключает WebSocket с backoff и дополнительно сверяет задачу и комментарии опросом раз в 30–60 секунд. При первой сверке он подавляет комментарии, созданные до регистрации связи с чатом; дальнейшие новые комментарии и изменения доставляются только при наличии сопоставления (mapping).
 
-Доставка уведомлений фиксирует подтверждённую отправку как `delivered`, доказанный отказ как `not_sent`, потерю ответа после возможной отправки как `delivery_unknown`. Повторяется только явный HTTP 429 при следующей сверке; `delivery_unknown` не повторяется. Отправка в Telegram ограничивается по каждому чату, а прежний лимит MAX сохраняется. Неудачная регистрация watcher mapping остаётся в профильном ledger и повторяется при следующих разрешённых операциях Workspace по сохранённым source fields; `get` никогда не регистрирует issue из контекста текущего вызывающего сообщения. Если платформа не позволяет ответить в точное исходное сообщение/тред, уведомление не отправляется в родительский чат.
+Доставка уведомлений фиксирует подтверждённую отправку как `delivered`, доказанный отказ как `not_sent`, потерю ответа после возможной отправки как `delivery_unknown`. Повторяется только явный HTTP 429 при следующей сверке; `delivery_unknown` не повторяется. Отправка в Telegram ограничивается по каждому чату, а прежний лимит MAX сохраняется. Неудачная регистрация сопоставления watcher остаётся в профильном журнале и повторяется при следующих разрешённых операциях Workspace по сохранённым полям источника; `get` никогда не регистрирует задачу из контекста текущего вызывающего сообщения. Если платформа не позволяет ответить в точное исходное сообщение или тред, уведомление не отправляется в родительский чат.
 
-Входящий Workspace сценарий зависит от adapter-а целевой сборки, который устанавливает session context для каждого текущего сообщения. MAX inbound adapter и его корректная привязка источника должны быть проверены отдельно на целевом Gateway. Исходящая доставка MAX watcher реализована отдельно.
+Входящий сценарий Workspace зависит от адаптера целевой сборки, который устанавливает контекст сессии для каждого текущего сообщения. MAX inbound adapter и его корректная привязка источника должны быть проверены отдельно на целевом Gateway. Исходящая доставка от watcher в MAX реализована отдельно.
 
-Plugin runtime вычисляет тот же deterministic env name и читает его только через `agent.secret_scope.get_secret()`. Для одного Hermes profile поддерживаются несколько независимых Multica Connections и Routes.
+Среда выполнения плагина вычисляет то же детерминированное имя переменной окружения и читает его только через `agent.secret_scope.get_secret()`. Для одного профиля Hermes поддерживаются несколько независимых подключений и маршрутов Multica.
 
-## Isolated
+## Изолированный режим (Isolated)
 
-В Isolated mode topology Route хранится в registry, а секреты и доверенные OS/systemd параметры устанавливает оператор вне Hermes. Каждый Route получает отдельный instance. Instance ID детерминированно строится как `r-<route_id без дефисов>`.
+В режиме Isolated топология маршрута хранится в реестре, а секреты и доверенные параметры ОС и systemd задаёт оператор вне Hermes. Каждый маршрут получает отдельный экземпляр. ID экземпляра детерминированно строится как `r-<route_id без дефисов>`.
 
-Fresh install использует:
+При первой установке используются:
 
 ```text
 hermes-multica-bridge@<instance>.socket
@@ -138,7 +138,7 @@ hermes-multica-bridge@<instance>.service
 /etc/hermes-multica-bridge/credentials/<instance>/
 ```
 
-Операторский helper:
+Вспомогательный скрипт оператора:
 
 ```bash
 sudo python3 /opt/hermes-multica-bridge/deploy/configure_isolated_instance.py \
@@ -149,23 +149,23 @@ sudo python3 /opt/hermes-multica-bridge/deploy/configure_isolated_instance.py \
   --route-policy-fingerprint <route-policy-fingerprint>
 ```
 
-Полную команду с non-secret Route identity показывает Desktop. Helper проверяет, что `instance` соответствует `route_id`, интерактивно запрашивает секреты с отключённым echo, создаёт root-owned config/credentials и socket drop-in для выбранного Hermes OS user. Общий `/run/hermes-multica-bridge` создаётся socket unit как root-owned parent, а каждый instance получает отдельный socket. После проверки файлов оператор отдельно выполняет `systemctl daemon-reload` и включает instance socket.
+Полную команду с несекретной идентичностью маршрута показывает Desktop. Скрипт проверяет, что `instance` соответствует `route_id`, интерактивно запрашивает секреты с отключённым эхом, создаёт конфигурацию и учётные данные, принадлежащие root, и drop-in сокета для выбранного пользователя ОС Hermes. Общий каталог `/run/hermes-multica-bridge` создаётся socket-модулем как родительский с правами root, а каждый экземпляр получает отдельный сокет. После проверки файлов оператор отдельно выполняет `systemctl daemon-reload` и включает сокет экземпляра.
 
 Подробности: [deploy/README.md](deploy/README.md).
 
-## Hermes UI
+## Интерфейс Hermes
 
-Unified package содержит три поверхности:
+Единый пакет содержит три поверхности:
 
-- `plugin.yaml` + Python plugin — Autopilot и Workspace инструменты Hermes;
-- `dashboard/` — web dashboard tab;
-- `desktop/plugin.js` — native Desktop page, зарегистрированная через публичные `ROUTES_AREA`/`SIDEBAR_NAV_AREA` SDK.
+- `plugin.yaml` + Python plugin — инструменты Autopilot и Workspace для Hermes;
+- `dashboard/` — вкладка веб-панели;
+- `desktop/plugin.js` — нативная страница Desktop, зарегистрированная через публичные SDK `ROUTES_AREA`/`SIDEBAR_NAV_AREA`.
 
-Native Desktop показывает **Обзор**, **Реестр** и **Диагностику** для профиля сфокусированной сессии (с fallback на gateway profile). В Реестре можно создавать несколько Connections/Workspaces/Routes, задавать exact OperatorGrants, ротировать route-scoped Standard credentials и получить команды для конкретного Isolated Route.
+Нативный Desktop показывает **Обзор**, **Реестр** и **Диагностику** для профиля сфокусированной сессии (с запасным вариантом — профиль Gateway). В Реестре можно создавать несколько подключений, рабочих пространств и маршрутов, задавать точные OperatorGrant, ротировать учётные данные Standard в рамках маршрута и получать команды для конкретного маршрута Isolated.
 
-Backend отклоняет включение Route, пока обязательные destination/policy fields и per-route readiness не готовы. При первом включении Route его destination фиксируется; включённый или уже использованный Route нельзя удалить или перенаправить, а вывод из эксплуатации выполняется через disable + tombstone. Для Isolated dashboard выполняет локальный `readiness` probe через route-specific socket; он не выполняет HTTP-запрос к Multica и не возвращает secret values.
+Серверная часть не разрешает включить маршрут, пока обязательные поля назначения и политики и готовность конкретного маршрута не выполнены. При первом включении маршрута его назначение фиксируется; включённый или уже использованный маршрут нельзя удалить или переназначить, а вывод из эксплуатации выполняется через отключение и пометку об удалении (tombstone). Для Isolated панель выполняет локальную проверку готовности через сокет конкретного маршрута; она не делает HTTP-запрос к Multica и не возвращает значения секретов.
 
-Custom UI показывает только наличие секретов и безопасные статусы. Profile/generation guards не позволяют запоздавшему status/save/credential response изменить состояние другого профиля, включая переключение A→B→A.
+Собственный интерфейс показывает только наличие секретов и безопасные статусы. Защита профиля и поколения не позволяет запоздавшему ответу status/save/credential изменить состояние другого профиля, включая переключение A→B→A.
 
 ## HMAC и HTTPS
 
@@ -175,68 +175,68 @@ Custom UI показывает только наличие секретов и �
 2. HMAC-SHA256 считается по тем же байтам `raw_body`.
 3. Передаётся `X-Hub-Signature-256: sha256=<hex>`.
 4. Передаётся стабильный `Idempotency-Key`.
-5. В HTTP request отправляются именно подписанные байты.
+5. В HTTP-запросе отправляются именно подписанные байты.
 
-Клиент принимает только HTTPS URL с тем же origin, который задан в `multica_origin`, и допустимым Multica webhook path. Userinfo, query, fragment, redirects и environment proxies запрещены. `request_timeout_seconds` задаёт один абсолютный monotonic deadline для DNS, connect/TLS, HTTP headers и чтения body, а не только отдельные socket waits. DNS выполняется в bounded daemon resolver; одновременно допускается не более четырёх зависших системных lookup, после исчерпания лимита новые запросы завершаются по своему deadline без создания дополнительных resolver threads.
+Клиент принимает только HTTPS URL с тем же источником (origin), который задан в `multica_origin`, и допустимым путём webhook Multica. Userinfo, query, fragment, перенаправления и прокси из окружения запрещены. `request_timeout_seconds` задаёт единый монотонный срок для DNS, connect/TLS, заголовков HTTP и чтения тела, а не только отдельные ожидания на сокетах. DNS выполняется в ограниченном фоновом резолвере; одновременно допускается не более четырёх зависших системных запросов, после исчерпания лимита новые запросы завершаются по своему сроку без создания дополнительных потоков резолвера.
 
-HMAC включён по умолчанию. В Standard оператор может явно отключить `hmac_enabled`, после чего остаётся bearer webhook URL. Новый Isolated Route требует HMAC и fail closed при попытке включить Route без него.
+HMAC включён по умолчанию. В Standard оператор может явно отключить `hmac_enabled`, после чего остаётся webhook URL с bearer-токеном. Новый маршрут Isolated требует HMAC и fail closed при попытке включить маршрут без него.
 
 ## Получение результата
 
-При `result_tracking_enabled=true` нужен отдельный read-only Multica PAT.
+При `result_tracking_enabled=true` нужен отдельный Multica PAT только для чтения.
 
 `multica_check_task_result`:
 
-1. снова получает текущую pinned Hermes task;
-2. находит её запись в ledger;
-3. использует только сохранённый при webhook delivery `run_id` и immutable destination snapshot исходного Route;
-4. читает Multica run и связанную Issue/comments по сохранённым `multica_origin`/`autopilot_id`, даже если Route позже disabled/tombstoned;
+1. снова получает текущую закреплённую задачу Hermes;
+2. находит её запись в журнале;
+3. использует только сохранённый при доставке webhook `run_id` и неизменяемый снимок назначения исходного маршрута;
+4. читает запуск Multica и связанную задачу с комментариями по сохранённым `multica_origin`/`autopilot_id`, даже если маршрут позже отключён или помечен tombstone;
 5. нормализует состояние;
-6. упорядочивает изменения одного статуса по монотонной Multica `Issue.revision` и не допускает stale rollback;
-7. при новом состоянии резервирует комментарий в ledger;
-8. пока эта reservation свежая, не позволяет следующему result snapshot обогнать публикацию комментария;
-9. записывает bounded comment в ту же Hermes task;
-10. подтверждает reservation только после успешной записи.
+6. упорядочивает изменения одного статуса по монотонной Multica `Issue.revision` и не допускает откат к устаревшему состоянию;
+7. при новом состоянии резервирует комментарий в журнале;
+8. пока резервирование свежее, не позволяет следующему снимку результата обогнать публикацию комментария;
+9. записывает комментарий ограниченного размера в ту же задачу Hermes;
+10. подтверждает резервирование только после успешной записи.
 
-Повторная проверка того же результата не создаёт дубликат. Если запись комментария не удалась, reservation освобождается и следующий check может повторить публикацию.
+Повторная проверка того же результата не создаёт дубликат. Если запись комментария не удалась, резервирование освобождается и следующая проверка может повторить публикацию.
 
 Нормализованные состояния: `pending`, `accepted`, `running`, `succeeded`, `failed`, `skipped`, `unknown`.
 
-Webhook `accepted` означает только, что Multica приняла доставку/создала run. Это не означает завершение задачи.
+Состояние `accepted` в webhook означает только, что Multica приняла доставку и создала запуск. Это не означает завершение задачи.
 
-## Локальный ledger
+## Локальный журнал (ledger)
 
-SQLite ledger хранит только необходимое состояние доставки и результата:
+Журнал SQLite хранит только необходимое состояние доставки и результата:
 
-- route-scoped partition key;
-- immutable snapshot: `route_id`, `connection_id`, `workspace_key`, внешний `workspace_id`, `multica_origin`, `autopilot_id`, `trigger_id`, security mode и route/policy fingerprint;
-- request/delivery/run/issue/task IDs;
-- fingerprint/idempotency state;
-- attempts/rate-limit state;
-- result fingerprint и состояние comment reservation.
-- последнюю серверную Issue revision, использованную для порядка result snapshots.
+- ключ раздела в рамках маршрута;
+- неизменяемый снимок: `route_id`, `connection_id`, `workspace_key`, внешний `workspace_id`, `multica_origin`, `autopilot_id`, `trigger_id`, режим безопасности и отпечаток маршрута и политики;
+- идентификаторы request/delivery/run/issue/task;
+- состояние отпечатка и идемпотентности;
+- состояние попыток и ограничения частоты;
+- отпечаток результата и состояние резервирования комментария;
+- последнюю серверную ревизию задачи, использованную для упорядочивания снимков результата.
 
-Webhook URL, PAT, HMAC secret и тела секретных ответов в ledger не сохраняются.
+URL webhook, PAT, секрет HMAC и тела секретных ответов в журнале не сохраняются.
 
-## Lifecycle конфигурации
+## Жизненный цикл конфигурации
 
-Плагин имеет версию 0.2.0. Registry принимает текущую каноническую структуру; state stores создаются с нуля, а несовместимая SQLite schema отклоняется без миграции или внутреннего versioning.
+Версия плагина — 0.2.0. Реестр принимает текущую каноническую структуру; хранилища состояния создаются с нуля, а несовместимая схема SQLite отклоняется без миграции и внутреннего версионирования.
 
-Смена Standard ↔ Isolated не переносит секреты автоматически. Новый режим включается только после собственной readiness-проверки. При включении Route его destination фиксируется; для другого destination создаётся новый Route, а прежний переводится в disable + tombstone.
+Переключение Standard ↔ Isolated не переносит секреты автоматически. Новый режим включается только после собственной проверки готовности. При включении маршрута его назначение фиксируется; для другого назначения создаётся новый маршрут, а прежний переводится в отключение и пометку об удалении (tombstone).
 
 ## Требования
 
-- Linux с systemd для watcher и Isolated sender;
+- Linux с systemd для watcher и отправителя Isolated;
 - Python 3.11+;
-- Hermes Agent 0.22.4+ с доступными в целевой сборке методами `gateway.session_context.get_bound_session_env`, `get_session_env` и `get_current_attachments`; MAX/Telegram adapter должен привязывать эти данные к текущему turn;
-- Linux 6.5+, systemd, unified cgroup v2, `SO_PEERCRED` и `SO_PEERPIDFD` только для Isolated;
-- HTTPS Multica endpoint;
-- Multica PAT для Workspace API и watcher; read-only PAT для Autopilot result tracking;
+- Hermes Agent 0.22.4+ с доступными в целевой сборке методами `gateway.session_context.get_bound_session_env`, `get_session_env` и `get_current_attachments`; адаптер MAX и Telegram должен привязывать эти данные к текущему ходу;
+- Linux 6.5+, systemd, унифицированные cgroup v2, `SO_PEERCRED` и `SO_PEERPIDFD` только для Isolated;
+- HTTPS-эндпоинт Multica;
+- Multica PAT для API Workspace и watcher; PAT только для чтения для отслеживания результата Autopilot;
 - `websockets` для Multica WebSocket watcher.
 
 ## Локальная проверка
 
-Основной offline набор не выполняет живых Multica запросов и использует fake credentials/mocked HTTP.
+Основной офлайн-набор не выполняет живых запросов к Multica и использует фиктивные учётные данные и замоканный HTTP.
 
 ```bash
 python3 -m unittest discover -s tests -v
@@ -244,11 +244,11 @@ node --test tests/test_desktop_profile_guard.mjs tests/test_desktop_registry_ui.
 python3 -m compileall -q bridge dashboard deploy tests
 ```
 
-Release gate также включает Ruff, Bandit, package build/metadata, Hermes plugin validate/doctor на чистом staging, `systemd-analyze verify`, secret/personal-data scan и project Thermos/Autoreview.
+Релизный контроль также включает Ruff, Bandit, сборку и проверку метаданных пакета, `hermes plugins validate` и `doctor` на чистом staging, `systemd-analyze verify`, поиск секретов и персональных данных, а также проектные Thermos и Autoreview.
 
 ## Состояние разработки
 
-Версия продукта — 0.2.0. Это развитие первой версии плагина без внутренних версий Registry, state store или API. Установка на сервер, live-записи в Multica, commit/push и публикация выполняются отдельным этапом.
+Версия продукта — 0.2.0. Это развитие первой версии плагина без внутренних версий реестра, хранилища состояния и API. Установка на сервер, живые записи в Multica, commit и push, публикация выполняются отдельным этапом.
 
 ## Лицензия
 
@@ -258,8 +258,8 @@ Release gate также включает Ruff, Bandit, package build/metadata, H
 
 ## Совместимость с Hermes
 
-Workspace не требует парного патча Hermes core. Чтобы работать с целевой custom-сборкой, плагин читает source context и текущие attachment descriptors через внутренний `gateway.session_context`; этот стык отмечен как `T38-DEBT-3`.
+Workspace не требует парного патча ядра Hermes. Чтобы работать с целевой сборкой Hermes, плагин читает контекст источника и текущие дескрипторы вложений через внутренний `gateway.session_context`; этот стык отмечен как `T38-DEBT-3`.
 
-Остаются три ограниченных технических долга: `bridge/hermes.py` использует private Kanban DB API только для проверки `worker_pid`, которого нет в `kanban_show`; `dashboard/plugin_api.py` использует `plugins_settings`, потому что dashboard route не получает `PluginContext`; Workspace использует внутренний Gateway session context, поскольку плагинные инструменты не получают `tool_context`. После каждого обновления Hermes нужно запускать `plugins validate`, `plugins doctor --ci`, тесты `kanban_show`/`kanban_comment`, Dashboard registry и Workspace source/attachment. Долги снимаются после появления соответствующих публичных API.
+Остаются три ограниченных технических долга: `bridge/hermes.py` использует приватный API Kanban DB только для проверки `worker_pid`, которого нет в `kanban_show`; `dashboard/plugin_api.py` использует `plugins_settings`, потому что маршрут панели не получает `PluginContext`; Workspace использует внутренний контекст сессии Gateway, поскольку инструменты плагина не получают `tool_context`. После каждого обновления Hermes нужно запускать `plugins validate`, `plugins doctor --ci`, тесты `kanban_show`/`kanban_comment`, реестра панели, а также источника и вложений Workspace. Долги снимаются после появления соответствующих публичных API.
 
-Входящий MAX зависит от наличия подходящего MAX adapter в используемой сборке Hermes.
+Входящий MAX зависит от наличия подходящего адаптера MAX в используемой сборке Hermes.
