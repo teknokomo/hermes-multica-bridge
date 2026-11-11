@@ -6,12 +6,13 @@ import os
 import re
 import stat
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .configuration import normalize_multica_origin
 from .errors import BridgeError
+from .notification_policy import NotificationPolicy, parse_notification_policy
 
 _NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 _ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
@@ -26,7 +27,7 @@ _PROFILE_KEYS = {
 _ROUTE_KEYS = {
     "route_id", "name", "multica_origin", "workspace_id", "project_id",
     "source_platforms", "allowed_user_ids", "allowed_chat_ids", "allow_groups",
-    "allowed_statuses",
+    "allowed_statuses", "notifications",
 }
 
 
@@ -76,6 +77,9 @@ class WatcherRoute:
     allowed_chat_ids: tuple[str, ...]
     allow_groups: bool
     allowed_statuses: tuple[str, ...]
+    notifications: NotificationPolicy = field(default_factory=NotificationPolicy)
+    policy_error: str = ""
+    policy_warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -165,6 +169,20 @@ def parse_watcher_config(value: Any) -> WatcherConfig:
             allow_groups = item.get("allow_groups", False)
             if type(allow_groups) is not bool:
                 raise _fail("allow_groups must be boolean.")
+            statuses = _string_list(item.get("allowed_statuses"), "allowed_statuses", maximum=64)
+            policy_error = ""
+            try:
+                policy = parse_notification_policy(item.get("notifications"), statuses)
+            except BridgeError as exc:
+                policy = NotificationPolicy()
+                policy_error = exc.code
+            warnings = ()
+            if "notifications" not in item:
+                warnings = ("notification_policy_missing",)
+            elif policy.mode == "verbose":
+                warnings = ("notification_policy_verbose",)
+            if not set(policy.final_statuses) & set(statuses):
+                warnings += ("notification_policy_no_final",)
             route = WatcherRoute(
                 route_id=route_id,
                 name=name.strip(),
@@ -177,7 +195,10 @@ def parse_watcher_config(value: Any) -> WatcherConfig:
                     item.get("allowed_chat_ids"), "allowed_chat_ids", pattern=_CHAT_ID_RE
                 ),
                 allow_groups=allow_groups,
-                allowed_statuses=_string_list(item.get("allowed_statuses"), "allowed_statuses", maximum=64),
+                allowed_statuses=statuses,
+                notifications=policy,
+                policy_error=policy_error,
+                policy_warnings=warnings,
             )
             if any(existing.route_id == route.route_id for existing in routes):
                 raise _fail("A profile has duplicate route IDs.")

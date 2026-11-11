@@ -61,6 +61,9 @@ class WatcherIpcClient:
             raise BridgeError("watcher_ipc_invalid", "Telegram thread mappings require a valid thread identifier.")
         return self._request({"operation": "register_issue", "mapping": mapping})
 
+    def route_policies(self, profile: str, route_id: str) -> dict[str, Any]:
+        return self._request({"operation": "route_policies", "profile": profile, "route_id": route_id})
+
     def readiness(self) -> dict[str, Any]:
         return self._request({"operation": "readiness"})
 

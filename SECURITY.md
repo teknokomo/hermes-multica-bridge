@@ -213,3 +213,7 @@ Release gate должен включать:
 - terminal Autoreview status.
 
 Локальный PASS не доказывает корректность live VPS, Multica credentials, Autopilot или systemd deployment.
+
+## Quiet-доставка 0.3.0
+
+Quiet повторяет неопределённые исходы в ограниченном бюджете: возможен дубль при потере ответа. Готовое сообщение хранится в приватном state без credentials; после подтверждения payload очищается. Claim и завершение fenced по attempts; recipient policy перепроверяется перед отправкой. Verbose сохраняет at-most-once. Миграция односторонняя; откат требует снимка БД и TOML.
