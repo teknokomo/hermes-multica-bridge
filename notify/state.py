@@ -504,29 +504,32 @@ class State:
                 (time.time() + 30, code, nid),
             )
 
-    def reserve(self, payload: dict, now: float) -> float:
-        # deliver reserves before claim and after send; 1.5 seconds per reservation
-        # enforces at least 3 seconds between Telegram group/thread send starts.
-        chat_step = (
-            1.5
-            if payload.get("platform") == "telegram"
-            and payload.get("chat_type") in {"group", "thread"}
-            else 0.5
-        )
+    def reserve(self, payload: dict, now: float, *, completed: bool = False) -> float:
+        # deliver reserves before claim and after send. The completion floor uses
+        # the actual POST completion time so an overdue slot cannot undercut it.
+        group = payload.get("platform") == "telegram" and payload.get("chat_type") in {
+            "group",
+            "thread",
+        }
+        chat_step = 1.5 if group else 0.5
+        chat_floor = 3.0 if group else 1.0
         keys = [
-            (f"chat:{payload['platform']}:{payload['chat_id']}", chat_step),
-            (f"account:{payload['platform']}:{payload['account']}", 0.05),
+            (f"chat:{payload['platform']}:{payload['chat_id']}", chat_step, chat_floor),
+            (f"account:{payload['platform']}:{payload['account']}", 0.05, 0.05),
         ]
         with self.transaction() as db:
             at = now
-            for key, _ in keys:
+            for key, _, _ in keys:
                 row = db.execute(
                     "SELECT next_at FROM rate_slots WHERE key=?", (key,)
                 ).fetchone()
                 at = max(at, row[0] if row else now)
-            for key, step in keys:
+            for key, step, floor in keys:
+                next_at = at + step
+                if completed:
+                    next_at = max(next_at, now + floor)
                 db.execute(
-                    "INSERT OR REPLACE INTO rate_slots VALUES(?,?)", (key, at + step)
+                    "INSERT OR REPLACE INTO rate_slots VALUES(?,?)", (key, next_at)
                 )
             return at
 

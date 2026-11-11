@@ -105,6 +105,33 @@ def test_reload_rejects_restart_only_delivery_settings(ctx, field, value):
     asyncio.run(check())
 
 
+def test_completed_pacing_floor_survives_overdue_slot(ctx):
+    payload = {
+        "platform": "telegram",
+        "chat_id": "100",
+        "chat_type": "thread",
+        "account": "tg",
+    }
+    assert ctx.state.reserve(payload, 0) == 0
+    assert ctx.state.reserve(payload, 10, completed=True) == 10
+    assert ctx.state.reserve(payload, 10) == 13
+
+
+def test_cli_response_recursion_is_event_invalid(ctx):
+    api = Multica.__new__(Multica)
+    api.config, api.workspace, api.env = ctx.config, ctx.config.workspaces["test"], {}
+
+    def recurse(*args):
+        raise RecursionError("nested")
+
+    with (
+        patch("notify.api.run_cli", return_value=b"{}"),
+        patch("notify.api.strict_json_loads", side_effect=recurse),
+        pytest.raises(NotifyError, match="notify_event_invalid"),
+    ):
+        list(api.issues(""))
+
+
 def test_actual_dispatch_pacing_after_delayed_first_request(ctx):
     add(ctx)
     run(ctx, comments=[comment(ctx, "c1"), comment(ctx, "c2")])

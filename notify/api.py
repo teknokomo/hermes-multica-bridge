@@ -180,7 +180,7 @@ class Multica:
                         argv, self.env, self.config.service["request_timeout_seconds"]
                     )
                 )
-            except (ValueError, UnicodeError):
+            except (ValueError, UnicodeError, RecursionError):
                 raise NotifyError("notify_event_invalid") from None
             require(
                 isinstance(page, dict)
@@ -237,7 +237,12 @@ class Multica:
             raw_comments = self.reader._request(
                 "GET", f"/api/issues/{quote(issue_id, safe='')}/comments"
             )
-            comments = strict_json_loads(raw_comments)
+            if not isinstance(raw_comments, (bytes, str)):
+                raise NotifyError("notify_event_invalid")
+            try:
+                comments = strict_json_loads(raw_comments)
+            except (ValueError, UnicodeError, RecursionError):
+                raise NotifyError("notify_event_invalid") from None
             require(
                 isinstance(comments, list)
                 and len(comments) <= 10000
@@ -248,7 +253,12 @@ class Multica:
                 raw = self.reader._request(
                     "GET", f"/api/issues/{quote(issue_id, safe='')}/task-runs"
                 )
-                runs = strict_json_loads(raw)
+                if not isinstance(raw, (bytes, str)):
+                    raise NotifyError("notify_event_invalid")
+                try:
+                    runs = strict_json_loads(raw)
+                except (ValueError, UnicodeError, RecursionError):
+                    raise NotifyError("notify_event_invalid") from None
                 require(
                     isinstance(runs, list) and len(runs) <= 10000,
                     "notify_event_invalid",

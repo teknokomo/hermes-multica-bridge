@@ -46,8 +46,8 @@ def log(event: str, **fields) -> None:
     LOG.info(json.dumps({"event": event, **fields}, ensure_ascii=False))
 
 
-async def blocking(function, *args):
-    task = asyncio.create_task(asyncio.to_thread(function, *args))
+async def blocking(function, *args, **kwargs):
+    task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
@@ -358,7 +358,9 @@ class Service:
                     result = await blocking(self.sender.send, payload, token)
                 finally:
                     # Base the next slot on completion, never on an overdue reservation.
-                    await blocking(self.state.reserve, payload, time.time())
+                    await blocking(
+                        self.state.reserve, payload, time.time(), completed=True
+                    )
                 if self.state.finish(
                     claim,
                     result.outcome,
