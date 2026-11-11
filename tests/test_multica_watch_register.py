@@ -184,6 +184,29 @@ class MulticaWatchRegisterTests(unittest.TestCase):
         found = register._extract_issue(raw)
         self.assertEqual(found["id"], ISSUE_A)
 
+    def test_single_registration_maps_malformed_cli_response_to_code_four(self) -> None:
+        for raw in (b"not-json", b"{}"):
+            cli = register.MulticaCli(self.config)
+            ipc = FakeIpc()
+            with (
+                patch.object(cli, "_run_bounded", return_value=raw),
+                self.subTest(response=raw),
+                self.assertRaises(register.AppError) as raised,
+            ):
+                register._run_single(
+                    "LING-1",
+                    "core",
+                    dry_run=False,
+                    config=self.config,
+                    cli=cli,
+                    ipc=ipc,
+                    journal_path=self.journal,
+                )
+            self.assertEqual(raised.exception.exit_code, 4)
+            self.assertEqual(ipc.readiness_calls, 0)
+            self.assertEqual(ipc.mappings, [])
+            self.assertFalse(self.journal.exists())
+
     def test_issue_verification_rejects_other_project_before_ipc(self) -> None:
         cli = FakeCli({ISSUE_A: issue(ISSUE_A, project=REPO_PROJECT)})
         ipc = FakeIpc()
@@ -570,8 +593,28 @@ class MulticaWatchRegisterTests(unittest.TestCase):
                 {"value": "é" * (register.MAX_IPC_FRAME - overhead)}
             )
 
-    def test_ipc_malformed_response_is_rejected(self) -> None:
+    def test_ipc_malformed_complete_response_is_rejected(self) -> None:
         sock_path = self.root / "bad.sock"
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(sock_path))
+        server.listen(1)
+
+        def serve() -> None:
+            conn, _ = server.accept()
+            with conn:
+                conn.recv(4096)
+                body = b"[]"
+                conn.sendall(struct.pack("!I", len(body)) + body)
+            server.close()
+
+        thread = threading.Thread(target=serve)
+        thread.start()
+        with self.assertRaises(register.IpcRejected):
+            register.WatcherIpc(sock_path).readiness()
+        thread.join(timeout=3)
+
+    def test_ipc_truncated_ack_is_unavailable(self) -> None:
+        sock_path = self.root / "truncated.sock"
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server.bind(str(sock_path))
         server.listen(1)
@@ -585,7 +628,7 @@ class MulticaWatchRegisterTests(unittest.TestCase):
 
         thread = threading.Thread(target=serve)
         thread.start()
-        with self.assertRaises(register.IpcRejected):
+        with self.assertRaises(register.IpcUnavailable):
             register.WatcherIpc(sock_path).readiness()
         thread.join(timeout=3)
 

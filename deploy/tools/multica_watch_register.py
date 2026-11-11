@@ -61,6 +61,10 @@ class MulticaError(RuntimeError):
     pass
 
 
+class InvalidMulticaResponse(MulticaError):
+    """The CLI returned data that does not satisfy the expected response shape."""
+
+
 class IpcUnavailable(RuntimeError):
     pass
 
@@ -342,16 +346,16 @@ def _extract_issue(value: Any) -> dict[str, Any]:
     if isinstance(value, dict) and isinstance(value.get("issue"), dict):
         value = value["issue"]
     if not isinstance(value, dict):
-        raise MulticaError("Multica returned an invalid issue response.")
+        raise InvalidMulticaResponse("Multica returned an invalid issue response.")
     required = {"id", "workspace_id", "project_id", "status", "updated_at"}
     if required - set(value):
-        raise MulticaError("Multica returned an incomplete issue response.")
+        raise InvalidMulticaResponse("Multica returned an incomplete issue response.")
     try:
         value["id"] = _canonical_issue_id(value["id"])
         value["workspace_id"] = _canonical_uuid(value["workspace_id"], "workspace_id")
         value["project_id"] = _canonical_uuid(value["project_id"], "project_id")
     except (ConfigError, TypeError, ValueError):
-        raise MulticaError(
+        raise InvalidMulticaResponse(
             "Multica returned an invalid issue or route identifier."
         ) from None
     return value
@@ -359,15 +363,15 @@ def _extract_issue(value: Any) -> dict[str, Any]:
 
 def _extract_page(value: Any) -> tuple[list[dict[str, Any]], bool, int]:
     if not isinstance(value, dict) or not isinstance(value.get("issues"), list):
-        raise MulticaError("Multica returned an invalid issue-list response.")
+        raise InvalidMulticaResponse("Multica returned an invalid issue-list response.")
     has_more = value.get("has_more")
     offset = value.get("offset")
     if type(has_more) is not bool or type(offset) is not int or offset < 0:
-        raise MulticaError("Multica returned incomplete pagination metadata.")
+        raise InvalidMulticaResponse("Multica returned incomplete pagination metadata.")
     rows: list[dict[str, Any]] = []
     for item in value["issues"]:
         if not isinstance(item, dict):
-            raise MulticaError("Multica returned an invalid issue-list item.")
+            raise InvalidMulticaResponse("Multica returned an invalid issue-list item.")
         rows.append(item)
     return rows, has_more, offset
 
@@ -396,7 +400,7 @@ class MulticaCli:
         try:
             return _strict_json(raw)
         except (UnicodeDecodeError, ValueError):
-            raise MulticaError("Multica CLI returned invalid JSON.") from None
+            raise InvalidMulticaResponse("Multica CLI returned invalid JSON.") from None
 
     @staticmethod
     def _run_bounded(command: Sequence[str], *, env: Mapping[str, str]) -> bytes:
@@ -510,7 +514,7 @@ def _recv_exact(conn: socket.socket, size: int, deadline: float) -> bytes:
         conn.settimeout(_remaining_timeout(deadline))
         chunk = conn.recv(size - len(result))
         if not chunk:
-            raise IpcRejected(
+            raise IpcUnavailable(
                 "Watcher IPC closed before returning a complete response."
             )
         result.extend(chunk)
@@ -799,6 +803,8 @@ def _run_single(
     route = config.routes[route_name]
     try:
         issue = cli.get_issue(issue_arg)
+    except InvalidMulticaResponse as exc:
+        raise AppError(4, "Multica returned an invalid issue response.") from exc
     except MulticaError as exc:
         raise AppError(
             1, "The issue was not found or could not be read from Multica."
