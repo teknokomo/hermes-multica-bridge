@@ -297,3 +297,19 @@ StateDirectory/ledger удалять только если больше не н�
 Откат: остановить watcher, восстановить БД и TOML из согласованного снимка, вернуть код 0.2.0 и проверить readiness. Старый код не читает новую схему; mappings и результаты после снимка при таком откате теряются. Живой пилот, перезапуск и изменение cron требуют отдельного этапа.
 
 Старые WAL/SHM нельзя смешивать с восстановленным снимком: восстанавливайте при остановленном watcher через согласованную SQLite backup/restore процедуру, сохраняя прежние файлы для диагностики и исходные owner/mode.
+
+## Регистратор существующих задач (backfill)
+
+Утилита `deploy/tools/multica_watch_register.py` регистрирует существующие задачи через watcher IPC. Она не входит в wheel и не регистрируется в plugin.yaml. Это backfill: после регистрации действует та же политика quiet/verbose соответствующего watcher-маршрута.
+
+Используйте [нерабочий пример с плейсхолдерами](../config/multica-watch.example.json). Задайте профиль watcher, профиль Multica CLI, маршрут, workspace/project, платформу, chat_type, разрешённого пользователя, чат, тред и опорное сообщение. Платформа задаётся явно: max или telegram; MAX thread отклоняется, поскольку точная доставка в MAX-тред не поддерживается. Для dm/group thread_id должен быть null. Журнал и IPC socket задаются параметрами. Реальные ID и приватные пути не публикуйте.
+
+```bash
+python3 deploy/tools/multica_watch_register.py --socket /REPLACE/IPC.sock --readiness
+python3 deploy/tools/multica_watch_register.py --config /REPLACE/private.json --journal /REPLACE/mappings.json ISSUE-123 --route route-a --dry-run
+python3 deploy/tools/multica_watch_register.py --config /REPLACE/private.json --journal /REPLACE/mappings.json --sweep
+```
+
+Конфигурация и журнал — приватные файлы 0600 в каталогах 0700. CLI выполняет только чтение issue get/list с закреплёнными profile, HTTPS origin и workspace. Перед IPC проверяется проект. Получателя нельзя заменить аргументами задачи. Dry-run не меняет mapping или журнал; подтверждение сохраняется только после ACK watcher. Повтор sweep идемпотентен; sweep_since задаётся при активации и не сдвигается между проходами.
+
+Коды завершения: 0 — успех; 1 — недоступная или чужая задача; 2 — недоступный IPC/потерянный ACK; 3 — отказ watcher или конфликт mapping; 4 — неверные аргументы, конфигурация, ответ CLI или журнал. Установка утилиты, настройка живых credentials и cron выполняются отдельным этапом.

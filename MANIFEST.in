@@ -16,3 +16,4 @@ prune .agents
 prune .backup
 prune .claude
 global-exclude __pycache__ *.py[cod] *.sqlite3 *.sqlite3-* .env .env.* *.log
+prune deploy/tools
