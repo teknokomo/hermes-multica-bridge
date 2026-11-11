@@ -118,6 +118,8 @@ class Service:
         )
         ids.update(h["issue_id"] for h in pending)
         acknowledged = set()
+        incomplete = False
+        processed_issues = 0
         for issue_id in sorted(ids):
             require(
                 not getattr(self, "stop", None) or not self.stop.is_set(),
@@ -140,16 +142,31 @@ class Service:
                     )
                 log("notify_issue_unreadable", workspace=key, code=exc.code)
                 continue
-            count = reconcile(
-                self.state,
-                self.config,
-                key,
-                issue,
-                comments,
-                runs,
-                link,
-                recovery=recovery,
-            )
+            except NotifyError as exc:
+                if exc.code != "notify_event_invalid":
+                    raise
+                incomplete = True
+                log("notify_issue_deferred", workspace=key, code=exc.code)
+                continue
+            try:
+                count = reconcile(
+                    self.state,
+                    self.config,
+                    key,
+                    issue,
+                    comments,
+                    runs,
+                    link,
+                    recovery=recovery,
+                )
+            except NotifyError as exc:
+                if exc.code != "notify_event_invalid":
+                    raise
+                # Keep this issue eligible for the next pass without blocking others.
+                incomplete = True
+                log("notify_issue_deferred", workspace=key, code=exc.code)
+                continue
+            processed_issues += 1
             confirmed = {
                 run.get("id") or run.get("task_id")
                 for run in runs
@@ -178,19 +195,22 @@ class Service:
                 "UPDATE hints SET status='processed',processed_at=? WHERE id=?",
                 [(time.time(), hint_id) for hint_id in acknowledged],
             )
-        values = {
-            "poll_until": now,
-            "last_error": "",
-            "recovery_mode": 0,
-            "source_history_limited": int(api.limited),
-        }
-        if full:
-            values["last_full"] = now
-        self.state.cursor(key, **values)
+        if incomplete:
+            self.state.cursor(key, last_error="notify_event_invalid")
+        else:
+            values = {
+                "poll_until": now,
+                "last_error": "",
+                "recovery_mode": 0,
+                "source_history_limited": int(api.limited),
+            }
+            if full:
+                values["last_full"] = now
+            self.state.cursor(key, **values)
         log(
             "events_ingested",
             workspace=key,
-            count=len(ids),
+            count=processed_issues,
             cursor_lag_seconds=max(0, time.time() - now),
         )
 

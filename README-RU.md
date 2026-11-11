@@ -314,11 +314,11 @@ REPORT не отправляется отдельно даже в verbose. Фи�
 
 Disable отменяет pending/retry. Inflight может завершиться; re-enable устанавливает since=now. `replay ID` и `dead-letter retry ID` явно возвращают dead/cancelled с сохранённым payload в очередь и не меняют получателя.
 
-Каждый POST расходует попытку, включая однократный fallback без reply после подтверждённой ошибки anchor. Тред сохраняется. Потеря ответа допускает повтор и возможный дубль; exactly-once не гарантируется. Пауза до claim ограничивает чат двумя сообщениями/с, аккаунт — двадцатью.
+Каждый POST расходует попытку, включая однократный fallback без reply после подтверждённой ошибки anchor. Тред сохраняется. Потеря ответа допускает повтор и возможный дубль; exactly-once не гарантируется. Telegram-группы и треды ограничены интервалом не менее 3 секунд на чат (не более 20 в минуту); для личных чатов Telegram сохраняется интервал в 1 секунду, pacing MAX не меняется. Общий лимит аккаунта остаётся 20 сообщений/с.
 
 Polling выполняется каждые 45 секунд с перекрытием 300 секунд. Полная сверка — каждые 300±30 секунд, не более двух одновременно и одной на workspace. Восстанавливается только доступная история Multica; status показывает recovery_mode/history_gap_seconds/source_history_limited.
 
-Event log хранится 7 дней, terminal notifications — 30; payload доставленных очищается сразу, dead/cancelled доступен для replay 30 дней. Processed keys живут весь срок подписки; pending hints не удаляются по возрасту, processed hints хранятся 24 часа, rejected — 7 дней.
+Event log хранится 7 дней, terminal notifications — 30; payload доставленных очищается сразу, dead/cancelled доступен для replay 30 дней. Processed keys живут весь срок подписки; pending hints объединяются по workspace/issue/type (для `task:failed` отдельно по task ID), не удаляются по возрасту и ограничены 10 000 на workspace. При заполнении новые уникальные hints отклоняются с диагностикой; историческая подписка `--since` запускает полную сверку доступной истории. Processed hints хранятся 24 часа, rejected — 7 дней.
 
 `import-watcher --watcher-config ... --bindings ... --dry-run` проверяет явные TOML bindings без записи. Реальный импорт создаёт инфраструктурные таблицы TOML и disabled-подписки после reload; mappings/старые DB не копируются. `import-issues --subscription ID` загружает baseline без исторической рассылки. `--shadow` отмечает отдельную подписку на явно выбранный тестовый чат.
 

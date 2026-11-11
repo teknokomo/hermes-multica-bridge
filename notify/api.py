@@ -130,6 +130,8 @@ class Multica:
                     b"--offset",
                     b"--fields",
                     b"--sort",
+                    b"--direction",
+                    b"--project",
                 )
             ),
             "notify_cli_contract_unavailable",

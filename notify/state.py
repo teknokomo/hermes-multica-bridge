@@ -19,6 +19,7 @@ from typing import Any
 from .config import Config, NotifyError, identifier, private_dir, require
 
 EVENTS = {"question", "blocked", "final", "failed", "cancelled"}
+MAX_PENDING_HINTS_PER_WORKSPACE = 10_000
 SCHEMA = {
     "accounts": "name TEXT PRIMARY KEY, platform TEXT NOT NULL, data_json TEXT NOT NULL, configured INTEGER NOT NULL",
     "workspaces": "id TEXT PRIMARY KEY, origin TEXT NOT NULL, workspace_id TEXT NOT NULL, data_json TEXT NOT NULL, configured INTEGER NOT NULL, enabled INTEGER NOT NULL",
@@ -33,8 +34,6 @@ SCHEMA = {
         status TEXT NOT NULL, revision INTEGER, status_entered_at TEXT, cycle_started_at REAL,
         transition_seq INTEGER NOT NULL, last_observed_at REAL NOT NULL,
         PRIMARY KEY(workspace_id,issue_id)""",
-    "seen_comments": """workspace_id TEXT NOT NULL, issue_id TEXT NOT NULL, comment_id TEXT NOT NULL, created_at REAL,
-        PRIMARY KEY(workspace_id,issue_id,comment_id)""",
     "events": """id INTEGER PRIMARY KEY AUTOINCREMENT, workspace_id TEXT NOT NULL, event_key TEXT NOT NULL,
         event_type TEXT NOT NULL, issue_id TEXT NOT NULL, payload_json TEXT, created_at REAL NOT NULL,
         UNIQUE(workspace_id,event_key)""",
@@ -258,6 +257,9 @@ class State:
                     )
                     self.db.execute(
                         "CREATE INDEX subscription_workspace ON subscriptions(workspace_id,enabled)"
+                    )
+                    self.db.execute(
+                        "CREATE INDEX pending_hint_workspace ON hints(workspace_id,status)"
                     )
                     self.db.execute("PRAGMA user_version=1")
             self.db.execute("PRAGMA journal_mode=WAL")
@@ -503,8 +505,16 @@ class State:
             )
 
     def reserve(self, payload: dict, now: float) -> float:
+        # deliver reserves before claim and after send; 1.5 seconds per reservation
+        # enforces at least 3 seconds between Telegram group/thread send starts.
+        chat_step = (
+            1.5
+            if payload.get("platform") == "telegram"
+            and payload.get("chat_type") in {"group", "thread"}
+            else 0.5
+        )
         keys = [
-            (f"chat:{payload['platform']}:{payload['chat_id']}", 0.5),
+            (f"chat:{payload['platform']}:{payload['chat_id']}", chat_step),
             (f"account:{payload['platform']}:{payload['account']}", 0.05),
         ]
         with self.transaction() as db:
@@ -663,10 +673,10 @@ class State:
             )
             return True
 
-    def hint(self, workspace: str, event: dict) -> None:
+    def hint(self, workspace: str, event: dict) -> bool:
         payload = event.get("payload", {})
         if not isinstance(payload, dict):
-            return
+            return False
         obj = (
             payload.get("comment")
             or payload.get("task")
@@ -674,10 +684,13 @@ class State:
             or payload
         )
         if not isinstance(obj, dict):
-            return
+            return False
+        event_type = event.get("type", "")
+        if not isinstance(event_type, str) or not event_type:
+            return False
         issue_id = (
             obj.get("issue_id")
-            if event.get("type", "").startswith(("comment:", "task:"))
+            if event_type.startswith(("comment:", "task:"))
             else obj.get("id")
         )
         if not isinstance(issue_id, str) or not re.fullmatch(
@@ -698,12 +711,12 @@ class State:
                         time.time(),
                     ),
                 )
-            return
-        task_id = obj.get("id") if event.get("type", "").startswith("task:") else None
+            return False
+        task_id = obj.get("id") if event_type.startswith("task:") else None
         identity = encoded(
             [
                 workspace,
-                event.get("type"),
+                event_type,
                 issue_id,
                 obj.get("id"),
                 obj.get("revision"),
@@ -711,6 +724,32 @@ class State:
             ]
         )
         with self.transaction() as db:
+            if event_type == "task:failed":
+                duplicate = db.execute(
+                    "SELECT 1 FROM hints WHERE workspace_id=? AND issue_id=? AND event_type=? AND task_id IS ? AND status='pending' LIMIT 1",
+                    (workspace, issue_id, event_type, task_id),
+                ).fetchone()
+            else:
+                duplicate = db.execute(
+                    "SELECT 1 FROM hints WHERE workspace_id=? AND issue_id=? AND event_type=? AND status='pending' LIMIT 1",
+                    (workspace, issue_id, event_type),
+                ).fetchone()
+            if duplicate:
+                return True
+            pending_count = db.execute(
+                "SELECT COUNT(*) FROM hints WHERE workspace_id=? AND status='pending'",
+                (workspace,),
+            ).fetchone()[0]
+            if pending_count >= MAX_PENDING_HINTS_PER_WORKSPACE:
+                now = time.time()
+                db.execute(
+                    "UPDATE cursors SET last_error='notify_hint_backlog_full',source_history_limited=1,updated_at=? WHERE workspace_id=?",
+                    (now, workspace),
+                )
+                db.execute(
+                    "INSERT INTO metadata(key,value) VALUES('metric:pending_hints_rejected','1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1"
+                )
+                return False
             db.execute(
                 "INSERT OR IGNORE INTO hints VALUES(?,?,?,?,?,?,?,NULL)",
                 (
@@ -718,11 +757,12 @@ class State:
                     workspace,
                     issue_id,
                     task_id,
-                    event.get("type", ""),
+                    event_type,
                     "pending",
                     time.time(),
                 ),
             )
+        return True
 
     def cursor(self, workspace: str, **values) -> None:
         statements = {

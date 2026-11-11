@@ -314,11 +314,11 @@ REPORT is never sent separately, including in verbose mode. A final message incl
 
 Disable cancels pending/retry entries. Inflight delivery may finish; re-enable sets since=now. `replay ID` and `dead-letter retry ID` explicitly requeue dead/cancelled entries with retained payloads and keep their recipient.
 
-Every POST consumes an attempt, including the one-time fallback without reply after a confirmed anchor error. The thread is preserved. A lost response permits retry and a possible duplicate; exactly-once is not guaranteed. Waiting before claim limits a chat to two messages/s and an account to twenty.
+Every POST consumes an attempt, including the one-time fallback without reply after a confirmed anchor error. The thread is preserved. A lost response permits retry and a possible duplicate; exactly-once is not guaranteed. Telegram groups and threads are paced at least 3 seconds apart per chat (no more than 20 per minute); Telegram private chats retain 1-second pacing, and MAX pacing is unchanged. The account-wide cap remains 20 messages/s.
 
 Polling runs every 45 seconds with a 300-second overlap. Full reconciliation runs every 300±30 seconds, at most two concurrently and one per workspace. Only available Multica history can be recovered; status exposes recovery_mode/history_gap_seconds/source_history_limited.
 
-The event log is retained for 7 days and terminal notifications for 30; delivered payloads are cleared immediately, while dead/cancelled payloads remain replayable for 30 days. Processed keys live for the subscription lifetime; pending hints have no age expiry, processed hints last 24 hours, and rejected hints last 7 days.
+The event log is retained for 7 days and terminal notifications for 30; delivered payloads are cleared immediately, while dead/cancelled payloads remain replayable for 30 days. Processed keys live for the subscription lifetime; pending hints are coalesced by workspace/issue/type (per task ID for `task:failed`), have no age expiry, and are capped at 10,000 per workspace. On overflow, new unique hints are rejected with a diagnostic; a historical `--since` subscription triggers a full scan of available history. Processed hints last 24 hours, and rejected hints last 7 days.
 
 `import-watcher --watcher-config ... --bindings ... --dry-run` validates explicit TOML bindings without writing. A real import creates infrastructure TOML tables and disabled subscriptions after reload; mappings/old DBs are not copied. `import-issues --subscription ID` loads a baseline without historical delivery. `--shadow` marks a separate subscription to an explicitly selected test chat.
 

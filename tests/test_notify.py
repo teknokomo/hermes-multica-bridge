@@ -138,12 +138,15 @@ def test_subscription_uniqueness_and_empty_thread(ctx):
     assert ctx.state.rows("SELECT thread_id FROM subscriptions")[0]["thread_id"] == ""
 
 
-def test_one_event_fans_out_and_global_seen_does_not_suppress(ctx):
+def test_one_event_fans_out_and_per_subscription_keys_deduplicate(ctx):
     add(ctx)
     add(ctx, chat_id="101")
     assert run(ctx, comments=[comment(ctx)]) == 2
     assert run(ctx, comments=[comment(ctx)]) == 0
-    assert len(ctx.state.rows("SELECT * FROM seen_comments")) == 1
+    assert (
+        len(ctx.state.rows("SELECT * FROM processed_keys WHERE event_key LIKE 'comment:%'"))
+        == 2
+    )
 
 
 def test_fanout_and_snapshot_rollback_together(ctx):
@@ -164,7 +167,7 @@ def test_fanout_and_snapshot_rollback_together(ctx):
         pytest.raises(NotifyError),
     ):
         run(ctx, comments=[comment(ctx)])
-    for table in ("notifications", "processed_keys", "issues", "seen_comments"):
+    for table in ("notifications", "processed_keys", "issues"):
         assert not ctx.state.rows(f"SELECT * FROM {table}")
 
 
@@ -445,10 +448,29 @@ def test_budget_one_does_not_allow_extra_anchor_post(ctx):
 
 
 def test_rate_limits_share_chat_across_threads(ctx):
-    p = {"platform": "telegram", "chat_id": "100", "account": "tg"}
+    p = {
+        "platform": "telegram",
+        "chat_id": "100",
+        "account": "tg",
+        "chat_type": "group",
+    }
     assert ctx.state.reserve(p, 1000) == 1000
-    assert ctx.state.reserve(p, 1000) == 1000.5
-    assert ctx.state.reserve(p | {"chat_id": "101"}, 1000) >= 1000.55
+    assert ctx.state.reserve(p, 1000) == 1001.5
+    assert ctx.state.reserve(p | {"chat_type": "thread"}, 1000) == 1003
+    assert ctx.state.reserve(p | {"chat_id": "101"}, 1000) >= 1003.05
+
+
+@pytest.mark.parametrize("platform", ["telegram", "max"])
+def test_private_chat_pacing_is_unchanged(ctx, platform):
+    payload = {
+        "platform": platform,
+        "chat_id": "private-chat",
+        "account": platform,
+        "chat_type": "dm",
+    }
+    first = ctx.state.reserve(payload, 1000)
+    ctx.state.reserve(payload, 1000)
+    assert ctx.state.reserve(payload, 1000) - first >= 1
 
 
 def test_restart_retains_frozen_payload_without_source(ctx):
@@ -587,7 +609,7 @@ def test_credentials_and_isolated_cli_home(ctx, monkeypatch):
         if "--version" in argv:
             return b"multica version 0.8.2"
         assert "fake-pat-sentinel" not in encoded(argv)
-        return b"--updated-since --updated-until --offset --fields --sort"
+        return b"--updated-since --updated-until --offset --fields --sort --direction --project"
 
     with patch("notify.api.run_cli", side_effect=invoke):
         api.check_cli()

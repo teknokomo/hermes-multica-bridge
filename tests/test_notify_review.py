@@ -7,14 +7,16 @@ import copy
 import io
 import sys
 import time
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
 from bridge.errors import BridgeError
-from notify.api import run_cli
+from notify.api import Multica, run_cli
 from notify.config import NotifyError, atomic_private, parse_config
-from notify.delivery import Result, Sender
+from notify.delivery import Result, Sender, response
+from notify.policy import reconcile as policy_reconcile
 from notify.service import Service
 from tests.test_notify import WID, add, comment, issue, notifications, run
 from tests.test_notify import ctx as ctx  # noqa: PLC0414 - pytest fixture re-export
@@ -128,7 +130,215 @@ def test_actual_dispatch_pacing_after_delayed_first_request(ctx):
 
     asyncio.run(check())
     assert len(starts) == 2
-    assert starts[1] - starts[0] >= 0.5
+    assert starts[1] - starts[0] >= 3.0
+
+
+@pytest.mark.parametrize("failure_point", ["snapshot", "reconcile"])
+def test_invalid_issue_does_not_block_scan_and_keeps_cursor_for_retry(
+    ctx, failure_point
+):
+    add(ctx, since=0)
+    old_cursor = ctx.now - 30
+    ctx.state.cursor("test", poll_until=old_cursor)
+    ctx.state.hint(
+        "test",
+        {"type": "issue:updated", "payload": {"issue": {"id": "bad-issue"}}},
+    )
+    service = Service.__new__(Service)
+    service.state, service.config = ctx.state, ctx.config
+    seen = []
+    fail_bad_issue = True
+    bad_issue = issue(ctx)
+    bad_issue.update(id="bad-issue", identifier="TEST-2")
+
+    class Api:
+        limited = False
+
+        def issues(self, *args):
+            return [{"id": "issue-a"}]
+
+        def snapshot(self, iid):
+            nonlocal fail_bad_issue
+            seen.append(iid)
+            if failure_point == "snapshot" and iid == "bad-issue" and fail_bad_issue:
+                raise NotifyError("notify_event_invalid")
+            current = bad_issue if iid == "bad-issue" else issue(ctx)
+            return (
+                current,
+                [comment(ctx, f"question-{iid}")],
+                [],
+                f"https://multica.example.invalid/test/issues/{current['identifier']}",
+            )
+
+    def reconcile_issue(*args, **kwargs):
+        if (
+            failure_point == "reconcile"
+            and args[3]["id"] == "bad-issue"
+            and fail_bad_issue
+        ):
+            raise NotifyError("notify_event_invalid")
+        return policy_reconcile(*args, **kwargs)
+
+    api = Api()
+    with patch("notify.service.reconcile", side_effect=reconcile_issue):
+        service.scan("test", api, False)
+    cursor = ctx.state.rows("SELECT * FROM cursors WHERE workspace_id='test'")[0]
+    assert seen == ["bad-issue", "issue-a"]
+    assert cursor["poll_until"] == old_cursor
+    assert cursor["last_error"] == "notify_event_invalid"
+    assert ctx.state.rows("SELECT status FROM hints")[0]["status"] == "pending"
+    assert len(notifications(ctx)) == 1
+
+    fail_bad_issue = False
+    with patch("notify.service.reconcile", side_effect=reconcile_issue):
+        service.scan("test", api, False)
+    cursor = ctx.state.rows("SELECT * FROM cursors WHERE workspace_id='test'")[0]
+    assert seen == ["bad-issue", "issue-a", "bad-issue", "issue-a"]
+    assert cursor["poll_until"] > old_cursor
+    assert cursor["last_error"] == ""
+    assert len(notifications(ctx)) == 2
+
+
+def test_pending_hint_backlog_is_bounded_and_historical_scan_recovers(ctx, monkeypatch):
+    monkeypatch.setattr("notify.state.MAX_PENDING_HINTS_PER_WORKSPACE", 1)
+    first = {
+        "type": "issue:updated",
+        "payload": {"issue": {"id": "issue-a", "revision": 1}},
+    }
+    assert ctx.state.hint("test", first)
+    assert ctx.state.hint(
+        "test",
+        {
+            "type": "issue:updated",
+            "payload": {"issue": {"id": "issue-a", "revision": 2}},
+        },
+    )
+    assert not ctx.state.hint(
+        "test", {"type": "issue:updated", "payload": {"issue": {"id": "issue-b"}}}
+    )
+    assert len(ctx.state.rows("SELECT * FROM hints WHERE status='pending'")) == 1
+    cursor = ctx.state.rows("SELECT * FROM cursors WHERE workspace_id='test'")[0]
+    assert cursor["last_error"] == "notify_hint_backlog_full"
+    assert cursor["source_history_limited"] == 1
+    assert (
+        ctx.state.rows(
+            "SELECT value FROM metadata WHERE key='metric:pending_hints_rejected'"
+        )[0]["value"]
+        == "1"
+    )
+
+    class NoSubscriptionsApi:
+        def issues(self, *args):
+            raise AssertionError("scan without subscriptions must preserve pending hints")
+
+    service = Service.__new__(Service)
+    service.state, service.config = ctx.state, ctx.config
+    service.scan("test", NoSubscriptionsApi(), False)
+    assert len(ctx.state.rows("SELECT * FROM hints WHERE status='pending'")) == 1
+
+    ctx.state.cursor("test", last_full=time.time())
+    add(ctx, since=ctx.now - 3600)
+    assert (
+        ctx.state.rows("SELECT last_full FROM cursors WHERE workspace_id='test'")[0][
+            "last_full"
+        ]
+        is None
+    )
+    historical = [issue(ctx), issue(ctx)]
+    historical[1].update(id="issue-b", identifier="TEST-2")
+    comments = {
+        row["id"]: [comment(ctx, f"question-{row['id']}")]
+        for row in historical
+    }
+
+    class HistoricalApi:
+        limited = True
+
+        def issues(self, *args):
+            return [{"id": row["id"]} for row in historical]
+
+        def snapshot(self, iid):
+            row = next(row for row in historical if row["id"] == iid)
+            return (
+                row,
+                comments[iid],
+                [],
+                f"https://multica.example.invalid/test/issues/{row['identifier']}",
+            )
+
+    service.scan("test", HistoricalApi(), True)
+    assert len(notifications(ctx)) == 2
+    assert not ctx.state.rows("SELECT * FROM hints WHERE status='pending'")
+
+
+def test_failed_hints_keep_each_task_id_but_coalesce_duplicates(ctx):
+    def failed(task_id):
+        return {
+            "type": "task:failed",
+            "payload": {"task": {"id": task_id, "issue_id": "issue-a"}},
+        }
+
+    assert ctx.state.hint("test", failed("run-a"))
+    assert ctx.state.hint("test", failed("run-a"))
+    assert ctx.state.hint("test", failed("run-b"))
+    rows = ctx.state.rows("SELECT task_id FROM hints WHERE status='pending' ORDER BY task_id")
+    assert [row["task_id"] for row in rows] == ["run-a", "run-b"]
+
+
+def test_http_408_is_retryable():
+    assert response(408, {}, False) == Result("retry", "http_408")
+
+
+def test_deeply_nested_response_is_uncertain_retry():
+    class NestedResponse(io.BytesIO):
+        def __init__(self, body):
+            super().__init__(body)
+            self.status = 200
+            self.headers = {}
+
+    class Opener:
+        def open(self, *args, **kwargs):
+            return NestedResponse(b"[" * 1200 + b"0" + b"]" * 1200)
+
+    sender = Sender()
+    sender.opener = Opener()
+    payload = {
+        "platform": "telegram",
+        "account": "tg",
+        "chat_id": "100",
+        "chat_type": "dm",
+        "thread_id": "",
+        "text": "test",
+        "anchor_message_id": None,
+    }
+    with (
+        patch(
+            "notify.delivery._response_body_complete",
+            side_effect=lambda result: result.tell() == len(result.getvalue()),
+        ),
+        patch("notify.delivery._set_response_timeout", return_value=True),
+    ):
+        assert sender.send(payload, "fake-token") == Result(
+            "retry", "response_uncertain"
+        )
+
+
+@pytest.mark.parametrize("missing", ["--direction", "--project"])
+def test_cli_contract_requires_every_used_list_flag(missing):
+    api = Multica.__new__(Multica)
+    api.config = SimpleNamespace(service={"cli_binary": "multica"})
+    api.env = {}
+    flags = b"--updated-since --updated-until --offset --fields --sort --direction --project"
+    help_text = b" ".join(flag for flag in flags.split() if flag.decode() != missing)
+
+    def invoke(argv, env, timeout):
+        return b"multica version 0.8.2" if "--version" in argv else help_text
+
+    with (
+        patch("notify.api.run_cli", side_effect=invoke),
+        pytest.raises(NotifyError, match="notify_cli_contract_unavailable"),
+    ):
+        api.check_cli()
 
 
 def test_duplicate_json_response_is_not_delivered():

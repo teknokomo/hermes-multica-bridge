@@ -224,10 +224,6 @@ def reconcile(
                 candidates.append(
                     (f"comment:{issue['id']}:{cid}", kind, body.strip(), at)
                 )
-            db.execute(
-                "INSERT OR IGNORE INTO seen_comments VALUES(?,?,?,?)",
-                (workspace, issue["id"], cid, at),
-            )
         kind = (
             "final"
             if issue["status"] in config.policy["final_statuses"]

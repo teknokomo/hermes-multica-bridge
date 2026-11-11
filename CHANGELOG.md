@@ -5,6 +5,7 @@
 - Центральный сервис hermes-multica-notify: подписки Telegram/MAX, isolated CLI profiles, WS/poll recovery и durable outbox.
 - Quiet/verbose, REPORT текущего цикла, typed squad и labels AND, bounded retries, lease fencing, dead-letter/replay.
 - TOML reload, explicit disabled watcher import, baseline issue import, shadow marker, private status/doctor и отдельный systemd unit.
+- Исправлена доступность сканирования при невалидной задаче, pacing Telegram-групп, retry HTTP 408 и обработка чрезмерно вложенного JSON; очередь WS hints ограничена с сохранением полной сверки для исторических подписок.
 - Существующие intake/tools/watcher сохраняют поведение; live deployment и пилоты выполняются отдельно.
 
 ## 0.3.0

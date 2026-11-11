@@ -339,7 +339,7 @@ hermes-multica-notify --config /REPLACE/notify.toml doctor
 
 CLI-профиль создаётся в runtime HOME workspace с правами 0600/0700 из systemd credential. HOME пользователя Hermes и token env не используются; sandbox ProtectHome остаётся включён. SIGHUP не устанавливает новые systemd credentials: новые LoadCredential требуют отдельного root-изменения unit/drop-in и перезапуска.
 
-Полная сверка 300±30 секунд: максимум две одновременно и одна на workspace; polling45s/overlap300s. Наблюдаемость показывает историю, которую источник не смог предоставить. Retention: events7d, terminal/replay30d, processed keys весь срок подписки, pending hints без TTL, processed24h/rejected7d.
+Полная сверка 300±30 секунд: максимум две одновременно и одна на workspace; polling45s/overlap300s. Наблюдаемость показывает историю, которую источник не смог предоставить. Pending hints объединяются по workspace/issue/type (для `task:failed` отдельно по task ID) и ограничены 10 000 на workspace; при заполнении новые уникальные hints отклоняются, а `status` показывает причину и ограниченность истории. Добавление подписки с историческим `--since` запускает полную сверку доступной истории. Retention: events7d, terminal/replay30d, processed keys весь срок подписки, pending hints без TTL, processed24h/rejected7d.
 
 Пилоты отдельно: shadow24ч → одна production-подписка7д → остальные по одной. Перед включением production отключить соответствующий старый watcher-путь: реестры независимы и не предотвращают двойную доставку между сервисами. Откат: остановить notify, вернуть старые watcher-маршруты, проверить readiness. Notify DB не восстанавливается поверх watcher DB; cron автоматически не меняется.
 

@@ -48,6 +48,8 @@ def response(
         except (ValueError, TypeError):
             delay = 0
         return Result("retry", "http_429", delay)
+    if status == 408:
+        return Result("retry", "http_408")
     # Only a proven rejection of the reply target permits dropping the anchor.
     description = str(data.get("description", "")).casefold()
     reply_error = data.get("code") in {
@@ -134,6 +136,8 @@ class Sender:
                     return Result("retry", "response_oversized")
             try:
                 data = strict_json_loads(chunks)
+            except RecursionError:
+                return Result("retry", "response_uncertain")
             except (ValueError, UnicodeError):
                 data = {}
             if not isinstance(data, dict):
