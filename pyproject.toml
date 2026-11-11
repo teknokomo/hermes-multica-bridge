@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-multica-bridge"
-version = "0.3.0"
+version = "0.4.0"
 description = "Hermes plugin for secure Standard or Isolated task delivery to Multica with result tracking"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,13 +12,17 @@ license = "LicenseRef-Omsk-Open-License-Basic-Attribution"
 license-files = ["LICENSE-RU.md"]
 dependencies = ["websockets>=13,<16"]
 
+[project.scripts]
+hermes-multica-notify = "notify.cli:main"
+
 [tool.setuptools]
 include-package-data = true
 
 [tool.setuptools.packages.find]
-include = ["bridge", "bridge.*"]
+include = ["bridge", "bridge.*", "notify", "notify.*"]
 
 [tool.setuptools.data-files]
+"share/hermes/plugins/hermes-multica-bridge/notify" = ["notify/*.py"]
 "share/hermes/plugins/hermes-multica-bridge" = ["plugin.yaml", "__init__.py", "MANIFEST.sha256"]
 "share/hermes/plugins/hermes-multica-bridge/bridge" = ["bridge/*.py"]
 "share/hermes/plugins/hermes-multica-bridge/dashboard" = ["dashboard/manifest.json", "dashboard/plugin_api.py"]

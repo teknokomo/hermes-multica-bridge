@@ -21,7 +21,7 @@ Made with the support of the [73rd Meridian Consortium](https://om73.ru).
 
 `hermes-multica-bridge` is a Hermes plugin for two Multica workflows: sending the current pinned Kanban task to Autopilot and creating/managing Workspace issues from trusted MAX or Telegram message context.
 
-Version 0.3.0 supports two security modes:
+Version 0.4.0 supports two security modes:
 
 - **Standard** — the plugin sends HTTPS requests itself. Non-secret topology is stored in the profile's `ConnectionRegistry`; each Route's webhook/HMAC/PAT credentials are managed through the public Hermes plugin credential API and read at runtime only through `agent.secret_scope`.
 - **Isolated** — the plugin never receives Multica secrets. Each new Route uses a separate socket-activated systemd sender instance with root-owned configuration and systemd credentials.
@@ -222,7 +222,7 @@ Webhook URLs, PATs, HMAC secrets, and secret response bodies are not stored in t
 
 ## Configuration lifecycle
 
-The plugin is version 0.3.0. The registry accepts its current canonical structure without internal versioning. Watcher state supports a one-way migration from 0.2.0; incompatible SQLite schemas are rejected.
+The plugin is version 0.4.0. The registry accepts its current canonical structure without internal versioning. Watcher state supports a one-way migration from 0.2.0; incompatible SQLite schemas are rejected.
 
 Switching between Standard and Isolated does not transfer secrets automatically. A new mode is enabled only after its own readiness check. Enabling a Route locks its destination; use a new Route for another destination and disable + tombstone the previous one.
 
@@ -241,16 +241,16 @@ Switching between Standard and Isolated does not transfer secrets automatically.
 The main offline suite makes no live Multica requests and uses fake credentials/mocked HTTP.
 
 ```bash
-python3 -m unittest discover -s tests -v
+python3 -m pytest -q
 node --test tests/test_desktop_profile_guard.mjs tests/test_desktop_registry_ui.mjs
-python3 -m compileall -q bridge dashboard deploy tests
+python3 -m compileall -q bridge notify dashboard deploy tests
 ```
 
 The release gate also includes Ruff, Bandit, package build/metadata checks, `hermes plugins validate` and `doctor` on a clean staging copy, `systemd-analyze verify`, a secret/personal-data scan, and project Thermos/Autoreview.
 
 ## Development status
 
-The product version is 0.3.0. This extends the first plugin release without internal Registry, state-store, or API versions. Server installation, live Multica writes, commit/push, and publication are separate stages.
+The product version is 0.4.0. Existing bridge formats are preserved; notify uses an independent SQLite DB with PRAGMA user_version and no internal API versions. Server installation, live Multica writes, commit/push, and publication are separate stages.
 
 ## License
 
@@ -291,3 +291,39 @@ All quiet classes use a durable payload and a send budget including the initial 
 State migration is one-way. Installation requires a consistent SQLite backup, SHA-256, an S3 copy, and a TOML snapshot. Rollback requires stopping the watcher, restoring DB/TOML, and running 0.2.0; mappings added after the snapshot are lost.
 
 ### Backfill registrar
+
+## Central notifications 0.4.0
+
+`hermes-multica-notify` is a separate process: Multica WS + read-only CLI → normalized events → subscriptions → durable outbox → Telegram/MAX. Intake and the seven Hermes tools retain their behavior; the existing watcher remains independent.
+
+TOML contains service/policy/accounts/workspaces; SQLite stores subscriptions and runtime state. Example: `config/notify.example.toml`. It is disabled and contains placeholders. Tokens come only from systemd credentials or private files, and Multica CLI 0.8.2+ receives a separate HOME/profile per workspace.
+
+```bash
+hermes-multica-notify --config /REPLACE/notify.toml init --db-path /REPLACE/notify.sqlite3 --runtime-dir /REPLACE/runtime
+hermes-multica-notify --config /REPLACE/notify.toml run
+hermes-multica-notify --config /REPLACE/notify.toml subscription list --json
+hermes-multica-notify --config /REPLACE/notify.toml status --json
+hermes-multica-notify --config /REPLACE/notify.toml doctor --offline
+```
+
+Before adding subscriptions, the service must project the TOML infrastructure into SQLite. `workspace add` appends a table, preserves comments, and requests SIGHUP. An invalid reload keeps the previous projection; removing a workspace/account disables dependent subscriptions.
+
+A subscription selects an account, platform, chat_type, and chat; Telegram threads require a thread ID, while MAX threads are rejected. An empty thread means the chat itself; empty project/squad means no filter. Squad matches only type=squad assignments; labels require every listed name. Quiet is the default.
+
+REPORT is never sent separately, including in verbose mode. A final message includes the latest report from the current observed cycle; an unknown boundary uses a 15-minute lookback. Missing transitions are not synthesized; repeated observed completions use a persistent transition_seq.
+
+Disable cancels pending/retry entries. Inflight delivery may finish; re-enable sets since=now. `replay ID` and `dead-letter retry ID` explicitly requeue dead/cancelled entries with retained payloads and keep their recipient.
+
+Every POST consumes an attempt, including the one-time fallback without reply after a confirmed anchor error. The thread is preserved. A lost response permits retry and a possible duplicate; exactly-once is not guaranteed. Telegram groups and threads are paced at least 3 seconds apart per chat (no more than 20 per minute); Telegram private chats retain 1-second pacing, and MAX pacing is unchanged. The account-wide cap remains 20 messages/s.
+
+Polling runs every 45 seconds with a 300-second overlap. Full reconciliation runs every 300±30 seconds, at most two concurrently and one per workspace. Only available Multica history can be recovered; status exposes recovery_mode/history_gap_seconds/source_history_limited.
+
+The event log is retained for 7 days and terminal notifications for 30; delivered payloads are cleared immediately, while dead/cancelled payloads remain replayable for 30 days. Processed keys live for the subscription lifetime; pending hints are coalesced by workspace/issue/type (per task ID for `task:failed`), have no age expiry, and are capped at 10,000 per workspace. On overflow, new unique hints are rejected with a diagnostic; a historical `--since` subscription triggers a full scan of available history. Processed hints last 24 hours, and rejected hints last 7 days.
+
+`import-watcher --watcher-config ... --bindings ... --dry-run` validates explicit TOML bindings without writing. A real import creates infrastructure TOML tables and disabled subscriptions after reload; mappings/old DBs are not copied. `import-issues --subscription ID` loads a baseline without historical delivery. `--shadow` marks a separate subscription to an explicitly selected test chat.
+
+Installation, LoadCredential drop-ins, cutover, cron, and live pilots are separate stages. Cutover requires consistent DB/TOML backups and an S3 copy; enabling a production subscription requires disabling its old watcher path. Rollback stops notify, restores previous watcher routes, and checks readiness. See `deploy/README.md`.
+
+Pacing serializes dispatch through request completion so scheduler delays cannot bunch POST requests; this is a conservative limit, not a throughput promise of 20/s. Changing delivery_workers or request_timeout_seconds requires a restart; reload rejects that candidate. Status exposes heartbeat, cursor lag, and degraded state.
+
+Before combining an issue with comments and task runs, the service rereads the issue and retries up to three times to obtain a coherent snapshot. If it keeps changing, the event is deferred and the cursor does not advance.

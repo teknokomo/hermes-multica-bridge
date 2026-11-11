@@ -192,7 +192,7 @@ Profile/generation guards отбрасывают stale status/save/credential re
 
 ## Lifecycle конфигурации
 
-Версия продукта — 0.2.0. Registry и пустые state stores создаются для текущей архитектуры; неизвестные поля и несовместимые SQLite schema отклоняются без migration path или внутренних версий API/state.
+Версия продукта — 0.4.0. Registry и Workspace ledger используют текущую структуру без внутренних версий API. Watcher поддерживает документированную миграцию 0.2.0→0.3.0; notify использует независимую схему SQLite. Неизвестные форматы отклоняются.
 
 Переход Standard ↔ Isolated не переносит секреты автоматически. Новый Route/режим включается только после отдельной readiness-проверки. Ledger сохраняет immutable delivery snapshot, поэтому rename/disable/tombstone текущего Route не меняет destination уже созданной delivery.
 
@@ -217,3 +217,14 @@ Release gate должен включать:
 ## Quiet-доставка 0.3.0
 
 Quiet повторяет неопределённые исходы в ограниченном бюджете: возможен дубль при потере ответа. Готовое сообщение хранится в приватном state без credentials; после подтверждения payload очищается. Claim и завершение fenced по attempts; recipient policy перепроверяется перед отправкой. Verbose сохраняет at-most-once. Миграция односторонняя; откат требует снимка БД и TOML.
+
+
+## Центральный notify 0.4.0
+
+Notify работает под отдельным hermes-notify, с независимыми SQLite и runtime-каталогом 0700. DB, bindings и частные credential files — 0600; systemd credential files могут быть 0400. Токены не записываются в SQLite, outbox, аргументы процессов или журнал. Для CLI создаётся временный service-owned HOME/profile из credential, без доступа к Hermes home и без зависимости от token env.
+
+Подписки создаются только локально. Поля получателя immutable; новый account/chat/thread требует новой подписки. Импорт разрешён только с явным приватным TOML bindings и проверкой старых allowlist; импортированные подписки disabled. Snapshot/fan-out/seen и outbox claim/finish используют транзакции; завершение fenced по lease_token и attempts.
+
+Новый store использует только PRAGMA user_version для миграций SQLite. Старые watcher databases не открываются как notify state. Event log7d/terminal30d/replay30d, долгоживущие processed keys без текста и отдельный retention hints предотвращают повторную отправку после очистки. Журнал/status исключают тексты, chat IDs и credentials. Сам event log содержит только минимальные идентификаторы, не тела комментариев.
+
+Доставка at-least-once допускает дубль после неопределённого сетевого ответа. Anchor fallback разрешён только при подтверждённом отказе reply, при сохранении треда и общем бюджете POST. Чтение доступной истории не доказывает восстановление удалённых или ненаблюдённых переходов. Публичного административного HTTP API нет; сервис не пишет в Multica.
