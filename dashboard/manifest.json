@@ -3,7 +3,7 @@
   "label": "Multica Bridge",
   "description": "Состояние, подключение и диагностика Hermes ↔ Multica Bridge",
   "icon": "Plug",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "tab": {
     "path": "/multica-bridge",
     "position": "after:plugins"

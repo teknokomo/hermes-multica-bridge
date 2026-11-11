@@ -1,0 +1,35 @@
+# Пример: credentials и subscriptions устанавливаются оператором отдельно.
+[service]
+db_path = "/var/lib/hermes-multica-notify/notify.sqlite3"
+runtime_dir = "/run/hermes-multica-notify"
+cli_binary = "/usr/local/bin/multica"
+poll_seconds = 45
+poll_overlap_seconds = 300
+request_timeout_seconds = 15
+max_attempts = 5
+sending_timeout_seconds = 300
+full_reconcile_seconds = 300
+full_reconcile_jitter_seconds = 30
+full_reconcile_parallelism = 2
+delivery_workers = 4
+retention_events_days = 7
+retention_notifications_days = 30
+replay_retention_days = 30
+
+[policy]
+final_statuses = ["done", "in_review"]
+question_prefixes = ["QUESTION:", "ВОПРОС:"]
+report_prefixes = ["REPORT:", "ОТЧЁТ:"]
+lookback_minutes = 15
+operator_mentions = []
+
+[accounts.telegram-test]
+platform = "telegram"
+token_credential = "notify-telegram-test"
+
+[workspaces.test]
+origin = "https://multica.example.invalid"
+workspace_id = "REPLACE_WORKSPACE_UUID"
+cli_profile = "notify-test"
+pat_credential = "notify-pat-test"
+enabled = false

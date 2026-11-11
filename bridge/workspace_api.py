@@ -146,9 +146,9 @@ class WorkspaceApiClient:
             "Accept": "application/json",
             "Authorization": f"Bearer {self._pat}",
             "X-Workspace-ID": self.workspace_id,
-            "User-Agent": "hermes-multica-bridge/0.3.0",
+            "User-Agent": "hermes-multica-bridge/0.4.0",
             "X-Client-Platform": "daemon",
-            "X-Client-Version": "0.3.0",
+            "X-Client-Version": "0.4.0",
         }
         if body is not None:
             headers["Content-Type"] = content_type

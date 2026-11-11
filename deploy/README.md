@@ -1,4 +1,4 @@
-# Развёртывание Hermes Multica Bridge 0.3.0
+# Развёртывание Hermes Multica Bridge 0.4.0
 
 Эта инструкция описывает настройку после копирования публичного пакета на целевой хост. Она не выполняет deployment автоматически.
 
@@ -94,7 +94,7 @@ Workspace tools не требуют изменений `PluginContext.register_t
 
 ```bash
 sudo python3 -m venv /opt/hermes-multica-bridge/watcher-venv
-sudo /opt/hermes-multica-bridge/watcher-venv/bin/pip install /path/to/hermes_multica_bridge-0.3.0-py3-none-any.whl
+sudo /opt/hermes-multica-bridge/watcher-venv/bin/pip install /path/to/hermes_multica_bridge-0.4.0-py3-none-any.whl
 sudo install -m 0644 deploy/systemd/hermes-multica-watcher.service \
   /etc/systemd/system/hermes-multica-watcher.service
 ```
@@ -256,7 +256,7 @@ sudo systemctl stop hermes-multica-bridge@<instance>.service
 
 ## Чистая установка профиля
 
-Версия продукта — 0.3.0. ConnectionRegistry и Workspace ledger сохраняют текущую структуру без внутренних версий. Watcher state поддерживает только документированную одностороннюю миграцию с 0.2.0; неизвестные схемы отклоняются. Credentials задаются заново через предназначенные для них Hermes/systemd интерфейсы и не выводятся в терминал или отчёты.
+Версия продукта — 0.4.0. ConnectionRegistry и Workspace ledger сохраняют текущую структуру без внутренних версий. Watcher state поддерживает только документированную одностороннюю миграцию с 0.2.0; неизвестные схемы отклоняются. Credentials задаются заново через предназначенные для них Hermes/systemd интерфейсы и не выводятся в терминал или отчёты.
 
 При первом включении Route его destination фиксируется. После появления deliveries нельзя удалять ledger или переиспользовать их `route_id` для другого назначения. Включённый или использованный Route должен остаться в registry и при выводе из эксплуатации перейти в disable + tombstone: result lookup использует immutable snapshot исходной доставки.
 
@@ -313,3 +313,34 @@ python3 deploy/tools/multica_watch_register.py --config /REPLACE/private.json --
 Конфигурация и журнал — приватные файлы 0600 в каталогах 0700. CLI выполняет только чтение issue get/list с закреплёнными profile, HTTPS origin и workspace. Перед IPC проверяется проект. Получателя нельзя заменить аргументами задачи. Dry-run не меняет mapping или журнал; подтверждение сохраняется только после ACK watcher. Повтор sweep идемпотентен; sweep_since задаётся при активации и не сдвигается между проходами.
 
 Коды завершения: 0 — успех; 1 — недоступная или чужая задача; 2 — недоступный IPC/потерянный ACK; 3 — отказ watcher или конфликт mapping; 4 — неверные аргументы, конфигурация, ответ CLI или журнал. Установка утилиты, настройка живых credentials и cron выполняются отдельным этапом.
+
+## Центральный notify 0.4.0
+
+Notify устанавливается в собственный venv и работает под `hermes-notify`. Плагинные tools и старый watcher остаются независимыми. Эта инструкция описывает отдельный deployment-этап; исходники не устанавливают службы автоматически.
+
+1. Сохранить согласованные SQLite backup, TOML, SHA-256 и S3-копии действующего watcher. Не заменять custom units и credentials.
+2. Создать системного пользователя `hermes-notify`, StateDirectory/RuntimeDirectory 0700 и приватный каталог конфигурации. Конфигурацией и CLI-файлами владеет hermes-notify; административные CLI-команды выполнять от этого пользователя.
+3. Установить wheel 0.4.0 в `/opt/hermes-multica-notify/venv`. Положить unit из репозитория; добавить operator-owned drop-in с точными `LoadCredential=<имя>:<приватный-путь>` для используемых accounts/workspaces. Не создавать пустые credentials.
+4. Инициализировать конфигурацию через `init`, заполнить TOML и credentials. Пример содержит нерабочие плейсхолдеры. Основной CLI 0.8.2 должен поддерживать updated-since/until, сортировку и paging; doctor проверяет capabilities. Перед live отдельно проверить точный серверный бинарник.
+5. После запуска `run` сервис строит infrastructure projection. Затем добавлять подписки. Изменения workspace через CLI append-only сохраняют комментарии и требуют SIGHUP; invalid reload оставляет рабочую проекцию.
+
+```bash
+hermes-multica-notify --config /REPLACE/notify.toml workspace add --name test --origin https://multica.example.invalid --workspace-id REPLACE_UUID --cli-profile notify-test --pat-credential notify-pat-test
+hermes-multica-notify --config /REPLACE/notify.toml subscription add --platform telegram --account telegram-test --chat REPLACE_CHAT --chat-type thread --thread REPLACE_THREAD --workspace test --project REPLACE_PROJECT --shadow --label "Тест"
+hermes-multica-notify --config /REPLACE/notify.toml import-watcher --watcher-config /REPLACE/watcher.toml --bindings /REPLACE/watcher-bindings.toml --dry-run
+hermes-multica-notify --config /REPLACE/notify.toml import-issues --subscription REPLACE_SUBSCRIPTION --dry-run
+hermes-multica-notify --config /REPLACE/notify.toml status --json
+hermes-multica-notify --config /REPLACE/notify.toml doctor
+```
+
+Импорт без dry-run добавляет недостающие инфраструктурные таблицы TOML и запрашивает reload; подписки записываются только после появления проекции в работающем сервисе. Если сервис не запущен, команда сообщает `notify_reload_pending`; после старта её повторяют. Повторный импорт идемпотентен. Реальный bindings-файл имеет 0600, пример — `config/watcher-bindings.example.toml`; получатели из allowlist или старых mappings не выводятся.
+
+`subscription disable ID` отменяет pending/retry; `enable ID` устанавливает since=now. `replay ID` разрешён только для dead/cancelled с retained payload и включённой подпиской. Истёкший payload восстановить нельзя. Shadow — отдельная подписка на явный тестовый чат, не автоматическое перенаправление production-потока.
+
+CLI-профиль создаётся в runtime HOME workspace с правами 0600/0700 из systemd credential. HOME пользователя Hermes и token env не используются; sandbox ProtectHome остаётся включён. SIGHUP не устанавливает новые systemd credentials: новые LoadCredential требуют отдельного root-изменения unit/drop-in и перезапуска.
+
+Полная сверка 300±30 секунд: максимум две одновременно и одна на workspace; polling45s/overlap300s. Наблюдаемость показывает историю, которую источник не смог предоставить. Retention: events7d, terminal/replay30d, processed keys весь срок подписки, pending hints без TTL, processed24h/rejected7d.
+
+Пилоты отдельно: shadow24ч → одна production-подписка7д → остальные по одной. Перед включением production отключить соответствующий старый watcher-путь: реестры независимы и не предотвращают двойную доставку между сервисами. Откат: остановить notify, вернуть старые watcher-маршруты, проверить readiness. Notify DB не восстанавливается поверх watcher DB; cron автоматически не меняется.
+
+Notify reload отклоняет изменения db_path, runtime_dir, delivery_workers и request_timeout_seconds: они требуют отдельного перезапуска. Отправки сериализованы до завершения HTTP для консервативного pacing; сбор workspace выполняется независимо. Постоянно недоступные по 403/404 issue из hints изолируются как rejected и не блокируют остальные задачи; текст ответа не журналируется.

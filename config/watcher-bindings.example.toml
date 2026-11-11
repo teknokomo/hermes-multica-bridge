@@ -1,0 +1,11 @@
+# Нерабочий пример. Настоящий bindings-файл: 0600, каталог 0700.
+[[bindings]]
+route_id = "REPLACE_ROUTE_UUID"
+platform = "telegram"
+account = "telegram-test"
+chat_id = "REPLACE_CHAT_ID"
+chat_type = "thread"
+thread_id = "REPLACE_THREAD_ID"
+anchor_message_id = "REPLACE_MESSAGE_ID"
+label = "Тестовая подписка"
+mode = "quiet"

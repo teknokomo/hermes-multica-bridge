@@ -4,6 +4,7 @@ include pyproject.toml
 include uv.lock
 include MANIFEST.sha256
 recursive-include bridge *.py
+recursive-include notify *.py
 recursive-include config *.toml *.json
 recursive-include deploy *.py *.md *.service *.socket
 include dashboard/manifest.json dashboard/plugin_api.py

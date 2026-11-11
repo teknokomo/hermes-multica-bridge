@@ -1,5 +1,5 @@
 name: hermes-multica-bridge
-version: "0.3.0"
+version: "0.4.0"
 manifest_version: 2
 requires_hermes: ">=0.22.4"
 description: "Bridge between Hermes and Multica: Kanban Autopilot routes and MAX/Telegram workspace routes with a separate delivery watcher."

@@ -1,10 +1,17 @@
-# 0.3.0
+# Changelog
+
+## 0.4.0
+
+- Центральный сервис hermes-multica-notify: подписки Telegram/MAX, isolated CLI profiles, WS/poll recovery и durable outbox.
+- Quiet/verbose, REPORT текущего цикла, typed squad и labels AND, bounded retries, lease fencing, dead-letter/replay.
+- TOML reload, explicit disabled watcher import, baseline issue import, shadow marker, private status/doctor и отдельный systemd unit.
+- Существующие intake/tools/watcher сохраняют поведение; live deployment и пилоты выполняются отдельно.
+
+## 0.3.0
 
 - Явная quiet-политика watcher, bounded retries и durable payload.
 - REPORT после паузы включается в final; cancelled включается отдельно.
 - Миграция state односторонняя; откат через согласованные снимки БД/TOML.
-
-# Changelog
 
 ## 0.2.0
 
