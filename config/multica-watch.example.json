@@ -1,0 +1,19 @@
+{
+  "watcher_profile": "REPLACE_PROFILE",
+  "platform": "telegram",
+  "chat_type": "thread",
+  "multica_profile": "REPLACE_MULTICA_PROFILE",
+  "multica_server_url": "https://multica.example.invalid",
+  "workspace_id": "REPLACE_WORKSPACE_UUID",
+  "sweep_since": "2099-01-01T00:00:00Z",
+  "user_id": "REPLACE_USER_ID",
+  "chat_id": "REPLACE_CHAT_ID",
+  "thread_id": "REPLACE_THREAD_ID",
+  "message_id": "REPLACE_ANCHOR_MESSAGE_ID",
+  "routes": {
+    "route-a": {
+      "route_id": "REPLACE_ROUTE_UUID",
+      "project_id": "REPLACE_PROJECT_UUID"
+    }
+  }
+}
