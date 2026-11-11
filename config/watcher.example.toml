@@ -26,7 +26,8 @@ source_platforms = ["max", "telegram"]
 allowed_user_ids = ["REPLACE_WITH_USER_ID"]
 allowed_chat_ids = ["REPLACE_WITH_CHAT_ID"]
 allow_groups = false
-allowed_statuses = ["todo", "in_progress", "done"]
+allowed_statuses = ["blocked", "done", "in_review", "cancelled"]
+notifications = { mode = "quiet", events = ["question", "blocked", "final", "failed"], max_attempts = 5, sending_timeout_seconds = 300 }
 
 [[profiles.om73.routes]]
 route_id = "REPLACE_WITH_WORKSPACE_ROUTE_ID_2"

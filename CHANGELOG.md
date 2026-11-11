@@ -1,3 +1,9 @@
+# 0.3.0
+
+- Явная quiet-политика watcher, bounded retries и durable payload.
+- REPORT после паузы включается в final; cancelled включается отдельно.
+- Миграция state односторонняя; откат через согласованные снимки БД/TOML.
+
 # Changelog
 
 ## 0.2.0

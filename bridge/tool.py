@@ -19,6 +19,7 @@ from .registry import (
 from .service import BridgeService, ServiceCredentials
 from .state import DeliverySnapshot, DeliveryStore
 from .validation import request_fingerprint
+from .watcher_ipc import WatcherIpcClient
 from .workspace_tools import register_workspace_tools, trusted_source
 
 PLUGIN_ID = "hermes-multica-bridge"
@@ -447,6 +448,18 @@ class PluginRuntime:
                         "warnings": list(route.config_warnings),
                         "security_mode": connection.security_mode,
                     })
+            profile_name = getattr(self.ctx, "profile_name", None)
+            profile_name = profile_name if isinstance(profile_name, str) and profile_name else "default"
+            for row in rows:
+                if row.get("watcher_enabled"):
+                    try:
+                        info = WatcherIpcClient(timeout=0.3).route_policies(profile_name, row["route_id"])
+                        row["notifications"] = info["notifications"]
+                        row["warnings"] = sorted(set(row["warnings"] + info.get("warnings", [])))
+                        if info.get("disabled"):
+                            row["watcher_policy"] = info.get("error_code") or "notification_policy_invalid"
+                    except (BridgeError, KeyError, TypeError):
+                        row["watcher_policy"] = "source_unavailable"
             try:
                 current = read_current_task_with_context(dispatch_tool=self.ctx.dispatch_tool)
             except BridgeError:

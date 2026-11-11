@@ -21,7 +21,7 @@ Made with the support of the [73rd Meridian Consortium](https://om73.ru).
 
 `hermes-multica-bridge` is a Hermes plugin for two Multica workflows: sending the current pinned Kanban task to Autopilot and creating/managing Workspace issues from trusted MAX or Telegram message context.
 
-Version 0.2.0 supports two security modes:
+Version 0.3.0 supports two security modes:
 
 - **Standard** — the plugin sends HTTPS requests itself. Non-secret topology is stored in the profile's `ConnectionRegistry`; each Route's webhook/HMAC/PAT credentials are managed through the public Hermes plugin credential API and read at runtime only through `agent.secret_scope`.
 - **Isolated** — the plugin never receives Multica secrets. Each new Route uses a separate socket-activated systemd sender instance with root-owned configuration and systemd credentials.
@@ -120,7 +120,7 @@ After issue creation, the plugin writes `origin`, `origin_route`, and `created_b
 
 The watcher is a separate `hermes-multica-watcher.service` process running as `om73-watcher`. It uses its own root-owned configuration, systemd credentials, and private SQLite state, and cannot access the Hermes home directory. The plugin registers a verified issue-to-source-message mapping through a Unix socket, where the peer UID is checked with `SO_PEERCRED`. The watcher reconnects to the WebSocket with backoff and also reconciles issues/comments by polling every 30–60 seconds. On the first reconciliation it suppresses comments created before the chat mapping was registered; later comments and changes are delivered only when a mapping exists.
 
-Notification delivery records confirmed sends as `delivered`, proven rejections as `not_sent`, and lost responses after a possible send as `delivery_unknown`. Only an explicit HTTP 429 is retried on a later reconciliation; `delivery_unknown` is never retried. Telegram sends are paced per chat, while MAX keeps its existing pacing. A failed watcher mapping stays in the profile ledger and later authorized Workspace operations retry it from the stored source fields; `get` never maps an issue from its current caller context. If the platform cannot reply to the exact source message/thread, the notification is not sent to the parent chat.
+In verbose mode, notification delivery records confirmed sends as `delivered`, proven rejections as `not_sent`, and lost responses after a possible send as `delivery_unknown`. Only an explicit HTTP 429 is retried on a later reconciliation; `delivery_unknown` is never retried. Telegram sends are paced per chat, while MAX keeps its existing pacing. A failed watcher mapping stays in the profile ledger and later authorized Workspace operations retry it from the stored source fields; `get` never maps an issue from its current caller context. If the platform cannot reply to the exact source message/thread, the notification is not sent to the parent chat.
 
 Inbound Workspace support depends on an adapter in the target build that sets session context for each current message. The MAX inbound adapter and its correct source binding must be verified separately on the target Gateway. Outbound MAX watcher delivery is implemented separately.
 
@@ -222,7 +222,7 @@ Webhook URLs, PATs, HMAC secrets, and secret response bodies are not stored in t
 
 ## Configuration lifecycle
 
-The plugin is version 0.2.0. The registry accepts the current canonical structure; state stores are created from scratch, and incompatible SQLite schemas are rejected without migration or internal versioning.
+The plugin is version 0.3.0. The registry accepts its current canonical structure without internal versioning. Watcher state supports a one-way migration from 0.2.0; incompatible SQLite schemas are rejected.
 
 Switching between Standard and Isolated does not transfer secrets automatically. A new mode is enabled only after its own readiness check. Enabling a Route locks its destination; use a new Route for another destination and disable + tombstone the previous one.
 
@@ -250,7 +250,7 @@ The release gate also includes Ruff, Bandit, package build/metadata checks, `her
 
 ## Development status
 
-The product version is 0.2.0. This extends the first plugin release without internal Registry, state-store, or API versions. Server installation, live Multica writes, commit/push, and publication are separate stages.
+The product version is 0.3.0. This extends the first plugin release without internal Registry, state-store, or API versions. Server installation, live Multica writes, commit/push, and publication are separate stages.
 
 ## License
 
@@ -265,3 +265,29 @@ Workspace does not require a paired Hermes core patch. To work with the target c
 Three limited technical debts remain: `bridge/hermes.py` uses the private Kanban DB API only to check `worker_pid`, which is not exposed by `kanban_show`; `dashboard/plugin_api.py` uses `plugins_settings` because the dashboard route receives no `PluginContext`; and Workspace uses the internal Gateway session context because plugin tools receive no `tool_context`. After each Hermes update, run `plugins validate`, `plugins doctor --ci`, the `kanban_show`/`kanban_comment` tests, the Dashboard registry test, and the Workspace source/attachment tests. These debts can be removed when the corresponding public APIs become available.
 
 Inbound MAX depends on a suitable MAX adapter being available in the Hermes build in use.
+
+## Notification policy
+
+Policy is configured only in watcher TOML. Without notifications, verbose preserves 0.2.0 behavior; quiet is explicitly enabled.
+
+| Class | When it is sent |
+|---|---|
+| question | QUESTION:/ВОПРОС: or an operator mention while blocked |
+| blocked | Transition into blocked |
+| final | Transition into done/in_review with the latest eligible REPORT:/ОТЧЁТ: |
+| failed | A received task:failed event |
+| cancelled | Transition into cancelled, only when explicitly enabled |
+
+Quiet suppresses ordinary and own comments. Reports are never sent separately; final selects the latest eligible report, including seen comments, at or after cycle_started_at when known, or within lookback only when the cycle boundary is unknown. Exact historical transitions cannot be recovered: migrated snapshots use updated_at for the status boundary and leave the cycle boundary unknown. An observed final-to-nonfinal transition starts a new cycle; quiet snapshots follow every status, including those outside allowed_statuses.
+
+```toml
+notifications = { mode = "quiet", events = ["question", "blocked", "final", "failed"], final_statuses = ["done", "in_review"], max_attempts = 5, sending_timeout_seconds = 300 }
+```
+
+final_statuses must belong to allowed_statuses. For cancelled, add it to both events and allowed_statuses. Invalid policy disables its route; readiness exposes degraded status and diagnostics. Policy is available through route_policies IPC and best-effort multica_list_routes.
+
+All quiet classes use a durable payload and a send budget including the initial send and HTTP 429. Delays are 30/60/120/300/600 seconds, then 600. A lost response may cause a duplicate; server-side exactly-once delivery is not promised. Exhaustion records retry_exhausted. Verbose retains its existing retries.
+
+State migration is one-way. Installation requires a consistent SQLite backup, SHA-256, an S3 copy, and a TOML snapshot. Rollback requires stopping the watcher, restoring DB/TOML, and running 0.2.0; mappings added after the snapshot are lost.
+
+### Backfill registrar

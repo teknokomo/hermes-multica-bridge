@@ -90,14 +90,14 @@ class WatcherStateTests(unittest.TestCase):
         path.chmod(0o600)
         with self.assertRaises(BridgeError) as raised:
             WatcherState(path)
-        self.assertEqual(raised.exception.code, "watcher_state_unavailable")
+        self.assertEqual(raised.exception.code, "watcher_state_migration_failed")
 
     def test_state_without_mapping_registration_timestamp_is_rejected(self) -> None:
         with sqlite3.connect(self.path) as db:
             db.execute("ALTER TABLE mappings DROP COLUMN registered_at_ns")
         with self.assertRaises(BridgeError) as raised:
             WatcherState(self.path)
-        self.assertEqual(raised.exception.code, "watcher_state_unavailable")
+        self.assertEqual(raised.exception.code, "watcher_state_migration_failed")
 
 
 if __name__ == "__main__":
