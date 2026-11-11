@@ -346,7 +346,7 @@ class WatcherTests(unittest.TestCase):
             self.assertEqual(json.loads(connections[1].sent[0]), {
                 "type": "auth", "payload": {"token": "fake-token"},
             })
-            self.assertEqual(watcher._event_queue.get_nowait(), ("om73", "route-1", {"issue_id": "issue-1"}))
+            self.assertEqual(watcher._event_queue.get_nowait(), ("om73", "route-1", {"issue_id": "issue-1", "type": "issue:updated"}))
 
         asyncio.run(exercise())
 

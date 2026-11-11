@@ -11,10 +11,12 @@ import signal
 import socket
 import stat
 import struct
+import threading
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
+from . import quiet_notifications
 from .errors import BridgeError
 from .validation import _valid_telegram_thread_id
 from .watcher_api import watcher_api
@@ -82,6 +84,7 @@ def _comment_is_after_registration(comment_created_at: Any, registered_at_ns: An
 class Watcher:
     def __init__(self, config: WatcherConfig):
         self.config = config
+        self._quiet_lock = threading.RLock()
         self.states: dict[str, WatcherState] = {}
         self.apis: dict[tuple[str, str], Any] = {}
         self.senders: dict[str, PlatformSender] = {}
@@ -94,6 +97,9 @@ class Watcher:
             telegram_token = read_systemd_credential(profile.telegram_token_credential) if profile.telegram_token_credential else ""
             self.senders[profile.name] = PlatformSender(max_token=max_token, telegram_token=telegram_token)
             for route in profile.routes:
+                if route.policy_error:
+                    logger.warning("route_id=%s disabled=%s", route.route_id, route.policy_error)
+                    continue
                 self.apis[(profile.name, route.route_id)] = watcher_api(
                     route.multica_origin, pat, route.workspace_id, timeout=config.request_timeout_seconds,
                 )
@@ -133,6 +139,8 @@ class Watcher:
         profile = self.config.profile(mapping["profile"])
         route = self.config.route(profile, mapping["route_id"])
         self._authorize_mapping(profile, route, mapping, peer_uid)
+        if route.policy_error:
+            raise BridgeError(route.policy_error, "Watcher route policy is disabled.")
         api = self.apis[(profile.name, route.route_id)]
         issue = api.get_issue(mapping["issue_id"])
         self._verify_issue(issue, route)
@@ -150,7 +158,20 @@ class Watcher:
         if issue.get("workspace_id") != route.workspace_id or issue.get("project_id") != route.project_id:
             raise BridgeError("watcher_issue_route_mismatch", "The issue does not belong to this watcher route.")
 
-    def _reconcile(self, profile: WatcherProfile, route: WatcherRoute, issue_id: str, *, initial: bool = False) -> None:
+    def _reconcile(self, profile: WatcherProfile, route: WatcherRoute, issue_id: str, *, initial: bool = False, event: dict[str, Any] | None = None) -> None:
+        if route.policy_error:
+            return
+        if route.notifications.mode == "quiet":
+            with self._quiet_lock:
+                locks = self.__dict__.setdefault("_quiet_issue_locks", {})
+                issue_lock = locks.setdefault((profile.name, issue_id), threading.RLock())
+            with issue_lock:
+                try:
+                    quiet_notifications.reconcile(self, profile, route, issue_id, event)
+                except BridgeError as exc:
+                    logger.warning("route_id=%s reconciliation=%s", route.route_id, exc.code)
+            quiet_notifications.drain(self, profile, route)
+            return
         state = self.states[profile.name]
         mapping = state.mapping(issue_id)
         if mapping is None or mapping["route_id"] != route.route_id:
@@ -268,7 +289,20 @@ class Watcher:
             body = await asyncio.wait_for(reader.readexactly(size), timeout=3)
             request = decode_frame(header + body)
             if request == {"operation": "readiness"}:
-                response = {"ok": True, "ready": True}
+                visible = [p for p in self.config.profiles if peer_uid in p.allowed_peer_uids]
+                disabled = [{"profile": p.name, "route_id": r.route_id, "error_code": r.policy_error}
+                            for p in visible for r in p.routes if r.policy_error]
+                response = {"ok": True, "ready": any(not r.policy_error for p in visible for r in p.routes)}
+                if disabled:
+                    response.update(degraded=True, disabled_routes=disabled[:32], disabled_count=len(disabled))
+            elif set(request) == {"operation", "profile", "route_id"} and request["operation"] == "route_policies":
+                profile = self.config.profile(request["profile"])
+                if peer_uid not in profile.allowed_peer_uids:
+                    raise BridgeError("watcher_peer_denied", "Profile policy access denied.")
+                route = self.config.route(profile, request["route_id"])
+                response = {"ok": True, "notifications": route.notifications.public(),
+                            "warnings": list(route.policy_warnings), "disabled": bool(route.policy_error),
+                            "error_code": route.policy_error}
             elif set(request) == {"operation", "mapping"} and request.get("operation") == "register_issue":
                 response = await asyncio.to_thread(self.register_mapping, request.get("mapping"), peer_uid)
             else:
@@ -320,7 +354,7 @@ class Watcher:
                             continue
                         for issue_id in _event_issue_ids(frame):
                             try:
-                                self._event_queue.put_nowait((profile.name, route.route_id, {"issue_id": issue_id}))
+                                self._event_queue.put_nowait((profile.name, route.route_id, {"issue_id": issue_id, "type": frame["type"]}))
                             except asyncio.QueueFull:
                                 logger.warning("Watcher event queue is full for route %s", route.route_id)
             except asyncio.CancelledError:
@@ -341,6 +375,7 @@ class Watcher:
                 return
             except TimeoutError:
                 pass
+            await asyncio.to_thread(quiet_notifications.drain, self, profile, route)
             mappings = self.states[profile.name].mappings(profile.name, route.route_id)
             await asyncio.gather(*(
                 asyncio.to_thread(self._reconcile, profile, route, mapping["issue_id"])
@@ -356,7 +391,7 @@ class Watcher:
             try:
                 profile = self.config.profile(profile_name)
                 route = self.config.route(profile, route_id)
-                await asyncio.to_thread(self._reconcile, profile, route, event["issue_id"])
+                await asyncio.to_thread(self._reconcile, profile, route, event["issue_id"], event=event)
             except BridgeError as exc:
                 logger.warning("Watcher event reconciliation refused for route %s (%s)", route_id, exc.code)
             except Exception as exc:  # noqa: BLE001 - one malformed event must not stop the queue consumer
@@ -396,6 +431,8 @@ class Watcher:
         tasks = [asyncio.create_task(self._consume_events(), name="watcher-events")]
         for profile in self.config.profiles:
             for route in profile.routes:
+                if route.policy_error:
+                    continue
                 tasks.append(asyncio.create_task(self._websocket_loop(profile, route), name=f"ws-{route.route_id}"))
                 tasks.append(asyncio.create_task(self._poll_route(profile, route), name=f"poll-{route.route_id}"))
         loop = asyncio.get_running_loop()

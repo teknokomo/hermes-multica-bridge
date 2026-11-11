@@ -1,4 +1,4 @@
-# Развёртывание Hermes Multica Bridge 0.2.0
+# Развёртывание Hermes Multica Bridge 0.3.0
 
 Эта инструкция описывает настройку после копирования публичного пакета на целевой хост. Она не выполняет deployment автоматически.
 
@@ -94,7 +94,7 @@ Workspace tools не требуют изменений `PluginContext.register_t
 
 ```bash
 sudo python3 -m venv /opt/hermes-multica-bridge/watcher-venv
-sudo /opt/hermes-multica-bridge/watcher-venv/bin/pip install /path/to/hermes_multica_bridge-0.2.0-py3-none-any.whl
+sudo /opt/hermes-multica-bridge/watcher-venv/bin/pip install /path/to/hermes_multica_bridge-0.3.0-py3-none-any.whl
 sudo install -m 0644 deploy/systemd/hermes-multica-watcher.service \
   /etc/systemd/system/hermes-multica-watcher.service
 ```
@@ -256,7 +256,7 @@ sudo systemctl stop hermes-multica-bridge@<instance>.service
 
 ## Чистая установка профиля
 
-Версия продукта — 0.2.0. ConnectionRegistry, Workspace watcher config и оба state stores создаются для текущей архитектуры с нуля. Неизвестные поля и несовместимые базы отклоняются; миграция внутренних форматов отсутствует. Credentials задаются заново через предназначенные для них Hermes/systemd интерфейсы и не выводятся в терминал или отчёты.
+Версия продукта — 0.3.0. ConnectionRegistry и Workspace ledger сохраняют текущую структуру без внутренних версий. Watcher state поддерживает только документированную одностороннюю миграцию с 0.2.0; неизвестные схемы отклоняются. Credentials задаются заново через предназначенные для них Hermes/systemd интерфейсы и не выводятся в терминал или отчёты.
 
 При первом включении Route его destination фиксируется. После появления deliveries нельзя удалять ledger или переиспользовать их `route_id` для другого назначения. Включённый или использованный Route должен остаться в registry и при выводе из эксплуатации перейти в disable + tombstone: result lookup использует immutable snapshot исходной доставки.
 
@@ -287,6 +287,16 @@ StateDirectory/ledger удалять только если больше не н�
 - result PAT scope при необходимости.
 
 Если текущему worker разрешено несколько Routes, сначала вызвать `multica_list_routes` и передать выбранный `route_id`. Ответ `accepted` подтверждает доставку, но не завершение Multica task. Результат проверяется отдельно через `multica_check_task_result`; при нескольких deliveries одной task также передаётся конкретный `route_id`.
+
+## Обновление watcher до 0.3.0
+
+Миграция watcher state односторонняя: добавляются deliveries.attempts/next_retry_at/event_type/payload_json и issue_snapshots.status_entered_at/cycle_started_at. Неизвестные схемы отклоняются. Старые mappings, snapshots и seen_comments сохраняются; историческая граница статуса ограничена сохранённым updated_at, историческая граница цикла неизвестна. При известной границе REPORT старого цикла не используется; при неизвестной применяется lookback.
+
+Перед deployment снимите согласованные SQLite backup (через sqlite3 .backup), SHA-256 и S3-копию каждой БД; отдельно сохраните TOML. Проверяйте копии с учётом WAL. После установки quiet включают явно; отсутствие notifications сохраняет verbose. Custom units, credentials, маршруты и cron не заменяются автоматически.
+
+Откат: остановить watcher, восстановить БД и TOML из согласованного снимка, вернуть код 0.2.0 и проверить readiness. Старый код не читает новую схему; mappings и результаты после снимка при таком откате теряются. Живой пилот, перезапуск и изменение cron требуют отдельного этапа.
+
+Старые WAL/SHM нельзя смешивать с восстановленным снимком: восстанавливайте при остановленном watcher через согласованную SQLite backup/restore процедуру, сохраняя прежние файлы для диагностики и исходные owner/mode.
 
 ## Регистратор существующих задач (backfill)
 
