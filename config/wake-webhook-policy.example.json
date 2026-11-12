@@ -1,0 +1,23 @@
+{
+  "routes": [
+    {
+      "profile": "default",
+      "route": "replace-route",
+      "events": ["task.completed"],
+      "deliver": "telegram",
+      "deliver_extra": {
+        "chat_id": "REPLACE_CHAT_ID",
+        "thread_id": "REPLACE_THREAD_ID"
+      },
+      "deliver_only": false,
+      "cron_job": false,
+      "mirror_to_session": false,
+      "script_configured": false,
+      "skills": [],
+      "coalesce_enabled": false,
+      "toolsets": ["web"],
+      "hmac_configured": true,
+      "prompt_policy": "snapshot_only_final"
+    }
+  ]
+}

@@ -30,6 +30,7 @@ from .config import (
 from .delivery import Sender
 from .policy import reconcile
 from .state import State, epoch
+from .wake import MAX_BODY_BYTES, WakeSender, load_webhook_policy
 
 LOG = logging.getLogger("hermes_multica_notify")
 EVENT_TYPES = {
@@ -78,12 +79,15 @@ class Service:
             self.config.service["full_reconcile_parallelism"]
         )
         self.delivery_slots = asyncio.Semaphore(self.config.service["delivery_workers"])
+        self.wake_slots = asyncio.Semaphore(self.config.service["delivery_workers"])
         # Dispatch remains serialized through completion: stalled workers cannot bunch
         # previously reserved slots into a burst. Collection runs independently.
         self.dispatch_lock = asyncio.Lock()
         self.scheduled: set[str] = set()
+        self.wake_scheduled: set[str] = set()
         self.collectors: list[asyncio.Task] = []
         self.deliveries: set[asyncio.Task] = set()
+        self.wake_deliveries: set[asyncio.Task] = set()
 
     def scan(self, key: str, api: Multica, full: bool) -> None:
         now = time.time()
@@ -391,6 +395,135 @@ class Service:
         finally:
             self.scheduled.discard(row["id"])
 
+    async def deliver_wake(self, row: dict) -> None:
+        claim = None
+        try:
+            async with self.wake_slots:
+                config = self.config
+                if not config.wake.get("enabled", False):
+                    return
+                route = next(
+                    (
+                        value
+                        for value in config.wake.get("routes", {}).values()
+                        if value["route"] == row["route"]
+                    ),
+                    None,
+                )
+                if route is None or route["profile"] != row["profile"]:
+                    return
+                try:
+                    webhook_policy = await blocking(
+                        load_webhook_policy,
+                        Path(config.wake["webhook_policy_file"]),
+                    )
+                except NotifyError as exc:
+                    await blocking(
+                        self.state.wake_defer_unclaimed, row["id"], exc.code
+                    )
+                    log("wake_webhook_policy_unavailable")
+                    return
+                try:
+                    secret = credential(config.wake["secret_credential"])
+                except NotifyError as exc:
+                    await blocking(
+                        self.state.wake_defer_unclaimed, row["id"], exc.code
+                    )
+                    log("wake_credential_unavailable")
+                    return
+                claim = await blocking(
+                    self.state.wake_claim,
+                    row["id"],
+                    time.time(),
+                    config.wake["request_timeout_seconds"] * 3 + 15,
+                    config.wake.get("routes", {}),
+                    webhook_policy,
+                )
+                if not claim:
+                    return
+                body = claim["payload_json"].encode("utf-8")
+                try:
+                    payload = strict_json_loads(body)
+                except (ValueError, UnicodeError, RecursionError):
+                    payload = None
+                external_workspace = config.workspaces.get(claim["source_workspace"], {}).get(
+                    "workspace_id"
+                )
+                valid = (
+                    len(body) <= MAX_BODY_BYTES
+                    and isinstance(payload, dict)
+                    and payload.get("event") == "task.completed"
+                    and payload.get("event_type") == "task.completed"
+                    and payload.get("type") == "task.completed"
+                    and payload.get("source") == "multica"
+                    and payload.get("wake_id") == claim["id"]
+                    and payload.get("issue_id") == claim["issue_id"]
+                    and payload.get("issue_key") == claim["issue_key"]
+                    and payload.get("transition_seq") == claim["transition_seq"]
+                    and payload.get("profile") == claim["profile"]
+                    and payload.get("workspace_id") == external_workspace
+                    and payload.get("project_id") == claim["source_project"]
+                    and payload.get("origin")
+                    == {
+                        "platform": claim["source_platform"],
+                        "chat_id": claim["source_chat_id"],
+                        "thread_id": claim["source_thread_id"],
+                        "chat_type": claim["source_chat_type"],
+                    }
+                    and isinstance(payload.get("snapshot"), dict)
+                )
+                if not valid:
+                    await blocking(
+                        self.state.wake_finish,
+                        claim,
+                        "dead",
+                        "wake_payload_invalid",
+                    )
+                    return
+                sender = WakeSender(
+                    config.wake["base_url"],
+                    config.wake["request_timeout_seconds"],
+                )
+                result = await blocking(
+                    sender.send,
+                    body,
+                    profile=claim["profile"],
+                    route=claim["route"],
+                    wake_id=claim["id"],
+                    secret=secret,
+                )
+                await blocking(
+                    self.state.wake_finish,
+                    claim,
+                    result.status,
+                    result.error_code,
+                )
+                log(
+                    {
+                        "sent": "wake_sent",
+                        "dead": "wake_dead",
+                        "delivery_unknown": "wake_unknown",
+                    }.get(result.status, "wake_result_invalid"),
+                    code=result.error_code,
+                )
+        except (NotifyError, OSError, sqlite3.Error, ValueError, TypeError, KeyError):
+            if claim:
+                await blocking(
+                    self.state.wake_finish,
+                    claim,
+                    "delivery_unknown",
+                    "wake_worker_uncertain",
+                )
+            else:
+                await blocking(
+                    self.state.wake_defer_unclaimed,
+                    row["id"],
+                    "wake_worker_unavailable",
+                )
+            log("wake_worker_unavailable")
+        finally:
+            self.wake_scheduled.discard(row["id"])
+
     async def pause(self, delay: float) -> None:
         try:
             await asyncio.wait_for(self.stop.wait(), timeout=max(0.001, delay))
@@ -427,6 +560,7 @@ class Service:
                 for key in sorted(self.locks):
                     await stack.enter_async_context(self.locks[key])
                 self.state.project(candidate)
+                self.state.project_wake_routes(candidate.wake.get("routes", {}))
                 for task in self.collectors:
                     task.cancel()
                 await asyncio.gather(*self.collectors, return_exceptions=True)
@@ -457,6 +591,7 @@ class Service:
                 raise NotifyError("notify_already_running") from None
             self.state = State(Path(self.config.service["db_path"]), create=True)
             self.state.project(self.config)
+            self.state.project_wake_routes(self.config.wake.get("routes", {}))
             with self.state.transaction() as db:
                 db.execute("UPDATE cursors SET ws_connected=0")
             start = Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[19]
@@ -473,6 +608,7 @@ class Service:
             self.start_collectors()
             last_prune = 0
             last_heartbeat = 0
+            last_wake_expire = 0
             while not self.stop.is_set():
                 if time.time() - last_heartbeat >= 1:
                     with self.state.transaction() as db:
@@ -490,8 +626,20 @@ class Service:
                         task = asyncio.create_task(self.deliver(row))
                         self.deliveries.add(task)
                         task.add_done_callback(self.deliveries.discard)
+                now = time.time()
+                if now - last_wake_expire >= 5:
+                    self.state.wake_expire(now)
+                    last_wake_expire = now
+                if self.config.wake.get("enabled", False):
+                    for row in self.state.wake_due(now):
+                        if row["id"] not in self.wake_scheduled:
+                            self.wake_scheduled.add(row["id"])
+                            task = asyncio.create_task(self.deliver_wake(row))
+                            self.wake_deliveries.add(task)
+                            task.add_done_callback(self.wake_deliveries.discard)
                 if time.time() - last_prune > 60:
                     self.state.prune(self.config)
+                    self.state.prune_wake()
                     last_prune = time.time()
                 await self.pause(0.2)
         finally:
@@ -499,7 +647,10 @@ class Service:
             for task in self.collectors:
                 task.cancel()
             await asyncio.gather(
-                *self.collectors, *self.deliveries, return_exceptions=True
+                *self.collectors,
+                *self.deliveries,
+                *self.wake_deliveries,
+                return_exceptions=True,
             )
             if owns_lock:
                 if hasattr(self, "state"):

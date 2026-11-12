@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.0
+
+- Added completion wake jobs for newly observed transitions to `done`, with immutable read-only snapshots and one HMAC V2 request to a profile-scoped loopback Hermes webhook.
+- Added additive notify database migration, wake subscriptions/receipts, exact destination validation through a protected webhook policy export, and suppression of regular notifications for registered wake subscriptions.
+- Classified webhook admission using both HTTP status and response JSON; `ignored` is terminal, `duplicate` is accepted, and uncertain transport outcomes require operator-confirmed replay.
+- Added bounded snapshot payloads, wake CLI commands, safe route diagnostics, and deployment guidance for credentials, backups, test targets, and rollback.
+- Product version is 0.5.0. Package installation does not enable live configuration or production routes.
+
 ## 0.4.0
 
 - Центральный сервис hermes-multica-notify: подписки Telegram/MAX, isolated CLI profiles, WS/poll recovery и durable outbox.

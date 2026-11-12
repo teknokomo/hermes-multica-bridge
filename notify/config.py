@@ -121,6 +121,7 @@ class Config:
     accounts: dict[str, dict[str, Any]]
     workspaces: dict[str, dict[str, Any]]
     workspace_errors: dict[str, str] = field(default_factory=dict)
+    wake: dict[str, Any] = field(default_factory=dict)
 
 
 DEFAULTS = {
@@ -147,12 +148,20 @@ POLICY = {
     "lookback_minutes": 15,
     "operator_mentions": [],
 }
+WAKE_DEFAULTS = {
+    "enabled": False,
+    "base_url": "http://127.0.0.1:8644",
+    "secret_credential": "hermes-wake-hmac",
+    "webhook_policy_file": "/etc/hermes-multica-notify/webhook-policy.json",
+    "request_timeout_seconds": 10,
+    "max_attempts": 1,
+}
 
 
 def parse_config(raw: Any) -> Config:
     require(
         isinstance(raw, dict)
-        and not set(raw) - {"service", "policy", "accounts", "workspaces"}
+        and not set(raw) - {"service", "policy", "accounts", "workspaces", "wake"}
     )
     service_raw, policy_raw = raw.get("service", {}), raw.get("policy", {})
     require(isinstance(service_raw, dict) and not set(service_raw) - set(DEFAULTS))
@@ -173,6 +182,92 @@ def parse_config(raw: Any) -> Config:
         and service["request_timeout_seconds"] < service["sending_timeout_seconds"]
         and service["full_reconcile_jitter_seconds"] < service["full_reconcile_seconds"]
     )
+    wake_raw = raw.get("wake", {})
+    require(
+        isinstance(wake_raw, dict)
+        and not set(wake_raw) - set(WAKE_DEFAULTS) - {"routes"},
+        "wake_config_invalid",
+    )
+    wake = WAKE_DEFAULTS | {
+        key: value for key, value in wake_raw.items() if key != "routes"
+    }
+    require(type(wake["enabled"]) is bool, "wake_config_invalid")
+    require(
+        type(wake["request_timeout_seconds"]) is int
+        and 1 <= wake["request_timeout_seconds"] <= 30
+        and type(wake["max_attempts"]) is int
+        and wake["max_attempts"] == 1,
+        "wake_config_invalid",
+    )
+    require(isinstance(wake["secret_credential"], str), "wake_config_invalid")
+    name(wake["secret_credential"])
+    require(
+        isinstance(wake["webhook_policy_file"], str)
+        and Path(wake["webhook_policy_file"]).is_absolute(),
+        "wake_config_invalid",
+    )
+    base_url = wake["base_url"]
+    require(
+        isinstance(base_url, str)
+        and base_url.isascii()
+        and len(base_url) <= 128
+        and base_url == base_url.strip(),
+        "wake_config_invalid",
+    )
+    try:
+        parsed_wake_url = urlsplit(base_url)
+        wake_port = parsed_wake_url.port
+    except ValueError:
+        raise NotifyError("wake_config_invalid") from None
+    require(
+        parsed_wake_url.scheme == "http"
+        and parsed_wake_url.hostname in {"127.0.0.1", "::1"}
+        and not parsed_wake_url.username
+        and not parsed_wake_url.password
+        and not parsed_wake_url.query
+        and not parsed_wake_url.fragment
+        and parsed_wake_url.path in {"", "/"}
+        and wake_port is not None
+        and 1 <= wake_port <= 65535,
+        "wake_config_invalid",
+    )
+    host = "[::1]" if parsed_wake_url.hostname == "::1" else "127.0.0.1"
+    wake["base_url"] = f"http://{host}:{wake_port}"
+    routes_raw = wake_raw.get("routes", {})
+    require(isinstance(routes_raw, dict), "wake_config_invalid")
+    routes, seen_routes = {}, set()
+    for route_key, route_row in routes_raw.items():
+        require(
+            isinstance(route_key, str)
+            and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", route_key) is not None,
+            "wake_config_invalid",
+        )
+        require(
+            isinstance(route_row, dict)
+            and not set(route_row) - {"profile", "route", "test"}
+            and {"profile", "route"} <= set(route_row),
+            "wake_config_invalid",
+        )
+        profile, route = route_row["profile"], route_row["route"]
+        require(
+            isinstance(profile, str) and profile in {"default", "om73"},
+            "wake_config_invalid",
+        )
+        require(
+            isinstance(route, str)
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", route) is not None,
+            "wake_config_invalid",
+        )
+        require(route not in seen_routes, "wake_config_invalid")
+        require(type(route_row.get("test", False)) is bool, "wake_config_invalid")
+        seen_routes.add(route)
+        routes[route_key] = {
+            "profile": profile,
+            "route": route,
+            "test": route_row.get("test", False),
+        }
+    require(not wake["enabled"] or bool(routes), "wake_config_invalid")
+    wake["routes"] = routes
     require(
         type(policy["lookback_minutes"]) is int
         and 0 <= policy["lookback_minutes"] <= 1440
@@ -246,7 +341,7 @@ def parse_config(raw: Any) -> Config:
         require(pair not in pairs)
         pairs.add(pair)
         valid_workspaces[key] = dict(row, origin=origin)
-    return Config(service, policy, accounts, valid_workspaces, errors)
+    return Config(service, policy, accounts, valid_workspaces, errors, wake)
 
 
 def load_config(path: Path) -> Config:

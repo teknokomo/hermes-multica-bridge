@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-multica-bridge"
-version = "0.5.0.dev1"
+version = "0.5.0"
 description = "Hermes plugin for secure Standard or Isolated task delivery to Multica with result tracking"
 readme = "README.md"
 requires-python = ">=3.11"

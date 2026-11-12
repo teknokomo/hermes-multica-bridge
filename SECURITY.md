@@ -192,7 +192,7 @@ Profile/generation guards отбрасывают stale status/save/credential re
 
 ## Lifecycle конфигурации
 
-Версия продукта — 0.4.0. Registry и Workspace ledger используют текущую структуру без внутренних версий API. Watcher поддерживает документированную миграцию 0.2.0→0.3.0; notify использует независимую схему SQLite. Неизвестные форматы отклоняются.
+Версия продукта — 0.5.0. Registry и Workspace ledger используют текущую структуру без внутренних версий API. Watcher поддерживает документированную миграцию 0.2.0→0.3.0; notify использует независимую схему SQLite с additive migration для wake. Неизвестные форматы отклоняются.
 
 Переход Standard ↔ Isolated не переносит секреты автоматически. Новый Route/режим включается только после отдельной readiness-проверки. Ledger сохраняет immutable delivery snapshot, поэтому rename/disable/tombstone текущего Route не меняет destination уже созданной delivery.
 
@@ -228,3 +228,13 @@ Notify работает под отдельным hermes-notify, с незави
 Новый store использует только PRAGMA user_version для миграций SQLite. Старые watcher databases не открываются как notify state. Event log7d/terminal30d/replay30d, долгоживущие processed keys без текста и отдельный retention hints предотвращают повторную отправку после очистки. Журнал/status исключают тексты, chat IDs и credentials. Сам event log содержит только минимальные идентификаторы, не тела комментариев.
 
 Доставка at-least-once допускает дубль после неопределённого сетевого ответа. Anchor fallback разрешён только при подтверждённом отказе reply, при сохранении треда и общем бюджете POST. Чтение доступной истории не доказывает восстановление удалённых или ненаблюдённых переходов. Публичного административного HTTP API нет; сервис не пишет в Multica.
+
+## Completion wake 0.5.0
+
+Wake использует отдельные таблицы в notify SQLite и не меняет старые watcher state. Схема обновляется одной транзакцией только с точной 0.4.0 схемы; неизвестная схема отклоняется без изменений. Запрос ограничен 32 KiB, snapshot — 24 KiB; текст комментариев и маршрутные IDs хранятся только в закрытой БД и webhook payload.
+
+Transport допускает только `127.0.0.1`/`::1`, не использует proxy environment и подписывает точные байты HMAC-SHA256 V2. Секрет поступает через systemd `LoadCredential`, не попадает в аргументы, TOML, SQLite, status или журналы. Redirects и внешний webhook URL запрещены.
+
+Перед включением CLI/doctor сверяют профиль, event, target, thread, HMAC presence и экспортированный toolset. `webhook-policy.json` не содержит секретов, но содержит chat/thread IDs; он root-owned, доступен только `hermes-notify` и оператору, и должен обновляться через проверенную конфигурацию Hermes. Notify не читает Hermes home.
+
+Wake имеет одну автоматическую попытку. `sent` подтверждает только admission Hermes; timeout/потеря ответа становится `delivery_unknown` без повтора. `ignored` — terminal failure, `duplicate` — принятый результат. Ручной replay требует проверки журнала/темы и может вызвать дубль; exactly-once не обещается. Тесты разрешены только в заранее выделенном тестовом проекте/получателе.
