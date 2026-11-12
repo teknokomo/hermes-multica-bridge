@@ -137,8 +137,36 @@ def test_read_only_systemd_credentials_mode(ctx, monkeypatch):
     directory.mkdir(mode=0o700)
     atomic_private(directory / "test", b"fake-credential")
     (directory / "test").chmod(0o400)
+    directory.chmod(0o500)
     monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(directory))
     assert credential("test") == "fake-credential"
+    directory.chmod(0o700)
+
+
+def test_read_only_systemd_credentials_group_readable_mode(ctx, monkeypatch):
+    from notify.config import credential
+
+    directory = ctx.root / "group-readable-creds"
+    directory.mkdir(mode=0o700)
+    atomic_private(directory / "test", b"fake-credential")
+    (directory / "test").chmod(0o440)
+    directory.chmod(0o550)
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(directory))
+    assert credential("test") == "fake-credential"
+    directory.chmod(0o700)
+
+
+def test_private_credential_rejects_group_readable_file_without_systemd_env(ctx, monkeypatch):
+    from notify.config import credential
+
+    directory = ctx.root / "private-creds"
+    directory.mkdir(mode=0o700)
+    atomic_private(directory / "test", b"fake-credential")
+    (directory / "test").chmod(0o440)
+    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
+    with pytest.raises(NotifyError) as exc:
+        credential("test", directory)
+    assert exc.value.code == "notify_credential_missing"
 
 
 def test_append_workspace_concurrent_adds_preserve_both(ctx):

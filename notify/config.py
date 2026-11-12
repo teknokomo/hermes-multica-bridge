@@ -258,6 +258,7 @@ def load_config(path: Path) -> Config:
 
 def credential(value: str, directory: Path | None = None) -> str:
     name(value)
+    systemd_credentials = "CREDENTIALS_DIRECTORY" in os.environ
     root = directory or Path(
         os.environ.get(
             "CREDENTIALS_DIRECTORY", "/etc/hermes-multica-notify/credentials"
@@ -271,12 +272,17 @@ def credential(value: str, directory: Path | None = None) -> str:
     require(
         info.st_uid in {0, os.getuid()}
         and stat.S_IMODE(info.st_mode)
-        in ({0o500, 0o700} if "CREDENTIALS_DIRECTORY" in os.environ else {0o700}),
+        in (
+            {0o500, 0o550, 0o700}
+            if systemd_credentials
+            else {0o700}
+        ),
         "notify_permissions_invalid",
     )
     # systemd credential directories can be root-owned/read-only; private file checks still apply.
     try:
-        result = private_read(root / value, 8192, modes=(0o400, 0o600)).decode().strip()
+        file_modes = (0o400, 0o440, 0o600) if systemd_credentials else (0o400, 0o600)
+        result = private_read(root / value, 8192, modes=file_modes).decode().strip()
     except NotifyError:
         raise NotifyError("notify_credential_missing") from None
     require(
