@@ -5,7 +5,7 @@
 
 ![Технокомо — 73-й Меридиан](docs/assets/teknokomo-om73-ru.jpg)
 
-# Важно! Grave! Important!
+# Important! Grave! Важно!
 
 -   Пролетарии всех стран, соединяйтесь!
 -   Workers of the world, unite!
