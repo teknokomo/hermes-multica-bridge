@@ -11,6 +11,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 from bridge.errors import BridgeError
+from bridge.registry import new_id, registry_from_mapping
 from bridge.workspace_state import WorkspaceState
 from bridge.workspace_tools import WORKSPACE_TOOLS, WorkspaceRuntime
 from tests.test_registry import (
@@ -19,6 +20,30 @@ from tests.test_registry import (
     SQUAD_UUID,
     workspace_registry_payload,
 )
+
+
+def _route_grants(payload, *, count=1, allow_all=False, auto_approve=False, expiry="2035-01-01T00:00:00Z",
+                  allowed_threads=()):
+    anchor = payload["routes"][0]
+    connection = payload["connections"][0]
+    workspace = payload["workspaces"][0]
+    grants = []
+    for _ in range(count):
+        grants.append({
+            "grant_id": new_id(), "profile": "om73",
+            "connection_id": connection["connection_id"],
+            "workspace_key": workspace["workspace_key"],
+            "workspace_id": workspace["workspace_id"],
+            "allowed_project_ids": [] if allow_all else ["project-1"],
+            "allowed_squad_ids": [], "allow_all_projects": allow_all,
+            "allowed_source_platforms": ["telegram"], "allowed_chat_ids": ["chat-1"],
+            "allowed_thread_ids": list(allowed_threads), "allowed_user_ids": ["user-1"],
+            "allowed_assignees": [{"id": MEMBER_UUID, "type": "member", "label": "Member"}],
+            "credential_route_id": anchor["route_id"], "max_routes": 3,
+            "auto_approve": auto_approve, "expires_at": expiry, "enabled": True,
+        })
+    payload["route_grants"] = grants
+    return payload
 
 
 class _Context:
@@ -318,6 +343,164 @@ class WorkspaceToolsTests(unittest.TestCase):
         ))
         self.assertEqual(parent_denied["error_code"], "route_denied")
         self.assertEqual(self.api.create_calls, [])
+
+    def test_wrong_allowed_thread_is_rejected_before_any_multica_operation(self) -> None:
+        self.payload["routes"][0].update(
+            allowed_thread_ids=["33"], allow_groups=True
+        )
+        self.ctx.config["registry"] = self.payload
+        source = SimpleNamespace(**{
+            **vars(self.source), "chat_type": "thread", "thread_id": "34",
+        })
+        result = json.loads(self.runtime.send(
+            {"route_id": self.route_id, "title": "Task"}, tool_context=source,
+        ))
+        self.assertEqual(result["error_code"], "route_thread_denied")
+        self.assertEqual(self.api.create_calls, [])
+        self.assertEqual(self.api.metadata_calls, [])
+
+    def test_route_create_requires_a_contextual_grant_before_multica_access(self) -> None:
+        registry = registry_from_mapping(copy.deepcopy(self.payload))
+        self.runtime._registry = lambda: registry
+        api = Mock()
+        self.runtime._api = Mock(return_value=api)
+        result = json.loads(self.runtime.create_route({
+            "name": "New route", "scope_kind": "project", "project_ids": ["project-1"],
+        }, tool_context=self.source))
+        self.assertEqual(result["error_code"], "route_grant_denied")
+        self.runtime._api.assert_not_called()
+        api.get_project.assert_not_called()
+
+    def test_route_create_requires_explicit_grant_when_context_is_ambiguous(self) -> None:
+        payload = _route_grants(copy.deepcopy(self.payload), count=2)
+        registry = registry_from_mapping(payload)
+        self.runtime._registry = lambda: registry
+        self.runtime._api = Mock()
+        result = json.loads(self.runtime.create_route({
+            "name": "New route", "scope_kind": "project", "project_ids": ["project-1"],
+        }, tool_context=self.source))
+        self.assertEqual(result["error_code"], "grant_required")
+        self.assertEqual(set(result["available_grant_ids"]), {item["grant_id"] for item in payload["route_grants"]})
+        self.runtime._api.assert_not_called()
+
+    def test_route_create_is_pending_by_default_and_uses_the_static_credential_anchor(self) -> None:
+        payload = _route_grants(copy.deepcopy(self.payload))
+        registry = registry_from_mapping(payload)
+        self.runtime._registry = lambda: registry
+        api = Mock()
+        api.get_project.return_value = {"workspace_id": "workspace-1", "id": "project-1"}
+        self.runtime._api = Mock(return_value=api)
+        saved = {}
+
+        class Store:
+            def create(_self, **kwargs):
+                saved.update(kwargs)
+                result = dict(kwargs["policy"], dynamic_status=kwargs["status"],
+                              enabled=kwargs["status"] == "active")
+                return result, True
+
+        self.runtime._dynamic_store = lambda: Store()
+        self.runtime._wake_readiness = lambda _registry, _route, project_ids: tuple({
+            "workspace_id": "workspace-1", "project_id": project_id,
+            "wake_ready": False, "reason": "wake_missing", "wake_route_id": None,
+        } for project_id in project_ids)
+        result = json.loads(self.runtime.create_route({
+            "name": "New route", "scope_kind": "project", "project_ids": ["project-1"],
+        }, tool_context=self.source))
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "pending")
+        self.assertFalse(result["wake_ready"])
+        self.assertEqual(saved["status"], "pending")
+        self.assertEqual(saved["policy"]["credential_route_id"], payload["route_grants"][0]["credential_route_id"])
+        self.assertEqual(saved["policy"]["watcher_enabled"], False)
+        self.assertEqual(saved["policy"]["wake_mode"], "completion")
+        api.get_project.assert_called_once_with("project-1")
+
+    def test_all_workspace_create_is_open_scope_and_send_requires_project_id(self) -> None:
+        payload = _route_grants(copy.deepcopy(self.payload), allow_all=True, auto_approve=True)
+        registry = registry_from_mapping(payload)
+        self.runtime._registry = lambda: registry
+        api = Mock()
+        api.get_project.return_value = {"workspace_id": "workspace-1", "id": "project-1"}
+        self.runtime._api = Mock(return_value=api)
+        saved = {}
+
+        class Store:
+            def create(_self, **kwargs):
+                saved.update(kwargs)
+                result = dict(kwargs["policy"], dynamic_status=kwargs["status"], enabled=True)
+                return result, True
+
+        self.runtime._dynamic_store = lambda: Store()
+        self.runtime._wake_readiness = lambda _registry, _route, project_ids: tuple({
+            "workspace_id": "workspace-1", "project_id": project_id,
+            "wake_ready": True, "reason": "ready", "wake_route_id": "wake-route",
+        } for project_id in project_ids)
+        result = json.loads(self.runtime.create_route({
+            "name": "Open route", "scope_kind": "workspace", "project_selection": "all_workspace",
+            "default_project_id": "project-1",
+        }, tool_context=self.source))
+        self.assertEqual(result["status"], "active")
+        self.assertTrue(result["wake_open_scope"])
+        self.assertFalse(result["wake_ready"])
+        dynamic_registry = registry_from_mapping(payload | {"routes": payload["routes"] + [saved["policy"]]})
+        route = dynamic_registry.route(saved["policy"]["route_id"])
+        with self.assertRaises(BridgeError) as raised:
+            self.runtime._project_for_send({}, dynamic_registry, route, api)
+        self.assertEqual(raised.exception.code, "project_required")
+        self.assertEqual(api.get_project.call_count, 1)
+
+    def test_allow_all_grant_can_revalidate_a_finite_route_project_subset(self) -> None:
+        payload = _route_grants(copy.deepcopy(self.payload), allow_all=True, auto_approve=True)
+        grant = payload["route_grants"][0]
+        dynamic = copy.deepcopy(payload["routes"][0])
+        dynamic.update({
+            "route_id": new_id(),
+            "name": "Finite project subset",
+            "project_id": "project-2",
+            "scope_kind": "project",
+            "project_selection": "allowlist",
+            "project_ids": ["project-2"],
+            "default_project_id": "project-2",
+            "source_platforms": ["telegram"],
+            "allowed_assignees": [{"id": MEMBER_UUID, "type": "member", "label": "Member"}],
+            "default_assignee": {"id": MEMBER_UUID, "type": "member", "label": "Member"},
+            "enabled": True,
+            "watcher_enabled": False,
+            "wake_mode": "completion",
+            "dynamic_status": "active",
+            "grant_id": grant["grant_id"],
+            "credential_route_id": grant["credential_route_id"],
+            "created_by_profile": grant["profile"],
+        })
+        payload["routes"].append(dynamic)
+        registry = registry_from_mapping(payload)
+
+        route = self.runtime._route(registry, self.source, dynamic["route_id"])
+
+        self.assertEqual(route.project_ids, ("project-2",))
+        with self.assertRaises(BridgeError) as raised:
+            self.runtime._project_for_send({"project_id": "project-3"}, registry, route, self.api)
+        self.assertEqual(raised.exception.code, "route_project_not_allowed")
+
+    def test_route_create_rejects_static_name_conflict_and_expired_grant_before_api(self) -> None:
+        payload = _route_grants(copy.deepcopy(self.payload))
+        registry = registry_from_mapping(payload)
+        self.runtime._registry = lambda: registry
+        self.runtime._api = Mock()
+        conflict = json.loads(self.runtime.create_route({
+            "name": " workspace ROUTE ", "scope_kind": "project", "project_ids": ["project-1"],
+        }, tool_context=self.source))
+        self.assertEqual(conflict["error_code"], "route_conflict")
+        self.runtime._api.assert_not_called()
+
+        expired_payload = _route_grants(copy.deepcopy(self.payload), expiry="2020-01-01T00:00:00Z")
+        self.runtime._registry = lambda: registry_from_mapping(expired_payload)
+        expired = json.loads(self.runtime.create_route({
+            "name": "New route", "scope_kind": "project", "project_ids": ["project-1"],
+        }, tool_context=self.source))
+        self.assertEqual(expired["error_code"], "route_grant_expired")
+        self.runtime._api.assert_not_called()
 
     def test_incomplete_telegram_thread_context_is_rejected_before_multica_write(self) -> None:
         for thread_id in (None, "0", "topic-nine"):

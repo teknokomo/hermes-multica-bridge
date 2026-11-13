@@ -4,6 +4,7 @@ import concurrent.futures
 import copy
 import importlib.util
 import sys
+import tempfile
 import threading
 import types
 import unittest
@@ -11,7 +12,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from bridge.errors import BridgeError
-from bridge.registry import registry_from_mapping, route_policy_fingerprint
+from bridge.registry import new_id, registry_from_mapping, route_policy_fingerprint
 from tests.helpers import isolated_bridge_config, standard_connection
 from tests.test_registry import registry_payload, workspace_registry_payload
 
@@ -24,6 +25,9 @@ def _load_plugin_api():
             return lambda function: function
 
         def put(self, *_args, **_kwargs):
+            return lambda function: function
+
+        def post(self, *_args, **_kwargs):
             return lambda function: function
 
     class HTTPException(Exception):
@@ -51,6 +55,78 @@ PLUGIN_API = _load_plugin_api()
 
 
 class DashboardPluginApiTests(unittest.TestCase):
+    def test_dynamic_route_approval_uses_profile_store_and_checks_credential_anchor(self) -> None:
+        raw = workspace_registry_payload()
+        anchor = raw["routes"][0]
+        workspace = raw["workspaces"][0]
+        connection = raw["connections"][0]
+        grant_id = new_id()
+        raw["route_grants"] = [{
+            "grant_id": grant_id,
+            "profile": "default",
+            "connection_id": connection["connection_id"],
+            "workspace_key": workspace["workspace_key"],
+            "workspace_id": workspace["workspace_id"],
+            "allowed_project_ids": ["project-1"],
+            "allowed_squad_ids": [],
+            "allow_all_projects": False,
+            "allowed_source_platforms": ["telegram"],
+            "allowed_chat_ids": ["chat-1"],
+            "allowed_thread_ids": [],
+            "allowed_user_ids": ["user-1"],
+            "allowed_assignees": [
+                {"id": item["id"], "type": item["type"]}
+                for item in anchor["allowed_assignees"]
+            ],
+            "credential_route_id": anchor["route_id"],
+            "max_routes": 2,
+            "auto_approve": False,
+            "expires_at": "2030-01-01T00:00:00Z",
+            "enabled": True,
+        }]
+        dynamic = copy.deepcopy(anchor)
+        dynamic_id = new_id()
+        dynamic.update({
+            "route_id": dynamic_id,
+            "name": "Pending dynamic route",
+            "enabled": False,
+            "watcher_enabled": False,
+            "wake_mode": "completion",
+            "source_platforms": ["telegram"],
+            "grant_id": grant_id,
+            "credential_route_id": anchor["route_id"],
+            "dynamic_status": "pending",
+            "created_by_profile": "default",
+        })
+        store = Mock()
+        store.get.return_value = dynamic
+        store.list.return_value = [dynamic]
+        storage_path = Path("dashboard-plugin-data/deliveries.sqlite3")
+        with (
+            patch.object(PLUGIN_API, "_fields", return_value=[{"key": "registry", "value": raw}]),
+            patch.object(PLUGIN_API, "_storage_path", return_value=storage_path),
+            patch.object(PLUGIN_API, "DynamicRouteStore", return_value=store) as store_factory,
+            patch.object(PLUGIN_API, "_route_secret_presence", return_value={"multica_pat": True}),
+        ):
+            result = PLUGIN_API._review_dynamic_route(dynamic_id, approve=True)
+
+        self.assertEqual(result, {"ok": True, "route_id": dynamic_id, "status": "active", "changed": True})
+        store_factory.assert_called_once_with(storage_path.parent / "dynamic-routes.sqlite3")
+        store.set_status.assert_called_once_with(dynamic_id, "default", "active")
+
+    def test_status_does_not_create_dynamic_state_when_no_dynamic_routes_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            storage_path = Path(temp) / "never-created" / "deliveries.sqlite3"
+            registry = {"connections": [], "workspaces": [], "routes": [], "operator_grants": [], "route_grants": []}
+            with (
+                patch.object(PLUGIN_API, "_fields", return_value=[{"key": "registry", "value": registry}]),
+                patch.object(PLUGIN_API, "_storage_path", return_value=storage_path),
+            ):
+                result = PLUGIN_API.status()
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["counts"]["dynamic_routes"], 0)
+            self.assertFalse(storage_path.parent.exists())
+
     def test_disabled_but_complete_connection_can_be_pre_enable_ready(self) -> None:
         connection = standard_connection(enabled=False)
         errors = PLUGIN_API._enable_readiness(
