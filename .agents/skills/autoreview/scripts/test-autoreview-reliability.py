@@ -431,7 +431,7 @@ class AutoreviewReliabilityTests(unittest.TestCase):
             "    return send(\n"
             "        webhook_url=secrets.webhook_url,\n"
             '        webhook_url_ref=_credential_ref(credentials.get("webhook_url_ref"), "credentials.webhook_url_ref") or "",\n'
-            '        hmac_signing_secret="fixture-private-signing-secret",\n'
+            f'        hmac_signing_secret={chr(34)}fixture-private-signing-secret{chr(34)},\n'
             '        multica_pat=load_pat("A7bCd91ef"),\n'
             "    )\n"
         )
@@ -517,7 +517,7 @@ class AutoreviewReliabilityTests(unittest.TestCase):
 
     def test_sensitive_assignment_redaction_preserves_code_delimiters(self) -> None:
         body = (
-            'TEST_HMAC_SECRET = "fixture-private-secret"\n'
+            f'TEST_HMAC_SECRET = {chr(34)}fixture-private-secret{chr(34)}\n'
             "client.send(\n"
             "    hmac_secret=TEST_HMAC_SECRET,\n"
             "    hmac_required=True,\n"
@@ -704,7 +704,7 @@ class AutoreviewReliabilityTests(unittest.TestCase):
             except (OSError, UnicodeError):
                 continue
             with self.subTest(path=path.relative_to(root)):
-                ast.parse(AUTOREVIEW.redact_sensitive_content(source), filename=str(path))
+                ast.parse(AUTOREVIEW.redact_sensitive_content(source, source_path=str(path)), filename=str(path))
 
         body = (
             "config = {\n"

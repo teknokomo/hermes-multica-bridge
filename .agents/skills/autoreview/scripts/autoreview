@@ -680,6 +680,13 @@ def _redact_sensitive_assignment(
     key = match.group("name") + key_suffix
     value = match.group("value")
     suffix = match.group("suffix")
+    if preserve_python_annotations:
+        # A SQL line inside a Python multiline string can resemble an assignment.
+        # Redact its value but preserve the closing Python delimiter and suffix.
+        for quote in (chr(34) * 3, chr(39) * 3):
+            closing = value.find(quote)
+            if closing >= 0 and not value.lstrip().startswith(quote):
+                return prefix + key + "[REDACTED]" + value[closing:] + suffix
     if re.match(r"\s*(?:\"\[REDACTED\]\"|'\[REDACTED\]')", value):
         return match.group(0)
     if suffix.lstrip().startswith(",") and re.fullmatch(
