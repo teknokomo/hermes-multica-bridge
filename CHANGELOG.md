@@ -3,6 +3,7 @@
 ## 0.6.0
 
 - Добавлены project/squad/workspace scopes, точные thread ACL и динамические Workspace-маршруты в пределах операторских route grants.
+- Исправлены disabled credential anchors, read-only проверка проектов при approval и независимость IPC-тестов от длины TMPDIR; устранены ложные security scan срабатывания тестовых фикстур.
 - Добавлен `multica_route_create`; неоднозначный grant требует выбора только среди разрешённых текущему сообщению вариантов, новый маршрут по умолчанию остаётся pending.
 - Динамические маршруты используют статический credential anchor без копирования PAT; отдельная профильная SQLite база обеспечивает идемпотентность, quota, audit и отзыв.
 - Completion-маршруты не требуют старого watcher; добавлен read-only notify readiness IPC с `SO_PEERCRED`, UID/profile ACL и per-project статусом.

@@ -28,6 +28,7 @@ from bridge.registry import (
     standard_route_secrets,
 )
 from bridge.state import DeliveryStore
+from bridge.workspace_api import WorkspaceApiClient
 
 PLUGIN_ID = "hermes-multica-bridge"
 router = APIRouter()
@@ -545,14 +546,26 @@ def _review_dynamic_route(route_id: str, *, approve: bool) -> dict[str, Any]:
         if dynamic["dynamic_status"] == "revoked":
             raise BridgeError("route_immutable", "A revoked dynamic route cannot be approved.")
         anchor = static_registry.route(grant.credential_route_id)
-        if not anchor.enabled or anchor.tombstoned:
-            raise BridgeError("credential_unavailable", "The dynamic route credential anchor is disabled.")
+        if anchor.dynamic_status or anchor.tombstoned:
+            raise BridgeError("credential_unavailable", "The dynamic route credential anchor is unavailable.")
         if dynamic["dynamic_status"] == "active":
             return {"ok": True, "route_id": route_id, "status": "active", "changed": False}
         complete, _accepted_routes = registry_with_dynamic_routes(raw, store.list(profile))
-        complete.route(route_id)
+        reviewed = complete.route(route_id)
         if not _route_secret_presence(anchor)["multica_pat"]:
             raise BridgeError("credential_unavailable", "The operator credential anchor has no Multica PAT.")
+        connection = static_registry.connection(anchor.connection_id)
+        workspace = static_registry.workspace(anchor.workspace_key)
+        secrets = standard_route_secrets(anchor, require_webhook=False)
+        if not secrets.multica_pat:
+            raise BridgeError("credential_unavailable", "The operator credential anchor has no Multica PAT.")
+        api = WorkspaceApiClient(connection.multica_origin, secrets.multica_pat, workspace.workspace_id,
+                                 timeout=connection.request_timeout_seconds)
+        projects = reviewed.project_ids if reviewed.project_selection == "allowlist" else (reviewed.default_project_id,)
+        for project_id in projects:
+            project = api.get_project(project_id)
+            if project.get("workspace_id") != workspace.workspace_id:
+                raise BridgeError("route_project_not_allowed", "A selected project is outside the granted workspace.")
         status = "active"
         store.set_status(route_id, profile, status)
         return {"ok": True, "route_id": route_id, "status": status, "changed": True}

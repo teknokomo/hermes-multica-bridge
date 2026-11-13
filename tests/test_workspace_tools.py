@@ -420,6 +420,7 @@ class WorkspaceToolsTests(unittest.TestCase):
 
     def test_route_create_is_pending_by_default_and_uses_the_static_credential_anchor(self) -> None:
         payload = _route_grants(copy.deepcopy(self.payload))
+        payload["routes"][0]["enabled"] = False
         registry = registry_from_mapping(payload)
         self.runtime._registry = lambda: registry
         api = Mock()
@@ -450,6 +451,11 @@ class WorkspaceToolsTests(unittest.TestCase):
         self.assertEqual(saved["policy"]["watcher_enabled"], False)
         self.assertEqual(saved["policy"]["wake_mode"], "completion")
         api.get_project.assert_called_once_with("project-1")
+        dynamic = dict(saved["policy"], dynamic_status="active", enabled=True)
+        payload["routes"].append(dynamic)
+        complete = registry_from_mapping(payload)
+        # A disabled static anchor still supplies credentials to an authorized route.
+        WorkspaceRuntime._api(self.runtime, complete, complete.route(dynamic["route_id"]))
 
     def test_all_workspace_create_is_open_scope_and_send_requires_project_id(self) -> None:
         payload = _route_grants(copy.deepcopy(self.payload), allow_all=True, auto_approve=True)

@@ -252,3 +252,5 @@ Wake имеет одну автоматическую попытку. `sent` п�
 Notify readiness IPC — отдельный read-only интерфейс. Каталог сокета имеет режим `0711` для traversal между service UID, а сокет — `0666`, чтобы разные профильные UID могли подключиться; это только транспортный доступ. Каждый peer проверяется через `SO_PEERCRED` по allowlist UID/profile до чтения кадра, длина кадра проверяется до JSON parsing. Интерфейс возвращает только готовность проекта и безопасный route identifier; plugin не получает соединение с notify DB и не читает credentials. Completion route не обращается к legacy watcher и отвергает сочетание `wake_mode=completion` и `watcher_enabled=true`.
 
 Repository Skill задаёт предпочтительный путь через зарегистрированные bridge tools; он не выдаёт права и не заменяет server-side grant проверки. Установка, grant configuration и включение notify подписки остаются отдельными операторскими действиями.
+
+Статический credential anchor может иметь enabled=false и служить только хранилищем PAT; tombstone запрещён. При approval проекты повторно проверяются read-only API Multica до активации маршрута.

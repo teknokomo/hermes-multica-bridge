@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import struct
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -14,6 +15,14 @@ from bridge.errors import BridgeError
 from bridge.notify_readiness import MAX_FRAME, MAX_PROJECTS, NotifyReadinessClient
 from notify.config import NotifyError, parse_config
 from notify.readiness_ipc import ReadinessServer
+
+
+@pytest.fixture
+def short_socket_root():
+    # AF_UNIX paths have a small OS limit, independent of pytest's TMPDIR.
+    with tempfile.TemporaryDirectory(prefix="hmb-", dir="/tmp") as directory:
+        yield Path(directory)
+
 
 WORKSPACE_ID = "11111111-1111-4111-8111-111111111111"
 PROJECT_ID = "22222222-2222-4222-8222-222222222222"
@@ -71,9 +80,9 @@ async def _raw_request(path, body: bytes) -> dict:
     return response
 
 
-def test_readiness_ipc_returns_only_project_readiness_and_authenticates_peer(tmp_path):
+def test_readiness_ipc_returns_only_project_readiness_and_authenticates_peer(short_socket_root):
     async def run():
-        socket_path = tmp_path / "run" / "readiness.sock"
+        socket_path = short_socket_root / "run" / "readiness.sock"
         socket_path.parent.mkdir(mode=0o700)
         state = _State()
         server = ReadinessServer(_config(socket_path), state)
@@ -132,9 +141,9 @@ def test_readiness_ipc_returns_only_project_readiness_and_authenticates_peer(tmp
     asyncio.run(run())
 
 
-def test_readiness_ipc_rejects_unallowlisted_uid_before_reading_request(tmp_path):
+def test_readiness_ipc_rejects_unallowlisted_uid_before_reading_request(short_socket_root):
     async def run():
-        socket_path = tmp_path / "run" / "readiness.sock"
+        socket_path = short_socket_root / "run" / "readiness.sock"
         socket_path.parent.mkdir(mode=0o700)
         state = _State()
         server = ReadinessServer(_config(socket_path, uid=os.getuid() + 1), state)
@@ -150,9 +159,9 @@ def test_readiness_ipc_rejects_unallowlisted_uid_before_reading_request(tmp_path
     asyncio.run(run())
 
 
-def test_source_profile_can_check_a_wake_route_owned_by_default_profile(tmp_path):
+def test_source_profile_can_check_a_wake_route_owned_by_default_profile(short_socket_root):
     async def run():
-        socket_path = tmp_path / "run" / "readiness.sock"
+        socket_path = short_socket_root / "run" / "readiness.sock"
         socket_path.parent.mkdir(mode=0o700)
         state = _State()
         server = ReadinessServer(_config(socket_path, profiles=["om73"]), state)
@@ -176,10 +185,10 @@ def test_source_profile_can_check_a_wake_route_owned_by_default_profile(tmp_path
     asyncio.run(run())
 
 
-def test_readiness_ipc_returns_one_result_for_every_project(tmp_path):
+def test_readiness_ipc_returns_one_result_for_every_project(short_socket_root):
     async def run():
         second_project_id = "33333333-3333-4333-8333-333333333333"
-        socket_path = tmp_path / "run" / "readiness.sock"
+        socket_path = short_socket_root / "run" / "readiness.sock"
         socket_path.parent.mkdir(mode=0o700)
         state = _State()
         state.data.append({
@@ -215,9 +224,9 @@ def test_readiness_ipc_returns_one_result_for_every_project(tmp_path):
     asyncio.run(run())
 
 
-def test_readiness_database_failure_returns_client_compatible_unavailable_rows(tmp_path):
+def test_readiness_database_failure_returns_client_compatible_unavailable_rows(short_socket_root):
     async def run():
-        socket_path = tmp_path / "run" / "readiness.sock"
+        socket_path = short_socket_root / "run" / "readiness.sock"
         socket_path.parent.mkdir(mode=0o700)
         state = _State()
 
@@ -247,9 +256,9 @@ def test_readiness_database_failure_returns_client_compatible_unavailable_rows(t
     asyncio.run(run())
 
 
-def test_readiness_uses_current_webhook_policy_instead_of_startup_snapshot(tmp_path):
+def test_readiness_uses_current_webhook_policy_instead_of_startup_snapshot(short_socket_root):
     async def run():
-        socket_path = tmp_path / "run" / "readiness.sock"
+        socket_path = short_socket_root / "run" / "readiness.sock"
         socket_path.parent.mkdir(mode=0o700)
         server = ReadinessServer(_config(socket_path), _State())
         current_policy = {("default", "canary-wake"): {}}

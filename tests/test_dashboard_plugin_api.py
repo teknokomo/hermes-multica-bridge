@@ -101,6 +101,7 @@ class DashboardPluginApiTests(unittest.TestCase):
         store = Mock()
         store.get.return_value = dynamic
         store.list.return_value = [dynamic]
+        anchor["enabled"] = False
         storage_path = Path("dashboard-plugin-data/deliveries.sqlite3")
         with (
             patch.object(PLUGIN_API, "_fields", return_value=[{"key": "registry", "value": raw}]),
@@ -108,14 +109,30 @@ class DashboardPluginApiTests(unittest.TestCase):
             patch.object(PLUGIN_API, "DynamicRouteStore", return_value=store) as store_factory,
             patch.object(PLUGIN_API, "_route_secret_presence", return_value={"multica_pat": True}),
         ):
-            result = PLUGIN_API._review_dynamic_route(dynamic_id, approve=True)
+            secrets = Mock(multica_pat="fake-pat")
+            api = Mock()
+            with (
+                patch.object(PLUGIN_API, "standard_route_secrets", return_value=secrets),
+                patch.object(PLUGIN_API, "WorkspaceApiClient", return_value=api),
+            ):
+                api.get_project.return_value = {"workspace_id": "foreign-workspace"}
+                with self.assertRaises(PLUGIN_API.HTTPException):
+                    PLUGIN_API._review_dynamic_route(dynamic_id, approve=True)
+                store.set_status.assert_not_called()
+                api.get_project.side_effect = BridgeError("api_unavailable", "Unavailable")
+                with self.assertRaises(PLUGIN_API.HTTPException):
+                    PLUGIN_API._review_dynamic_route(dynamic_id, approve=True)
+                store.set_status.assert_not_called()
+                api.get_project.side_effect = None
+                api.get_project.return_value = {"workspace_id": workspace["workspace_id"]}
+                result = PLUGIN_API._review_dynamic_route(dynamic_id, approve=True)
 
         self.assertEqual(result, {"ok": True, "route_id": dynamic_id, "status": "active", "changed": True})
-        store_factory.assert_called_once_with(storage_path.parent / "dynamic-routes.sqlite3")
+        self.assertEqual(store_factory.call_count, 3)
         store.set_status.assert_called_once_with(dynamic_id, "default", "active")
 
-    def test_dynamic_route_approval_rejects_disabled_or_tombstoned_anchor(self) -> None:
-        for field, value in (("enabled", False), ("tombstoned", True)):
+    def test_dynamic_route_approval_rejects_tombstoned_anchor(self) -> None:
+        for field, value in (("tombstoned", True),):
             with self.subTest(field=field):
                 raw = workspace_registry_payload()
                 anchor = raw["routes"][0]

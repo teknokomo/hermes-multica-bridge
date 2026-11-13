@@ -371,7 +371,7 @@ A completion route uses `wake_mode=completion` with `watcher_enabled=false`. It 
 
 Notify readiness is checked through a separate read-only Unix socket. The service checks `SO_PEERCRED`, allowed UIDs and profiles, and frame size before parsing JSON; IPC grants no access to the notify SQLite database or credentials. Notify unavailability is a warning and does not block task creation.
 
-A dynamic route reads the Multica PAT through a static credential anchor for the same connection/workspace. The secret is never copied to dynamic-route SQLite; the anchor, grant, workspace, and credential are rechecked before each operation.
+A dynamic route reads the Multica PAT through a static credential anchor for the same connection/workspace. The anchor may be disabled for execution while storing the PAT; tombstoned or dynamic anchors are rejected. The secret is never copied to dynamic-route SQLite; the anchor, grant, workspace, and credential are rechecked before each operation.
 
 The package includes the `hermes-multica-bridge` Skill: it directs the agent to bridge tools and forbids bypasses through shell, Multica CLI, or SQL. Installing the Skill creates no grants, routes, or subscriptions.
 

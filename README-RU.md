@@ -371,7 +371,7 @@ Completion-маршрут использует `wake_mode=completion` и `watche
 
 Проверка notify выполняется через отдельный read-only Unix socket. Сервис проверяет `SO_PEERCRED`, разрешённые UID и профили и ограничивает размер кадра до разбора JSON; IPC не выдаёт доступ к notify SQLite или credentials. Недоступность notify только показывает предупреждение и не блокирует создание задачи.
 
-Динамический маршрут читает Multica PAT через статический credential anchor того же connection/workspace. Секрет не копируется в dynamic-route SQLite; anchor, grant, workspace и credentials проверяются повторно перед операцией.
+Динамический маршрут читает Multica PAT через статический credential anchor того же connection/workspace. Anchor может быть отключён для выполнения и хранить PAT; tombstoned и динамические anchors отклоняются. Секрет не копируется в dynamic-route SQLite; anchor, grant, workspace и credentials проверяются повторно перед операцией.
 
 Пакет включает Skill `hermes-multica-bridge`: он направляет агента к bridge tools и запрещает обход через shell, Multica CLI или SQL. Установка Skill не создаёт grants, маршруты или подписки.
 

@@ -315,7 +315,6 @@ class WorkspaceRuntime:
             credential_route = registry.route(grant.credential_route_id)
             if (
                 credential_route.dynamic_status
-                or not credential_route.enabled
                 or credential_route.tombstoned
                 or credential_route.connection_id != route.connection_id
                 or credential_route.workspace_key != route.workspace_key
@@ -918,7 +917,7 @@ class WorkspaceRuntime:
             workspace = registry.workspace(grant.workspace_key)
             if (not connection.enabled or connection.security_mode != "standard"
                     or workspace.workspace_id != grant.workspace_id
-                    or anchor.dynamic_status or not anchor.enabled or anchor.tombstoned
+                    or anchor.dynamic_status or anchor.tombstoned
                     or anchor.route_type != "workspace"):
                 raise BridgeError("route_grant_denied", "The grant's credential anchor is not available for this workspace.")
             api = self._api(registry, anchor)
