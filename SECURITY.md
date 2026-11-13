@@ -33,9 +33,11 @@ Bridge соединяет доверенный контекст Hermes Kanban с
 
 - Плагин не регистрирует инструменты с `pass_context` и не принимает source fields в аргументах модели. Для целевой Hermes-сборки он читает текущий turn через `gateway.session_context`: bound-only `get_bound_session_env()` подтверждает task-local привязку и возвращает автора текущего сообщения, включая общие сессии. Legacy `get_session_env(USER_ID)` описывает адресата сессии и не используется для авторизации. Пустой или неполный bound-контекст означает отказ до Multica write; fallback к process env отсутствует. Это внутренний Hermes API и ограничение совместимости `T38-DEBT-3`; его контракт нужно перепроверять после обновления Hermes.
 - Workspace route проверяет платформу и точное членство user/chat IDs в allowlist. Group/channel/thread недоступны без отдельного `allow_groups=true`.
-- Workspace route всегда требует настроенные `workspace_id` и `project_id`; каждый читаемый или изменяемый issue проверяется по обоим ID. Parent issue подзадачи проверяется по той же паре.
+- Статический Workspace route 0.5.0 привязан к одному проекту; scoped routes 0.6.0 ограничиваются явным project allowlist, squad или workspace. `all_workspace` разрешён только dynamic workspace route с активным `allow_all_projects=true`, а send всегда требует явный `project_id`. Каждый issue и parent перепроверяется по workspace и project.
+- Динамический маршрут создаётся только внутри operator-owned `route_grant`; trusted source выбирает единственный подходящий grant, а неоднозначность требует `grant_id` из ограниченного набора. Route ACL может только сужать grant; expiry, revoke и credential anchor проверяются перед операцией.
+- `allowed_thread_ids` проверяется точным trusted thread во всех Workspace tools. Source или thread, переданный моделью, не используется; mismatch блокирует обращение к Multica.
 - Assignee и status ограничены route allowlist. Создание подзадачи требует разрешённого человеческого assignee. Инструмент не приглашает пользователей и не изменяет доступ к пространствам.
-- Workspace доступен только в Standard с профильным PAT. Профильные записи, инструменты и локальный ledger не читают прежние development-конфиги или state stores.
+- Статические Workspace routes доступны только в Standard с профильным PAT. Динамический route читает PAT через закреплённый статический anchor того же connection/workspace; токен не копируется в dynamic route state. Профильные записи и инструменты не читают прежние development-конфиги или state stores.
 - `requester` и `source_message_id` в Multica metadata являются HMAC-SHA-256 pseudonym с domain-separated ключом, производным от профильного PAT маршрута; raw user/chat/message ID в metadata не записываются.
 - Каждая операция записи привязана к профилю, маршруту, источнику и типу операции. Повтор подтверждённой операции возвращает сохранённый ответ; изменённый payload для той же source operation отклоняется. Только ответ, доказывающий отказ до принятия, допускает новую попытку. Transport/5xx/невалидный ответ фиксируется как `operation_unknown`, POST не повторяется автоматически.
 
@@ -192,7 +194,7 @@ Profile/generation guards отбрасывают stale status/save/credential re
 
 ## Lifecycle конфигурации
 
-Версия продукта — 0.5.0. Registry и Workspace ledger используют текущую структуру без внутренних версий API. Watcher поддерживает документированную миграцию 0.2.0→0.3.0; notify использует независимую схему SQLite с additive migration для wake. Неизвестные форматы отклоняются.
+Версия продукта — 0.6.0. Static registry сохраняет структуру 0.5.0 без переписывания и внутренних версий API. Dynamic routes живут в отдельном профильном store с quota, idempotency, audit и терминальным revoke; неизвестная схема отвергается до изменения файла. Notify readiness IPC только читает ограниченный индекс, проверяет `SO_PEERCRED`, UID/profile allowlist и размер кадра, не открывая plugin доступ к notify DB или credentials. Completion routes используют notify и не требуют старого watcher; установка watcher не выполняется автоматически.
 
 Переход Standard ↔ Isolated не переносит секреты автоматически. Новый Route/режим включается только после отдельной readiness-проверки. Ledger сохраняет immutable delivery snapshot, поэтому rename/disable/tombstone текущего Route не меняет destination уже созданной delivery.
 
@@ -238,3 +240,15 @@ Transport допускает только `127.0.0.1`/`::1`, не использ
 Перед включением CLI/doctor сверяют профиль, event, target, thread, HMAC presence и экспортированный toolset. `webhook-policy.json` не содержит секретов, но содержит chat/thread IDs; он root-owned, доступен только `hermes-notify` и оператору, и должен обновляться через проверенную конфигурацию Hermes. Notify не читает Hermes home.
 
 Wake имеет одну автоматическую попытку. `sent` подтверждает только admission Hermes; timeout/потеря ответа становится `delivery_unknown` без повтора. `ignored` — terminal failure, `duplicate` — принятый результат. Ручной replay требует проверки журнала/темы и может вызвать дубль; exactly-once не обещается. Тесты разрешены только в заранее выделенном тестовом проекте/получателе.
+
+## Scoped routes и grants 0.6.0
+
+`route_grants` — операторская политика профиля, а не полномочие модели. Grant связывает один profile/connection/workspace с точными project/squad/source/user/thread/assignee allowlists, credential anchor, quota и expiry. `multica_route_create` может только сузить этот набор; при нескольких подходящих grants нужен `grant_id` из текущего trusted context. Route по умолчанию остаётся pending.
+
+Все Workspace операции повторно проверяют grant, срок, source thread, проект и credential anchor. `all_workspace` допустим только для динамического workspace route с разрешением grant; каждая отправка обязана указать project, который Multica подтвердил как часть workspace. Статические маршруты не переводятся в открытый scope.
+
+Динамическое состояние хранится в отдельной профильной SQLite базе с приватными правами и не содержит PAT. PAT читается через статический credential anchor того же connection/workspace; disabled, revoked или истёкший grant и недоступный anchor приводят к отказу до записи.
+
+Notify readiness IPC — отдельный read-only интерфейс. Каталог сокета имеет режим `0711` для traversal между service UID, а сокет — `0666`, чтобы разные профильные UID могли подключиться; это только транспортный доступ. Каждый peer проверяется через `SO_PEERCRED` по allowlist UID/profile до чтения кадра, длина кадра проверяется до JSON parsing. Интерфейс возвращает только готовность проекта и безопасный route identifier; plugin не получает соединение с notify DB и не читает credentials. Completion route не обращается к legacy watcher и отвергает сочетание `wake_mode=completion` и `watcher_enabled=true`.
+
+Repository Skill задаёт предпочтительный путь через зарегистрированные bridge tools; он не выдаёт права и не заменяет server-side grant проверки. Установка, grant configuration и включение notify подписки остаются отдельными операторскими действиями.

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-multica-bridge"
-version = "0.5.0"
-description = "Hermes plugin for secure Standard or Isolated task delivery to Multica with result tracking"
+version = "0.6.0"
+description = "Hermes plugin for scoped Multica Workspace routes, operator grants, and completion wake readiness"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "LicenseRef-Omsk-Open-License-Basic-Attribution"
@@ -31,6 +31,7 @@ include = ["bridge", "bridge.*", "notify", "notify.*"]
 "share/hermes/plugins/hermes-multica-bridge/config" = ["config/*.toml", "config/*.json"]
 "share/hermes/plugins/hermes-multica-bridge/deploy" = ["deploy/*.py", "deploy/README.md"]
 "share/hermes/plugins/hermes-multica-bridge/deploy/systemd" = ["deploy/systemd/*.service", "deploy/systemd/*.socket"]
+"share/hermes/plugins/hermes-multica-bridge/skills/hermes-multica-bridge" = ["skills/hermes-multica-bridge/SKILL.md"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["N999"]

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.0
+
+- Добавлены project/squad/workspace scopes, точные thread ACL и динамические Workspace-маршруты в пределах операторских route grants.
+- Добавлен `multica_route_create`; неоднозначный grant требует выбора только среди разрешённых текущему сообщению вариантов, новый маршрут по умолчанию остаётся pending.
+- Динамические маршруты используют статический credential anchor без копирования PAT; отдельная профильная SQLite база обеспечивает идемпотентность, quota, audit и отзыв.
+- Completion-маршруты не требуют старого watcher; добавлен read-only notify readiness IPC с `SO_PEERCRED`, UID/profile ACL и per-project статусом.
+- Добавлены Dashboard review actions и packaged Hermes Skill; legacy 0.5.0 routes остаются без автоматического переписывания.
+- Product version is 0.6.0. This source change does not install, enable, or publish routes.
+
 ## 0.5.0
 
 - Исправлены идемпотентность wake enable, остановка ожидающих workers, запрет обычных retry после wake-регистрации, выбор CLI alias и точность doctor; webhook transport проверяет полноту ответа и ограничивает общую длительность запроса.

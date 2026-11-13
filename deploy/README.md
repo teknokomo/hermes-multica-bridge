@@ -1,4 +1,4 @@
-# Развёртывание Hermes Multica Bridge 0.5.0
+# Развёртывание Hermes Multica Bridge 0.6.0
 
 Эта инструкция описывает настройку после копирования публичного пакета на целевой хост. Она не выполняет deployment автоматически.
 
@@ -256,7 +256,7 @@ sudo systemctl stop hermes-multica-bridge@<instance>.service
 
 ## Чистая установка профиля
 
-Версия продукта — 0.5.0. ConnectionRegistry и Workspace ledger сохраняют текущую структуру без внутренних версий. Watcher state поддерживает только документированную одностороннюю миграцию с 0.2.0; notify выполняет additive-миграцию только с точной схемы 0.4.0. Неизвестные схемы отклоняются. Credentials задаются через предназначенные для них Hermes/systemd интерфейсы и не выводятся в терминал или отчёты.
+Версия продукта — 0.6.0. Статический ConnectionRegistry 0.5.0 продолжает загружаться без переписывания; внутренние версии registry/API не добавляются. Dynamic routes хранятся отдельно на профиль, не содержат credentials и отклоняют неизвестную схему до изменения store. Notify использует собственную миграцию SQLite; старый watcher state не переиспользуется. Credentials задаются через предназначенные Hermes/systemd интерфейсы и не выводятся в терминал или отчёты.
 
 При первом включении Route его destination фиксируется. После появления deliveries нельзя удалять ledger или переиспользовать их `route_id` для другого назначения. Включённый или использованный Route должен остаться в registry и при выводе из эксплуатации перейти в disable + tombstone: result lookup использует immutable snapshot исходной доставки.
 
@@ -320,7 +320,7 @@ Notify устанавливается в собственный venv и рабо
 
 1. Сохранить согласованные SQLite backup, TOML, SHA-256 и S3-копии действующего watcher. Не заменять custom units и credentials.
 2. Создать системного пользователя `hermes-notify`, StateDirectory/RuntimeDirectory 0700 и приватный каталог конфигурации. Конфигурацией и CLI-файлами владеет hermes-notify; административные CLI-команды выполнять от этого пользователя.
-3. Установить wheel 0.5.0 в `/opt/hermes-multica-notify/venv`. Положить unit из репозитория; добавить operator-owned drop-in с точными `LoadCredential=<имя>:<приватный-путь>` для используемых accounts/workspaces. Не создавать пустые credentials.
+3. Установить wheel 0.6.0 в `/opt/hermes-multica-notify/venv`. Положить unit из репозитория; добавить operator-owned drop-in с точными `LoadCredential=<имя>:<приватный-путь>` для используемых accounts/workspaces. Не создавать пустые credentials.
 4. Инициализировать конфигурацию через `init`, заполнить TOML и credentials. Пример содержит нерабочие плейсхолдеры. Основной CLI 0.8.2 должен поддерживать updated-since/until, сортировку и paging; doctor проверяет capabilities. Перед live отдельно проверить точный серверный бинарник.
 5. После запуска `run` сервис строит infrastructure projection. Затем добавлять подписки. Изменения workspace через CLI append-only сохраняют комментарии и требуют SIGHUP; invalid reload оставляет рабочую проекцию.
 
@@ -359,3 +359,19 @@ Hermes webhook route должен иметь точные `events = ["task.compl
 Одна автоматическая попытка POST не гарантирует exactly-once. `delivery_unknown` не повторяется автоматически. Перед `wake replay ID --confirm` оператор сверяет Hermes journal и целевой тред; тот же wake ID позволяет Hermes дедуплицировать уже принятый запрос, но доставка ответа всё ещё может быть неоднозначной.
 
 Откат: отключить wake-подписки, остановить notify и только затем восстановить согласованные БД/TOML/credential drop-ins. Не удаляйте receipts и сохранённые `delivery_unknown` без записи audit. Gateway restart выполняется только в согласованное окно и после готовности обоих профилей и тестовой цели.
+
+## Scoped Workspace routes 0.6.0
+
+Static routes версии 0.5.0 остаются без переписывания. В `registry.route_grants` оператор отдельно задаёт профиль, connection, workspace, разрешённые project/squad, источник и точный thread/user, typed assignees, credential anchor, лимит маршрутов, auto-approval и срок действия. Не добавляйте реальные токены в registry; PAT anchor задаётся через Hermes credential UI.
+
+Динамические маршруты создаются инструментом `multica_route_create` только из trusted чата. Один совпавший grant выбирается автоматически; при нескольких нужен `grant_id` из перечня текущего контекста. Маршрут остаётся `pending`, пока оператор не одобрит его в Dashboard или не включит `auto_approve` в grant. Отзыв гранта блокирует последующие операции; секреты в dynamic store не сохраняются.
+
+Для конечного набора используйте `project` или `allowlist`. `all_workspace` доступен только динамическому маршруту `scope_kind=workspace` при активном `allow_all_projects=true`, и каждый `multica_workspace_send` требует явный `project_id`. Не переносите статические маршруты в открытый scope. `allowed_thread_ids` — точное ограничение входной темы; оно проверяется до Multica API.
+
+Completion route обязан иметь `wake_mode=completion` и `watcher_enabled=false`; он не нуждается в старом watcher. Readiness берётся из отдельного read-only notify socket и показывается по проектам. Для нескольких проектов общий `wake_ready=true` означает покрытие каждого разрешённого проекта; открытый workspace scope всегда остаётся `false` для общего readiness. Отсутствие notify отображается как warning.
+
+`[readiness_ipc]` по умолчанию выключен. Для локальной интеграции задайте только необходимые UID и Hermes profile в приватном notify TOML, включите read-only сокет и добавьте plugin UID в allowlist. Каталог сокета доступен для traversal (`0711`), сокет — для подключения (`0666`), но каждый peer проверяется по `SO_PEERCRED`/UID/profile до чтения запроса; длина кадра проверяется до JSON parsing. Не открывайте сокет через сеть и не выдавайте ему доступ к Hermes home, notify DB или credentials.
+
+Отдельный DynamicRouteStore создаётся в приватной директории данных профиля. Не копируйте его между профилями и не редактируйте SQLite вручную. При неизвестной схеме сервис прекращает операцию без миграции или изменения файла. Новые и отозванные маршруты становятся видимыми без рестарта Gateway.
+
+В этой реализации T74 не выполняется: package install, live grants/credentials, wake subscriptions, Gateway/notify/watcher restart, canary, Multica issue, production activation и публикация требуют отдельного разрешения и backup/rollback плана.
