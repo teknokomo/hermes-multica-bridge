@@ -257,6 +257,134 @@ class RegistryTests(unittest.TestCase):
                     registry_from_mapping(payload)
                 self.assertEqual(raised.exception.code, "configuration_invalid")
 
+    def test_legacy_workspace_route_normalizes_to_project_scope_and_legacy_watcher(self) -> None:
+        payload = workspace_registry_payload()
+        route = payload["routes"][0]
+        normalized = registry_from_mapping(payload).routes[0]
+        self.assertEqual(normalized.scope_kind, "project")
+        self.assertEqual(normalized.project_selection, "allowlist")
+        self.assertEqual(normalized.project_ids, ("project-1",))
+        self.assertEqual(normalized.default_project_id, "project-1")
+        self.assertEqual(normalized.allowed_thread_ids, ())
+        self.assertEqual(normalized.wake_mode, "legacy_watcher")
+
+        route.update(wake_mode="completion", watcher_enabled=False)
+        parsed = registry_from_mapping(payload).routes[0]
+        self.assertEqual(parsed.wake_mode, "completion")
+        self.assertFalse(parsed.watcher_enabled)
+
+    def test_enabled_project_scope_accepts_new_project_fields_without_legacy_project_id(self) -> None:
+        payload = workspace_registry_payload()
+        route = payload["routes"][0]
+        route.pop("project_id")
+        route.update({
+            "scope_kind": "project",
+            "project_selection": "allowlist",
+            "project_ids": ["project-1"],
+            "default_project_id": "project-1",
+        })
+
+        parsed = registry_from_mapping(payload).routes[0]
+
+        self.assertEqual(parsed.project_ids, ("project-1",))
+        self.assertEqual(parsed.default_project_id, "project-1")
+        self.assertEqual(parsed.project_id, "project-1")
+
+    def test_completion_route_rejects_legacy_watcher_and_static_all_workspace(self) -> None:
+        payload = workspace_registry_payload()
+        payload["routes"][0].update(wake_mode="completion", watcher_enabled=True)
+        with self.assertRaises(BridgeError):
+            registry_from_mapping(payload)
+        payload["routes"][0].update(watcher_enabled=False, project_selection="all_workspace",
+                                    project_ids=[], default_project_id="project-1")
+        with self.assertRaises(BridgeError):
+            registry_from_mapping(payload)
+
+    def test_allowed_thread_ids_are_an_exact_trusted_source_restriction(self) -> None:
+        payload = workspace_registry_payload(allow_groups=True)
+        payload["routes"][0]["allowed_thread_ids"] = ["thread-33"]
+        registry = registry_from_mapping(payload)
+        source = {"platform": "telegram", "user_id": "user-1", "chat_id": "chat-1",
+                  "thread_id": "thread-33", "chat_type": "thread", "message_id": "m1"}
+        self.assertEqual(len(registry.authorized_workspace_routes(source)), 1)
+        source["thread_id"] = "thread-34"
+        self.assertEqual(registry.authorized_workspace_routes(source), ())
+
+    def test_dynamic_route_must_match_an_active_grant_anchor_and_scope(self) -> None:
+        payload = workspace_registry_payload()
+        anchor = payload["routes"][0]
+        workspace = payload["workspaces"][0]
+        connection = payload["connections"][0]
+        grant_id = new_id()
+        payload["route_grants"] = [{
+            "grant_id": grant_id, "profile": "default",
+            "connection_id": connection["connection_id"], "workspace_key": workspace["workspace_key"],
+            "workspace_id": workspace["workspace_id"], "allowed_project_ids": ["project-1"],
+            "allowed_squad_ids": [], "allow_all_projects": False,
+            "allowed_source_platforms": ["telegram"], "allowed_chat_ids": ["chat-1"],
+            "allowed_thread_ids": ["thread-33"], "allowed_user_ids": ["user-1"],
+            "allowed_assignees": [{"id": MEMBER_UUID, "type": "member"}],
+            "credential_route_id": anchor["route_id"], "max_routes": 2, "auto_approve": False,
+            "expires_at": "2030-01-01T00:00:00Z", "enabled": True,
+        }]
+        dynamic = copy.deepcopy(anchor)
+        dynamic.update({
+            "route_id": new_id(), "name": "Dynamic", "project_id": "project-1",
+            "project_ids": ["project-1"], "default_project_id": "project-1",
+            "scope_kind": "project", "project_selection": "allowlist",
+            "allowed_thread_ids": ["thread-33"], "wake_mode": "completion",
+            "source_platforms": ["telegram"],
+            "allowed_assignees": [{"id": MEMBER_UUID, "type": "member"}],
+            "default_assignee": {"id": MEMBER_UUID, "type": "member"},
+            "watcher_enabled": False, "enabled": False, "dynamic_status": "pending",
+            "grant_id": grant_id, "credential_route_id": anchor["route_id"],
+            "created_by_profile": "default",
+        })
+        payload["routes"].append(dynamic)
+        registry = registry_from_mapping(payload)
+        self.assertEqual(registry.routes[-1].dynamic_status, "pending")
+        self.assertEqual(registry.routes[-1].credential_route_id, anchor["route_id"])
+
+        payload["routes"][-1]["credential_route_id"] = new_id()
+        with self.assertRaises(BridgeError):
+            registry_from_mapping(payload)
+
+    def test_dynamic_all_workspace_requires_grant_permission_and_project_selection(self) -> None:
+        payload = workspace_registry_payload()
+        anchor = payload["routes"][0]
+        workspace = payload["workspaces"][0]
+        connection = payload["connections"][0]
+        grant_id = new_id()
+        payload["route_grants"] = [{
+            "grant_id": grant_id, "profile": "default", "connection_id": connection["connection_id"],
+            "workspace_key": workspace["workspace_key"], "workspace_id": workspace["workspace_id"],
+            "allowed_project_ids": [], "allowed_squad_ids": [], "allow_all_projects": True,
+            "allowed_source_platforms": ["telegram"], "allowed_chat_ids": ["chat-1"],
+            "allowed_thread_ids": [], "allowed_user_ids": ["user-1"],
+            "allowed_assignees": [{"id": MEMBER_UUID, "type": "member"}],
+            "credential_route_id": anchor["route_id"], "max_routes": 2, "auto_approve": False,
+            "expires_at": "2030-01-01T00:00:00Z", "enabled": True,
+        }]
+        route = copy.deepcopy(anchor)
+        route.update({"route_id": new_id(), "name": "Open scope", "project_id": "project-1",
+                      "scope_kind": "workspace", "project_selection": "all_workspace", "project_ids": [],
+                      "default_project_id": "project-1", "watcher_enabled": False,
+                      "source_platforms": ["telegram"],
+                      "allowed_assignees": [{"id": MEMBER_UUID, "type": "member"}],
+                      "default_assignee": {"id": MEMBER_UUID, "type": "member"},
+                      "wake_mode": "completion", "enabled": False, "dynamic_status": "pending",
+                      "grant_id": grant_id, "credential_route_id": anchor["route_id"],
+                      "created_by_profile": "default"})
+        payload["routes"].append(route)
+        self.assertEqual(registry_from_mapping(payload).routes[-1].project_selection, "all_workspace")
+        payload["route_grants"][0]["allow_all_projects"] = False
+        with self.assertRaises(BridgeError):
+            registry_from_mapping(payload)
+        payload["route_grants"][0]["allow_all_projects"] = True
+        payload["routes"][-1]["scope_kind"] = "project"
+        with self.assertRaises(BridgeError):
+            registry_from_mapping(payload)
+
     def test_workspace_route_requires_standard_connection_and_complete_policy(self) -> None:
         registry = registry_from_mapping(workspace_registry_payload())
         route = registry.routes[0]

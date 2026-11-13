@@ -157,5 +157,6 @@
       "allowed_assignees": ["REPLACE-ASSIGNEE"]
     }
   ],
-  "operator_grants": []
+  "operator_grants": [],
+  "route_grants": []
 }
