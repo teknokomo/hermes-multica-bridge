@@ -48,12 +48,24 @@ class DynamicRouteStore:
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        db = sqlite3.connect(self.path, timeout=5, isolation_level=None)
-        db.row_factory = sqlite3.Row
-        db.execute("PRAGMA busy_timeout=5000")
-        db.execute("PRAGMA journal_mode=WAL")
-        db.execute("PRAGMA synchronous=FULL")
-        return db
+        db = None
+        try:
+            db = sqlite3.connect(self.path, timeout=5, isolation_level=None)
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA busy_timeout=5000")
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA synchronous=FULL")
+            return db
+        except sqlite3.Error as exc:
+            if db is not None:
+                try:
+                    db.close()
+                except sqlite3.Error:
+                    pass
+            raise BridgeError(
+                "dynamic_route_state_unavailable",
+                "Dynamic route storage is unavailable.",
+            ) from exc
 
     def _initialize(self) -> None:
         self._preflight_schema()

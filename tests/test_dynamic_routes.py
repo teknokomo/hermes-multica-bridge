@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -30,6 +31,28 @@ def test_dynamic_store_initializes_private_independent_schema(tmp_path):
         assert not any("token" in field or "secret" in field or "pat" in field for field in columns)
     finally:
         db.close()
+
+
+def test_connect_translates_sqlite_connection_and_setup_failures(tmp_path):
+    store = object.__new__(DynamicRouteStore)
+    store.path = tmp_path / "routes.db"
+
+    with (
+        patch("bridge.dynamic_routes.sqlite3.connect", side_effect=sqlite3.OperationalError("busy")),
+        pytest.raises(BridgeError) as connection_error,
+    ):
+        store._connect()
+    assert connection_error.value.code == "dynamic_route_state_unavailable"
+
+    database = Mock()
+    database.execute.side_effect = sqlite3.OperationalError("WAL setup failed")
+    with (
+        patch("bridge.dynamic_routes.sqlite3.connect", return_value=database),
+        pytest.raises(BridgeError) as setup_error,
+    ):
+        store._connect()
+    assert setup_error.value.code == "dynamic_route_state_unavailable"
+    database.close.assert_called_once_with()
 
 
 def test_create_is_idempotent_and_name_conflicts_do_not_partially_write(tmp_path):

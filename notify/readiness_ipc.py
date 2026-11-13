@@ -36,7 +36,6 @@ class ReadinessServer:
         self.state = state
         self.path = Path(config.readiness_ipc["socket_path"])
         self._server: asyncio.AbstractServer | None = None
-        self._policy: dict | None = None
 
     async def start(self, *, policy: dict | None = None) -> None:
         if not self.config.readiness_ipc.get("enabled"):
@@ -61,9 +60,8 @@ class ReadinessServer:
                 raise NotifyError("notify_ipc_path_untrusted")
             self.path.unlink()
         try:
-            self._policy = policy if policy is not None else load_webhook_policy(
-                Path(self.config.wake["webhook_policy_file"])
-            )
+            if policy is None:
+                load_webhook_policy(Path(self.config.wake["webhook_policy_file"]))
             self._server = await asyncio.start_unix_server(self._handle, path=str(self.path), limit=MAX_FRAME + 4)
             # Cross-UID peers connect here; _peer_allowed() authorizes every peer via SO_PEERCRED.
             os.chmod(self.path, 0o666)  # nosec B103
@@ -89,11 +87,9 @@ class ReadinessServer:
     async def refresh(self, config: Config, *, policy: dict | None = None) -> None:
         if config.readiness_ipc["socket_path"] != str(self.path):
             raise NotifyError("notify_config_reload_failed")
-        next_policy = policy if policy is not None else load_webhook_policy(
-            Path(config.wake["webhook_policy_file"])
-        )
+        if policy is None:
+            load_webhook_policy(Path(config.wake["webhook_policy_file"]))
         self.config = config
-        self._policy = next_policy
 
     def _peer_allowed(self, writer: asyncio.StreamWriter, profile: str) -> bool:
         sock = writer.get_extra_info("socket")
@@ -194,7 +190,7 @@ class ReadinessServer:
                 if len(rows) > 4096:
                     raise ValueError("readiness row limit")
             configured_routes = self.config.wake.get("routes", {})
-            policy = self._policy or {}
+            policy = load_webhook_policy(Path(self.config.wake["webhook_policy_file"]))
         except Exception:  # noqa: BLE001 - expose only a stable unavailable result
             return [{"workspace_id": p["workspace_id"], "project_id": p["project_id"],
                      "wake_ready": False, "reason": "source_unavailable", "wake_route_id": None}

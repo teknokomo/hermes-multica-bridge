@@ -9,6 +9,7 @@
 - Добавлены Dashboard review actions и packaged Hermes Skill; legacy 0.5.0 routes остаются без автоматического переписывания.
 - Уточнены квоты dynamic routes по каждому grant и транзакционная миграция store; недействительные/revoked записи не ломают static routes, а Dashboard блокирует их осиротевание.
 - Dashboard теперь отражает ошибки completion readiness; Desktop блокирует сохранение невалидного `route_grants` JSON и не предлагает static routes режим `all_workspace`.
+- Усилены обработки SQLite-сбоев и parent-project checks; Dashboard пакетирует большие readiness allowlists, а readiness сверяет актуальную webhook policy.
 - Product version is 0.6.0. This source change does not install, enable, or publish routes.
 
 ## 0.5.0

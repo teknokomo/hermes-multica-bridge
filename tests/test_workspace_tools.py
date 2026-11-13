@@ -483,6 +483,19 @@ class WorkspaceToolsTests(unittest.TestCase):
         with self.assertRaises(BridgeError) as raised:
             self.runtime._project_for_send({}, dynamic_registry, route, api)
         self.assertEqual(raised.exception.code, "project_required")
+        self.runtime._issue_in_route(
+            {"workspace_id": "workspace-1", "project_id": "project-2"},
+            dynamic_registry,
+            route,
+        )
+        with self.assertRaises(BridgeError) as parent_error:
+            self.runtime._issue_in_route(
+                {"workspace_id": "workspace-1", "project_id": "project-2"},
+                dynamic_registry,
+                route,
+                project_id="project-1",
+            )
+        self.assertEqual(parent_error.exception.code, "route_denied")
         self.assertEqual(api.get_project.call_count, 1)
 
     def test_allow_all_grant_can_revalidate_a_finite_route_project_subset(self) -> None:

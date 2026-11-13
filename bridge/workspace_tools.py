@@ -346,7 +346,7 @@ class WorkspaceRuntime:
             if project_id is not None or route.project_selection == "allowlist" and len(allowed_projects) == 1
             else issue.get("project_id") in allowed_projects
         )
-        if route.project_selection == "all_workspace":
+        if route.project_selection == "all_workspace" and project_id is None:
             project_matches = bool(issue.get("project_id"))
         if issue.get("workspace_id") != workspace.workspace_id or not project_matches:
             raise BridgeError("route_denied", "The issue does not belong to this Workspace route.")

@@ -16,7 +16,7 @@ if str(PLUGIN_ROOT) not in sys.path:
 
 from bridge.dynamic_routes import DynamicRouteStore
 from bridge.errors import BridgeError
-from bridge.notify_readiness import NotifyReadinessClient
+from bridge.notify_readiness import MAX_PROJECTS, NotifyReadinessClient
 from bridge.protocol import BridgeIpcClient
 from bridge.registry import (
     ConnectionRegistry,
@@ -225,10 +225,15 @@ def _route_status(registry: ConnectionRegistry, route: RegistryRoute) -> dict[st
             project_ids = route.project_ids if route.project_selection == "allowlist" else (route.default_project_id,)
             workspace_id = workspace.workspace_id
             try:
-                wake_readiness = NotifyReadinessClient().check(
-                    route.created_by_profile or "default",
-                    [{"workspace_id": workspace_id, "project_id": project_id} for project_id in project_ids],
-                ) if project_ids else []
+                wake_readiness = []
+                if project_ids:
+                    client = NotifyReadinessClient()
+                    for offset in range(0, len(project_ids), MAX_PROJECTS):
+                        batch = project_ids[offset:offset + MAX_PROJECTS]
+                        wake_readiness.extend(client.check(
+                            route.created_by_profile or "default",
+                            [{"workspace_id": workspace_id, "project_id": project_id} for project_id in batch],
+                        ))
                 wake_ready = bool(wake_readiness) and all(item["wake_ready"] for item in wake_readiness)
                 if route.project_selection == "all_workspace":
                     wake_ready = False
@@ -523,29 +528,32 @@ def _review_dynamic_route(route_id: str, *, approve: bool) -> dict[str, Any]:
         static_registry = registry_from_mapping(raw)
         store = DynamicRouteStore(_storage_path().parent / "dynamic-routes.sqlite3")
         dynamic = store.get(route_id)
-        grant = static_registry.route_grant(dynamic["grant_id"])
         profile = dynamic["created_by_profile"]
-        if profile != grant.profile or dynamic["connection_id"] != grant.connection_id:
-            raise BridgeError("route_grant_denied", "The dynamic route no longer matches its operator grant.")
-        if approve:
-            if not grant.active:
-                raise BridgeError("route_grant_expired", "The operator grant is expired or disabled.")
-            if dynamic["dynamic_status"] == "revoked":
-                raise BridgeError("route_immutable", "A revoked dynamic route cannot be approved.")
-            anchor = static_registry.route(grant.credential_route_id)
-            if not anchor.enabled or anchor.tombstoned:
-                raise BridgeError("credential_unavailable", "The dynamic route credential anchor is disabled.")
-            if dynamic["dynamic_status"] == "active":
-                return {"ok": True, "route_id": route_id, "status": "active", "changed": False}
-            complete, _accepted_routes = registry_with_dynamic_routes(raw, store.list(profile))
-            complete.route(route_id)
-            if not _route_secret_presence(anchor)["multica_pat"]:
-                raise BridgeError("credential_unavailable", "The operator credential anchor has no Multica PAT.")
-            status = "active"
-        else:
+        if not isinstance(profile, str) or not profile or len(profile) > 128:
+            raise BridgeError("route_grant_denied", "The dynamic route profile is invalid.")
+        if not approve:
             if dynamic["dynamic_status"] == "revoked":
                 return {"ok": True, "route_id": route_id, "status": "revoked", "changed": False}
-            status = "revoked"
+            store.set_status(route_id, profile, "revoked")
+            return {"ok": True, "route_id": route_id, "status": "revoked", "changed": True}
+
+        grant = static_registry.route_grant(dynamic["grant_id"])
+        if profile != grant.profile or dynamic["connection_id"] != grant.connection_id:
+            raise BridgeError("route_grant_denied", "The dynamic route no longer matches its operator grant.")
+        if not grant.active:
+            raise BridgeError("route_grant_expired", "The operator grant is expired or disabled.")
+        if dynamic["dynamic_status"] == "revoked":
+            raise BridgeError("route_immutable", "A revoked dynamic route cannot be approved.")
+        anchor = static_registry.route(grant.credential_route_id)
+        if not anchor.enabled or anchor.tombstoned:
+            raise BridgeError("credential_unavailable", "The dynamic route credential anchor is disabled.")
+        if dynamic["dynamic_status"] == "active":
+            return {"ok": True, "route_id": route_id, "status": "active", "changed": False}
+        complete, _accepted_routes = registry_with_dynamic_routes(raw, store.list(profile))
+        complete.route(route_id)
+        if not _route_secret_presence(anchor)["multica_pat"]:
+            raise BridgeError("credential_unavailable", "The operator credential anchor has no Multica PAT.")
+        status = "active"
         store.set_status(route_id, profile, status)
         return {"ok": True, "route_id": route_id, "status": status, "changed": True}
     except (BridgeError, HTTPException) as exc:

@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import struct
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -242,6 +243,36 @@ def test_readiness_database_failure_returns_client_compatible_unavailable_rows(t
                 }]
             finally:
                 await server.close()
+
+    asyncio.run(run())
+
+
+def test_readiness_uses_current_webhook_policy_instead_of_startup_snapshot(tmp_path):
+    async def run():
+        socket_path = tmp_path / "run" / "readiness.sock"
+        socket_path.parent.mkdir(mode=0o700)
+        server = ReadinessServer(_config(socket_path), _State())
+        current_policy = {("default", "canary-wake"): {}}
+
+        def verify(policy, profile, route, _source):
+            if (profile, route) not in policy:
+                raise NotifyError("wake_route_unavailable")
+
+        await server.start(policy={})
+        try:
+            with (
+                patch("notify.readiness_ipc.load_webhook_policy", return_value=current_policy) as load_policy,
+                patch("notify.readiness_ipc.verify_webhook_policy", side_effect=verify),
+            ):
+                result = await asyncio.to_thread(
+                    server._readiness,
+                    "default",
+                    [{"workspace_id": WORKSPACE_ID, "project_id": PROJECT_ID}],
+                )
+            assert result[0]["wake_ready"] is True
+            load_policy.assert_called_once_with(Path("/unused/test-policy.json"))
+        finally:
+            await server.close()
 
     asyncio.run(run())
 

@@ -163,6 +163,62 @@ class DashboardPluginApiTests(unittest.TestCase):
                 self.assertIn("credential", raised.exception.detail)
                 secret_check.assert_not_called()
 
+    def test_reject_dynamic_route_succeeds_after_its_grant_was_removed(self) -> None:
+        raw = workspace_registry_payload()
+        dynamic = copy.deepcopy(raw["routes"][0])
+        dynamic_id = new_id()
+        dynamic.update({
+            "route_id": dynamic_id,
+            "name": "Orphaned dynamic route",
+            "enabled": True,
+            "watcher_enabled": False,
+            "wake_mode": "completion",
+            "grant_id": new_id(),
+            "credential_route_id": raw["routes"][0]["route_id"],
+            "dynamic_status": "active",
+            "created_by_profile": "default",
+        })
+        store = Mock()
+        store.get.return_value = dynamic
+        with (
+            patch.object(PLUGIN_API, "_fields", return_value=[{"key": "registry", "value": raw}]),
+            patch.object(PLUGIN_API, "_storage_path", return_value=Path("fake/deliveries.sqlite3")),
+            patch.object(PLUGIN_API, "DynamicRouteStore", return_value=store),
+        ):
+            result = PLUGIN_API._review_dynamic_route(dynamic_id, approve=False)
+
+        self.assertEqual(result, {"ok": True, "route_id": dynamic_id, "status": "revoked", "changed": True})
+        store.set_status.assert_called_once_with(dynamic_id, "default", "revoked")
+
+    def test_completion_readiness_is_checked_in_ipc_sized_batches(self) -> None:
+        raw = workspace_registry_payload()
+        route = raw["routes"][0]
+        project_ids = [f"project-{index}" for index in range(PLUGIN_API.MAX_PROJECTS + 1)]
+        route.update({
+            "scope_kind": "workspace",
+            "project_selection": "allowlist",
+            "project_ids": project_ids,
+            "project_id": project_ids[0],
+            "default_project_id": project_ids[0],
+            "wake_mode": "completion",
+            "watcher_enabled": False,
+        })
+        registry = registry_from_mapping(raw)
+        client = Mock()
+        client.check.side_effect = lambda profile, projects: [
+            {"project_id": item["project_id"], "wake_ready": True, "reason": "ready", "wake_route_id": "wake"}
+            for item in projects
+        ]
+        with (
+            patch.object(PLUGIN_API, "NotifyReadinessClient", return_value=client),
+            patch.object(PLUGIN_API, "_route_secret_presence", return_value={"multica_pat": True}),
+        ):
+            result = PLUGIN_API._route_status(registry, registry.routes[0])
+
+        self.assertTrue(result["wake_ready"])
+        self.assertEqual([len(call.args[1]) for call in client.check.call_args_list], [PLUGIN_API.MAX_PROJECTS, 1])
+        self.assertEqual([item["project_id"] for item in result["projects_readiness"]], project_ids)
+
     def test_registry_update_rejects_grant_edits_that_orphan_existing_dynamic_routes(self) -> None:
         current = workspace_registry_payload()
         anchor = current["routes"][0]
