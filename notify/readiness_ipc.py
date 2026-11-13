@@ -11,6 +11,7 @@ import struct
 from pathlib import Path
 from typing import Any
 
+from bridge.notify_contract import READINESS_PROFILES
 from bridge.validation import strict_json_loads
 
 from .config import Config, NotifyError
@@ -19,7 +20,7 @@ from .wake import load_webhook_policy, verify_webhook_policy
 
 MAX_FRAME = 16 * 1024
 MAX_PROJECTS = 32
-_PROFILE_SET = {"default", "om73"}
+_PROFILE_SET = READINESS_PROFILES
 
 
 def _encode(value: dict[str, Any]) -> bytes:
@@ -196,7 +197,8 @@ class ReadinessServer:
             policy = self._policy or {}
         except Exception:  # noqa: BLE001 - expose only a stable unavailable result
             return [{"workspace_id": p["workspace_id"], "project_id": p["project_id"],
-                     "wake_ready": False, "reason": "source_unavailable"} for p in projects]
+                     "wake_ready": False, "reason": "source_unavailable", "wake_route_id": None}
+                    for p in projects]
         for project in projects:
             ready, reason = False, "wake_missing"
             matched_route = None

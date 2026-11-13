@@ -18,6 +18,8 @@ import {
   newConnection,
   newRoute,
   newWorkspace,
+  parseRouteGrantsDraft,
+  projectSelectionOptions,
   routeDestinationFieldLocked,
   routeStatus,
   updateWorkspaceConnection,
@@ -510,6 +512,7 @@ function RegistryEditor({ ctx, profile }) {
   const [selectedRoute, setSelectedRoute] = useState('')
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState('')
+  const [routeGrantsDraftError, setRouteGrantsDraftError] = useState('')
   const [grantDraft, setGrantDraft] = useState(() => ({ profile, board: '', task: '' }))
   const { board: grantBoard, task: grantTask } = profileScopedGrantDraft(grantDraft, profile)
   const [listDrafts, setListDrafts] = useState({})
@@ -542,6 +545,7 @@ function RegistryEditor({ ctx, profile }) {
     setSelectedWorkspace('')
     setSelectedRoute('')
     setSaveError('')
+    setRouteGrantsDraftError('')
     setSaving(false)
     setListDrafts({})
     setGrantDraft({ profile, board: '', task: '' })
@@ -657,6 +661,12 @@ function RegistryEditor({ ctx, profile }) {
 
   async function saveRegistry() {
     if (!registry) return
+    if (routeGrantsDraftIsInvalid()) {
+      const message = 'Исправьте JSON route_grants: ожидается JSON-массив.'
+      setRouteGrantsDraftError(message)
+      setSaveError(message)
+      return
+    }
     const saveProfile = profile
     const generation = ++saveGeneration.current
     const submittedDraftGeneration = draftGeneration.current
@@ -829,14 +839,22 @@ function RegistryEditor({ ctx, profile }) {
       : JSON.stringify(registry.route_grants || [], null, 2)
   }
 
+  function routeGrantsDraftIsInvalid() {
+    const draftKey = 'registry:route_grants'
+    return Object.prototype.hasOwnProperty.call(listDrafts, draftKey)
+      && !parseRouteGrantsDraft(listDrafts[draftKey]).valid
+  }
+
   function updateRouteGrantsJson(value) {
     const draftKey = 'registry:route_grants'
     setListDrafts(current => ({ ...current, [draftKey]: value }))
-    try {
-      const parsed = JSON.parse(value)
-      if (Array.isArray(parsed)) mutate(next => { next.route_grants = parsed })
-    } catch {
-      // Keep invalid drafts visible, but do not persist partial JSON.
+    const parsed = parseRouteGrantsDraft(value)
+    if (parsed.valid) {
+      mutate(next => { next.route_grants = parsed.value })
+      setRouteGrantsDraftError('')
+      setSaveError('')
+    } else {
+      setRouteGrantsDraftError('JSON route_grants должен быть корректным JSON-массивом.')
     }
   }
 
@@ -876,7 +894,7 @@ function RegistryEditor({ ctx, profile }) {
         children: [
           jsx(Button, {
             onClick: () => void saveRegistry(),
-            disabled: saving,
+            disabled: saving || routeGrantsDraftIsInvalid(),
             children: saving ? 'Сохранение…' : 'Сохранить registry'
           }),
           jsx(Button, { onClick: () => void refresh(), disabled: saving, children: 'Перечитать readiness' })
@@ -969,7 +987,8 @@ function RegistryEditor({ ctx, profile }) {
           jsx(FormField, {
             label: 'route_grants (JSON)', type: 'textarea', value: routeGrantsDraft(),
             onChange: updateRouteGrantsJson
-          })
+          }),
+          routeGrantsDraftError ? jsx('div', { role: 'alert', children: routeGrantsDraftError }) : null
         ]
       }),
 
@@ -1027,9 +1046,7 @@ function RegistryEditor({ ctx, profile }) {
                   jsx(SelectField, { label: 'Scope', value: route.scope_kind || 'project', disabled: routeDestinationFieldLocked(route, 'scope_kind'), onChange: value => updateRoute('scope_kind', value), options: [
                     { value: 'project', label: 'Один проект' }, { value: 'squad', label: 'Squad с allowlist проектов' }, { value: 'workspace', label: 'Workspace' }
                   ] }),
-                  jsx(SelectField, { label: 'Выбор проектов', value: route.project_selection || 'allowlist', disabled: routeDestinationFieldLocked(route, 'project_selection'), onChange: value => updateRoute('project_selection', value), options: [
-                    { value: 'allowlist', label: 'Явный allowlist' }, { value: 'all_workspace', label: 'Все проекты по grant' }
-                  ] }),
+                  jsx(SelectField, { label: 'Выбор проектов', value: route.project_selection || 'allowlist', disabled: routeDestinationFieldLocked(route, 'project_selection'), onChange: value => updateRoute('project_selection', value), options: projectSelectionOptions(route) }),
                   jsx(FormField, { label: 'Project IDs (через запятую)', value: routeListDraft('project_ids'), disabled: routeDestinationFieldLocked(route, 'project_ids'), onChange: value => updateRouteList('project_ids', value) }),
                   jsx(FormField, { label: 'Default project ID', value: route.default_project_id || route.project_id, disabled: routeDestinationFieldLocked(route, 'default_project_id'), onChange: value => updateRoute('default_project_id', value) }),
                   jsx(FormField, { label: 'Squad ID', value: route.squad_id || '', disabled: routeDestinationFieldLocked(route, 'squad_id'), onChange: value => updateRoute('squad_id', value) }),

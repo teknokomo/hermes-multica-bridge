@@ -18,6 +18,23 @@ export function routeStatus(status, routeId) {
   return (status?.routes || []).find(item => item.route_id === routeId) || null
 }
 
+export function parseRouteGrantsDraft(value) {
+  try {
+    const parsed = JSON.parse(value)
+    return Array.isArray(parsed) ? { valid: true, value: parsed } : { valid: false, value: null }
+  } catch {
+    return { valid: false, value: null }
+  }
+}
+
+export function projectSelectionOptions(route) {
+  const options = [{ value: 'allowlist', label: 'Явный allowlist' }]
+  if (route?.route_type === 'workspace' && route?.dynamic_status) {
+    options.push({ value: 'all_workspace', label: 'Все проекты по grant' })
+  }
+  return options
+}
+
 const ROUTE_DESTINATION_FIELDS = new Set([
   'connection_id', 'workspace_key', 'route_type', 'project_id', 'project_ids',
   'project_selection', 'default_project_id', 'scope_kind', 'squad_id', 'autopilot_id',

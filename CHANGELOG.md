@@ -7,6 +7,8 @@
 - Динамические маршруты используют статический credential anchor без копирования PAT; отдельная профильная SQLite база обеспечивает идемпотентность, quota, audit и отзыв.
 - Completion-маршруты не требуют старого watcher; добавлен read-only notify readiness IPC с `SO_PEERCRED`, UID/profile ACL и per-project статусом.
 - Добавлены Dashboard review actions и packaged Hermes Skill; legacy 0.5.0 routes остаются без автоматического переписывания.
+- Уточнены квоты dynamic routes по каждому grant и транзакционная миграция store; недействительные/revoked записи не ломают static routes, а Dashboard блокирует их осиротевание.
+- Dashboard теперь отражает ошибки completion readiness; Desktop блокирует сохранение невалидного `route_grants` JSON и не предлагает static routes режим `all_workspace`.
 - Product version is 0.6.0. This source change does not install, enable, or publish routes.
 
 ## 0.5.0

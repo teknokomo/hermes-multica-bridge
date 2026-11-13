@@ -24,6 +24,7 @@ from .registry import (
     WorkspaceAssignee,
     new_id,
     registry_from_mapping,
+    registry_with_dynamic_routes,
     standard_route_secrets,
 )
 from .validation import _valid_telegram_thread_id
@@ -208,16 +209,15 @@ class WorkspaceRuntime:
         raw = self.ctx.get_config("registry", None)
         if not isinstance(raw, dict):
             raw = {"connections": [], "workspaces": [], "routes": [], "operator_grants": [], "route_grants": []}
-        merged = dict(raw)
-        merged["routes"] = list(raw.get("routes", []))
+        dynamic_rows = []
         try:
-            merged["routes"].extend(self._dynamic_store().list(self._profile()))
+            dynamic_rows = self._dynamic_store().list(self._profile())
         except BridgeError as exc:
-            # Outside Hermes, list/validate of static configuration remains useful.
-            # Actual dynamic operations still fail when profile storage is required.
-            if exc.code != "hermes_unavailable":
+            # Dynamic state is an optional overlay. Never let a broken overlay
+            # disable valid static routes; dynamic writes still fail closed.
+            if exc.code != "hermes_unavailable" and not exc.code.startswith("dynamic_route_state_"):
                 raise
-        return registry_from_mapping(merged)
+        return registry_with_dynamic_routes(raw, dynamic_rows)[0]
 
     def _profile(self) -> str:
         value = getattr(self.ctx, "profile_name", None)
@@ -829,6 +829,8 @@ class WorkspaceRuntime:
             ):
                 raise BridgeError("route_conflict", "A static route already uses this name in the workspace.")
             route_id = new_id()
+            # Defense in depth: route IDs are random UUIDv7, but the merged
+            # registry must still reject any collision before state is written.
             if any(route.route_id == route_id for route in registry.routes):
                 raise BridgeError("route_conflict", "The generated route identifier is already in use.")
             if project_selection == "all_workspace" and (
@@ -977,9 +979,21 @@ class WorkspaceRuntime:
                 "thread_id": source_thread, "name": normalized_name,
             }
             create_key = hashlib.sha256(_json(create_identity).encode()).hexdigest()
+            raw_registry = self.ctx.get_config("registry", None)
+            if not isinstance(raw_registry, dict):
+                raw_registry = {"connections": [], "workspaces": [], "routes": [],
+                                "operator_grants": [], "route_grants": []}
+
+            def validate_registry(existing_rows: list[dict[str, Any]], candidate: dict[str, Any]) -> None:
+                _current, accepted_rows = registry_with_dynamic_routes(raw_registry, existing_rows)
+                combined = dict(raw_registry)
+                combined["routes"] = [*raw_registry.get("routes", []), *accepted_rows, candidate]
+                registry_from_mapping(combined)
+
             stored, created = self._dynamic_store().create(
                 profile=profile, workspace_id=workspace.workspace_id, name=route_name,
-                create_key=create_key, policy=route_policy, status=status, max_routes=grant.max_routes,
+                grant_id=grant.grant_id, create_key=create_key, policy=route_policy,
+                status=status, max_routes=grant.max_routes, validate_registry=validate_registry,
             )
             project_readiness = self._wake_readiness(
                 registry, anchor,

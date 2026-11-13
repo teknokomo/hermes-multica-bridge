@@ -359,7 +359,7 @@ Wake is disabled by default. Live enablement requires preapproved `test=true` pr
 
 ## Scoped routes and grants 0.6.0
 
-The operator-edited registry stores `route_grants`; operators configure grants, not the model. A grant binds a profile, connection, workspace, source chat/thread/user, projects or squad, typed assignees, credential anchor, quota, and expiry. A disabled or expired grant blocks new operations.
+The operator-edited registry stores `route_grants`; operators configure grants, not the model. A grant binds a profile, connection, workspace, source chat/thread/user, projects or squad, typed assignees, credential anchor, a route quota counted independently for that grant, and expiry. A disabled or expired grant blocks new operations.
 
 The eighth tool, `multica_route_create`, uses only trusted message source context. If multiple grants match, it returns `grant_required` with IDs of only the eligible grants; the route is created as `pending` unless the operator explicitly enables `auto_approve`. Approval and revocation are available only to operators through the Dashboard.
 

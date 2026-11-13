@@ -214,6 +214,38 @@ def test_readiness_ipc_returns_one_result_for_every_project(tmp_path):
     asyncio.run(run())
 
 
+def test_readiness_database_failure_returns_client_compatible_unavailable_rows(tmp_path):
+    async def run():
+        socket_path = tmp_path / "run" / "readiness.sock"
+        socket_path.parent.mkdir(mode=0o700)
+        state = _State()
+
+        def unavailable_rows(*_args, **_kwargs):
+            raise RuntimeError("database unavailable")
+
+        state.rows = unavailable_rows
+        server = ReadinessServer(_config(socket_path), state)
+        with patch("notify.readiness_ipc.load_webhook_policy", return_value={}):
+            await server.start()
+            try:
+                result = await asyncio.to_thread(
+                    NotifyReadinessClient(str(socket_path)).check,
+                    "default",
+                    [{"workspace_id": WORKSPACE_ID, "project_id": PROJECT_ID}],
+                )
+                assert result == [{
+                    "workspace_id": WORKSPACE_ID,
+                    "project_id": PROJECT_ID,
+                    "wake_ready": False,
+                    "reason": "source_unavailable",
+                    "wake_route_id": None,
+                }]
+            finally:
+                await server.close()
+
+    asyncio.run(run())
+
+
 def test_readiness_client_rejects_malformed_project_input_before_connect(tmp_path):
     client = NotifyReadinessClient(str(tmp_path / "missing.sock"))
     with pytest.raises(BridgeError) as raised:
@@ -273,5 +305,14 @@ def test_notify_config_requires_a_valid_readiness_peer_allowlist(tmp_path):
     assert parsed.readiness_ipc["peers"] == ({"uid": 1000, "profiles": ("default",)},)
 
     raw["readiness_ipc"]["peers"][0]["profiles"] = ["../other"]
+    with pytest.raises(NotifyError):
+        parse_config(raw)
+
+    raw["readiness_ipc"]["peers"][0]["profiles"] = ["worker-a"]
+    with pytest.raises(NotifyError):
+        parse_config(raw)
+
+    raw["readiness_ipc"]["peers"][0]["profiles"] = ["default"]
+    raw["readiness_ipc"]["socket_path"] = str(tmp_path / "custom.sock")
     with pytest.raises(NotifyError):
         parse_config(raw)

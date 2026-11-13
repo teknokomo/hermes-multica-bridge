@@ -690,7 +690,7 @@ def _parse_route(row: Any) -> RegistryRoute:
                 raise _fail("route.default_project_id must be in route.project_ids.")
         elif project_ids:
             raise _fail("all_workspace routes cannot carry a finite project_ids allowlist.")
-        if scope_kind == "project" and (
+        if row.get("enabled", False) and scope_kind == "project" and (
             project_selection != "allowlist" or len(project_ids) != 1 or not default_project_id
         ):
             raise _fail("Project routes require exactly one allowlisted project.")
@@ -1037,3 +1037,32 @@ def registry_from_mapping(value: Any) -> ConnectionRegistry:
             ) not in {(item.id, item.type) for item in grant.allowed_assignees}:
                 raise _fail("A dynamic route default assignee exceeds its operator grant.")
     return ConnectionRegistry(connections, workspaces, routes, grants, route_grants)
+
+
+def registry_with_dynamic_routes(
+    value: Any, dynamic_rows: list[dict[str, Any]],
+) -> tuple[ConnectionRegistry, tuple[dict[str, Any], ...]]:
+    """Merge only dynamic rows that remain valid under the current static grants.
+
+    A removed or narrowed grant must never retain authority through stored route
+    state. Invalid rows are omitted individually so they cannot break unrelated
+    static routes; the rows remain in the profile-owned store for audit/review.
+    """
+    static_registry = registry_from_mapping(value)
+    if not isinstance(value, Mapping):  # guarded by registry_from_mapping above
+        return static_registry, ()
+    static_routes = list(value.get("routes", ()))
+    accepted: list[dict[str, Any]] = []
+    for row in dynamic_rows:
+        if not isinstance(row, Mapping):
+            continue
+        candidate = dict(value)
+        candidate["routes"] = [*static_routes, *accepted, dict(row)]
+        try:
+            registry_from_mapping(candidate)
+        except BridgeError:
+            continue
+        accepted.append(dict(row))
+    merged = dict(value)
+    merged["routes"] = [*static_routes, *accepted]
+    return registry_from_mapping(merged), tuple(accepted)

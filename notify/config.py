@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from bridge.notify_contract import READINESS_PROFILES, READINESS_SOCKET_PATH
+
 PROFILE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 
 
@@ -161,7 +163,7 @@ WAKE_DEFAULTS = {
 }
 READINESS_IPC_DEFAULTS = {
     "enabled": False,
-    "socket_path": "/run/hermes-multica-notify-readiness/readiness.sock",
+    "socket_path": READINESS_SOCKET_PATH,
     "peers": [],
 }
 
@@ -286,10 +288,7 @@ def parse_config(raw: Any) -> Config:
     require(type(readiness_ipc["enabled"]) is bool, "notify_config_invalid")
     socket_path = readiness_ipc["socket_path"]
     require(
-        isinstance(socket_path, str)
-        and Path(socket_path).is_absolute()
-        and len(socket_path) <= 100
-        and str(Path(socket_path).parent) == "/run/hermes-multica-notify-readiness",
+        isinstance(socket_path, str) and socket_path == READINESS_SOCKET_PATH,
         "notify_config_invalid",
     )
     peers = readiness_ipc["peers"]
@@ -305,7 +304,7 @@ def parse_config(raw: Any) -> Config:
             and peer["uid"] not in seen_uids
             and isinstance(peer["profiles"], list)
             and 1 <= len(peer["profiles"]) <= 8
-            and all(isinstance(p, str) and PROFILE_RE.fullmatch(p) for p in peer["profiles"])
+            and all(isinstance(p, str) and p in READINESS_PROFILES for p in peer["profiles"])
             and len(set(peer["profiles"])) == len(peer["profiles"]),
             "notify_config_invalid",
         )

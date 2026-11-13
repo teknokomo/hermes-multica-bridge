@@ -359,7 +359,7 @@ Wake выключен по умолчанию. Живое включение т�
 
 ## Scoped routes и grants 0.6.0
 
-Редакторский реестр хранит `route_grants`; grant настраивает оператор, а не модель. Grant связывает профиль, connection, workspace, source chat/thread/user, проекты или squad, typed assignees, credential anchor, лимит и срок действия. Отключённый или просроченный grant запрещает новые операции.
+Редакторский реестр хранит `route_grants`; grant настраивает оператор, а не модель. Grant связывает профиль, connection, workspace, source chat/thread/user, проекты или squad, typed assignees, credential anchor, лимит маршрутов, который считается отдельно для этого grant, и срок действия. Отключённый или просроченный grant запрещает новые операции.
 
 Восьмой инструмент `multica_route_create` использует только trusted message source. При нескольких совпавших grants он возвращает `grant_required` с ID только подходящих grants; маршрут создаётся `pending`, если оператор явно не включил `auto_approve`. Одобрение и отзыв доступны только через Dashboard оператору.
 

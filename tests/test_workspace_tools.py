@@ -172,6 +172,41 @@ class WorkspaceToolsTests(unittest.TestCase):
         package.session_context = module
         return {"gateway": package, "gateway.session_context": module}
 
+    def test_stale_dynamic_routes_do_not_break_static_route_lookup(self) -> None:
+        grant_payload = _route_grants(copy.deepcopy(self.payload))
+        grant = grant_payload["route_grants"][0]
+
+        def dynamic_row(grant_id: str) -> dict:
+            row = copy.deepcopy(self.payload["routes"][0])
+            row.update({
+                "route_id": new_id(), "name": "Stored dynamic", "enabled": False,
+                "watcher_enabled": False, "wake_mode": "completion", "dynamic_status": "pending",
+                "grant_id": grant_id, "credential_route_id": row["route_id"],
+                "created_by_profile": "om73",
+            })
+            return row
+
+        stale = dynamic_row(new_id())
+        self.runtime._dynamic_store = lambda: SimpleNamespace(list=lambda _profile: [stale])
+        self.ctx.config["registry"] = self.payload
+        registry = self.runtime._registry()
+        self.assertEqual([route.route_id for route in registry.routes], [self.route_id])
+
+        self.runtime._dynamic_store = lambda: SimpleNamespace(
+            list=Mock(side_effect=BridgeError("dynamic_route_state_unavailable", "state unavailable"))
+        )
+        self.ctx.config["registry"] = self.payload
+        registry = self.runtime._registry()
+        self.assertEqual([route.route_id for route in registry.routes], [self.route_id])
+
+        narrowed = copy.deepcopy(grant_payload)
+        narrowed["route_grants"][0]["allowed_chat_ids"] = []
+        stale = dynamic_row(grant["grant_id"])
+        self.runtime._dynamic_store = lambda: SimpleNamespace(list=lambda _profile: [stale])
+        self.ctx.config["registry"] = narrowed
+        registry = self.runtime._registry()
+        self.assertEqual([route.route_id for route in registry.routes], [self.route_id])
+
     def test_create_is_cached_by_profile_route_and_source(self) -> None:
         ipc = SimpleNamespace(register_issue=lambda mapping: {"ok": True})
         args = {"route_id": self.route_id, "title": "Task"}

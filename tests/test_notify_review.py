@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import io
-import os
 import sys
 import time
 from pathlib import Path
@@ -118,7 +117,7 @@ def test_invalid_readiness_policy_keeps_reload_projection_and_ipc_unchanged(ctx)
         raw["readiness_ipc"] = {
             "enabled": True,
             "socket_path": socket_path,
-            "peers": [{"uid": os.getuid(), "profiles": ["default"]}],
+            "peers": [{"uid": 1000, "profiles": ["default"]}],
         }
         candidate = parse_config(raw)
         projection_calls = []

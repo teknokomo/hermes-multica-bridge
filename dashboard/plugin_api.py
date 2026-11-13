@@ -23,6 +23,7 @@ from bridge.registry import (
     RegistryRoute,
     new_id,
     registry_from_mapping,
+    registry_with_dynamic_routes,
     route_policy_fingerprint,
     standard_route_secrets,
 )
@@ -233,8 +234,18 @@ def _route_status(registry: ConnectionRegistry, route: RegistryRoute) -> dict[st
                     wake_ready = False
             except BridgeError:
                 wake_readiness = [{"project_id": project_id, "wake_ready": False,
-                                   "reason": "source_unavailable"} for project_id in project_ids]
+                                   "reason": "source_unavailable", "wake_route_id": None}
+                                  for project_id in project_ids]
                 wake_ready = False
+                readiness.append("wake_readiness_unavailable")
+            if wake_readiness is None:
+                readiness.append("wake_readiness_unavailable")
+            else:
+                for project in wake_readiness:
+                    if not project["wake_ready"]:
+                        readiness.append(
+                            f"wake_not_ready:{project['project_id']}:{project['reason']}"
+                        )
         return {
             "route_id": route.route_id,
             "route_type": route.route_type,
@@ -378,8 +389,6 @@ def _guard_registry_update(
 def status() -> dict[str, Any]:
     try:
         raw = _effective_registry(_fields())
-        merged = dict(raw)
-        merged["routes"] = list(raw.get("routes", []))
         dynamic_store_path = _storage_path().parent / "dynamic-routes.sqlite3"
         try:
             store_info = dynamic_store_path.lstat()
@@ -392,12 +401,7 @@ def status() -> dict[str, Any]:
                 raise BridgeError("dynamic_route_state_untrusted", "Dynamic route storage has an unsafe file type.")
             route_store = DynamicRouteStore(dynamic_store_path)
             dynamic_rows = route_store.list_all()
-        grant_profiles = {grant.get("profile") for grant in raw.get("route_grants", [])
-                          if isinstance(grant, dict) and isinstance(grant.get("profile"), str)}
-        dynamic_rows = [row for row in dynamic_rows
-                        if row.get("created_by_profile") in grant_profiles]
-        merged["routes"].extend(dynamic_rows)
-        registry = registry_from_mapping(merged)
+        registry, dynamic_rows = registry_with_dynamic_routes(raw, dynamic_rows)
     except BridgeError as exc:
         return {"ok": False, "configured": False, "error_code": exc.code, "message": exc.message}
     routes = [_route_status(registry, route) for route in registry.routes]
@@ -421,6 +425,32 @@ def allocate_id() -> dict[str, str]:
     return {"id": new_id()}
 
 
+def _dynamic_route_valid_for_registry(raw: dict[str, Any], route: dict[str, Any]) -> bool:
+    _registry, accepted = registry_with_dynamic_routes(raw, [route])
+    return any(item.get("route_id") == route.get("route_id") for item in accepted)
+
+
+def _guard_dynamic_route_grant_edits(old_raw: dict[str, Any], new_raw: dict[str, Any]) -> None:
+    if not old_raw.get("route_grants") and not new_raw.get("route_grants"):
+        return
+    dynamic_store_path = _storage_path().parent / "dynamic-routes.sqlite3"
+    try:
+        info = dynamic_store_path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise BridgeError("dynamic_route_state_unavailable", "Dynamic routes could not be inspected.") from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise BridgeError("dynamic_route_state_untrusted", "Dynamic route storage has an unsafe file type.")
+    for route in DynamicRouteStore(dynamic_store_path).list_all():
+        if (_dynamic_route_valid_for_registry(old_raw, route)
+                and not _dynamic_route_valid_for_registry(new_raw, route)):
+            raise BridgeError(
+                "dynamic_route_grant_in_use",
+                "Revoke or update the affected dynamic route before narrowing or removing its grant.",
+            )
+
+
 @router.put("/registry")
 def update_registry(payload: Annotated[dict[str, Any], Body(...)]) -> dict[str, Any]:
     raw = payload.get("registry") if isinstance(payload, dict) else None
@@ -435,6 +465,7 @@ def update_registry(payload: Annotated[dict[str, Any], Body(...)]) -> dict[str, 
         with _REGISTRY_UPDATE_LOCK:
             current_raw = _effective_registry(_fields())
             old_registry = registry_from_mapping(current_raw)
+            _guard_dynamic_route_grant_edits(current_raw, raw)
             used_route_ids = _used_route_ids()
             locked_route_ids = _guard_registry_update(
                 old_registry,
@@ -501,13 +532,13 @@ def _review_dynamic_route(route_id: str, *, approve: bool) -> dict[str, Any]:
                 raise BridgeError("route_grant_expired", "The operator grant is expired or disabled.")
             if dynamic["dynamic_status"] == "revoked":
                 raise BridgeError("route_immutable", "A revoked dynamic route cannot be approved.")
+            anchor = static_registry.route(grant.credential_route_id)
+            if not anchor.enabled or anchor.tombstoned:
+                raise BridgeError("credential_unavailable", "The dynamic route credential anchor is disabled.")
             if dynamic["dynamic_status"] == "active":
                 return {"ok": True, "route_id": route_id, "status": "active", "changed": False}
-            all_routes = dict(raw)
-            all_routes["routes"] = list(raw.get("routes", [])) + store.list(profile)
-            complete = registry_from_mapping(all_routes)
+            complete, _accepted_routes = registry_with_dynamic_routes(raw, store.list(profile))
             complete.route(route_id)
-            anchor = complete.route(grant.credential_route_id)
             if not _route_secret_presence(anchor)["multica_pat"]:
                 raise BridgeError("credential_unavailable", "The operator credential anchor has no Multica PAT.")
             status = "active"

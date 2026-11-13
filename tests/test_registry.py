@@ -11,6 +11,7 @@ from bridge.registry import (
     TrustedRouteContext,
     new_id,
     registry_from_mapping,
+    registry_with_dynamic_routes,
     route_policy_fingerprint,
     route_secret_env_name,
     standard_route_secrets,
@@ -290,6 +291,23 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(parsed.default_project_id, "project-1")
         self.assertEqual(parsed.project_id, "project-1")
 
+    def test_disabled_legacy_project_draft_without_destination_remains_parseable(self) -> None:
+        payload = workspace_registry_payload()
+        route = payload["routes"][0]
+        route["enabled"] = False
+        route.pop("project_id")
+        route.pop("default_project_id", None)
+        route["project_ids"] = []
+
+        parsed = registry_from_mapping(payload).routes[0]
+        self.assertFalse(parsed.enabled)
+        self.assertEqual(parsed.project_ids, ())
+        self.assertEqual(parsed.default_project_id, "")
+
+        route["enabled"] = True
+        with self.assertRaises(BridgeError):
+            registry_from_mapping(payload)
+
     def test_completion_route_rejects_legacy_watcher_and_static_all_workspace(self) -> None:
         payload = workspace_registry_payload()
         payload["routes"][0].update(wake_mode="completion", watcher_enabled=True)
@@ -344,6 +362,24 @@ class RegistryTests(unittest.TestCase):
         registry = registry_from_mapping(payload)
         self.assertEqual(registry.routes[-1].dynamic_status, "pending")
         self.assertEqual(registry.routes[-1].credential_route_id, anchor["route_id"])
+
+        static_payload = copy.deepcopy(payload)
+        static_payload["routes"].pop()
+        merged, accepted = registry_with_dynamic_routes(static_payload, [dynamic])
+        self.assertEqual([route.route_id for route in merged.routes], [anchor["route_id"], dynamic["route_id"]])
+        self.assertEqual(len(accepted), 1)
+
+        missing_grant = copy.deepcopy(static_payload)
+        missing_grant["route_grants"] = []
+        merged, accepted = registry_with_dynamic_routes(missing_grant, [dynamic])
+        self.assertEqual([route.route_id for route in merged.routes], [anchor["route_id"]])
+        self.assertEqual(accepted, ())
+
+        narrowed_grant = copy.deepcopy(static_payload)
+        narrowed_grant["route_grants"][0]["allowed_chat_ids"] = []
+        merged, accepted = registry_with_dynamic_routes(narrowed_grant, [dynamic])
+        self.assertEqual([route.route_id for route in merged.routes], [anchor["route_id"]])
+        self.assertEqual(accepted, ())
 
         payload["routes"][-1]["credential_route_id"] = new_id()
         with self.assertRaises(BridgeError):

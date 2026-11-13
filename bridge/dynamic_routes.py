@@ -8,12 +8,13 @@ import os
 import sqlite3
 import stat
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from .errors import BridgeError
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _TABLES = {"dynamic_routes", "route_audit"}
 
 
@@ -69,6 +70,7 @@ class DynamicRouteStore:
                         route_id TEXT PRIMARY KEY,
                         profile TEXT NOT NULL,
                         workspace_id TEXT NOT NULL,
+                        grant_id TEXT NOT NULL,
                         name TEXT NOT NULL,
                         name_normalized TEXT NOT NULL,
                         create_key TEXT NOT NULL UNIQUE,
@@ -88,16 +90,45 @@ class DynamicRouteStore:
                         action TEXT NOT NULL,
                         created_at REAL NOT NULL
                     );
-                    PRAGMA user_version=1;
+                    PRAGMA user_version=2;
                     COMMIT;
                 """)
                 objects = {("table", name) for name in _TABLES}
                 version = _SCHEMA_VERSION
+            if version == 1:
+                try:
+                    db.execute("BEGIN IMMEDIATE")
+                    db.execute("ALTER TABLE dynamic_routes ADD COLUMN grant_id TEXT NOT NULL DEFAULT ''")
+                    rows = db.execute("SELECT route_id,policy_json FROM dynamic_routes").fetchall()
+                    for row in rows:
+                        policy = json.loads(row["policy_json"])
+                        grant_id = policy.get("grant_id") if isinstance(policy, dict) else None
+                        if not isinstance(grant_id, str) or not grant_id:
+                            raise BridgeError(
+                                "dynamic_route_state_unsupported",
+                                "Dynamic route database has no grant identity to migrate safely.",
+                            )
+                        db.execute(
+                            "UPDATE dynamic_routes SET grant_id=? WHERE route_id=?",
+                            (grant_id, row["route_id"]),
+                        )
+                    db.execute("PRAGMA user_version=2")
+                    db.commit()
+                    version = 2
+                except BridgeError:
+                    db.rollback()
+                    raise
+                except (sqlite3.Error, ValueError, TypeError) as exc:
+                    db.rollback()
+                    raise BridgeError(
+                        "dynamic_route_state_unsupported",
+                        "Dynamic route database could not be migrated safely.",
+                    ) from exc
             expected_objects = {("table", name) for name in _TABLES}
             if version != _SCHEMA_VERSION or objects != expected_objects:
                 raise BridgeError("dynamic_route_state_unsupported", "Dynamic route database schema is unsupported.")
             route_columns = {r[1] for r in db.execute("PRAGMA table_info(dynamic_routes)")}
-            expected = {"route_id", "profile", "workspace_id", "name", "name_normalized", "create_key",
+            expected = {"route_id", "profile", "workspace_id", "grant_id", "name", "name_normalized", "create_key",
                         "policy_hash", "policy_json", "status", "created_by_profile", "created_at",
                         "updated_at", "revision"}
             audit_columns = {r[1] for r in db.execute("PRAGMA table_info(route_audit)")}
@@ -111,11 +142,12 @@ class DynamicRouteStore:
 
     def _preflight_schema(self) -> None:
         """Reject unknown stores through a read-only connection before enabling WAL."""
-        expected_route_columns = {
+        expected_route_columns_v1 = {
             "route_id", "profile", "workspace_id", "name", "name_normalized", "create_key",
             "policy_hash", "policy_json", "status", "created_by_profile", "created_at",
             "updated_at", "revision",
         }
+        expected_route_columns_v2 = expected_route_columns_v1 | {"grant_id"}
         expected_audit_columns = {"id", "route_id", "profile", "action", "created_at"}
         db = None
         try:
@@ -127,10 +159,11 @@ class DynamicRouteStore:
             if version == 0 and not objects:
                 return
             expected_objects = {("table", name) for name in _TABLES}
-            if version != _SCHEMA_VERSION or objects != expected_objects:
+            if version not in {1, _SCHEMA_VERSION} or objects != expected_objects:
                 raise BridgeError("dynamic_route_state_unsupported", "Dynamic route database schema is unsupported.")
             route_columns = {row[1] for row in db.execute("PRAGMA table_info(dynamic_routes)")}
             audit_columns = {row[1] for row in db.execute("PRAGMA table_info(route_audit)")}
+            expected_route_columns = expected_route_columns_v1 if version == 1 else expected_route_columns_v2
             if route_columns != expected_route_columns or audit_columns != expected_audit_columns:
                 raise BridgeError("dynamic_route_state_unsupported", "Dynamic route database schema is unsupported.")
         except BridgeError:
@@ -151,7 +184,10 @@ class DynamicRouteStore:
     def list(self, profile: str) -> list[dict[str, Any]]:
         db = self._connect()
         try:
-            rows = db.execute("SELECT * FROM dynamic_routes WHERE profile=? ORDER BY created_at,route_id", (profile,)).fetchall()
+            rows = db.execute(
+                "SELECT * FROM dynamic_routes WHERE profile=? AND status!='revoked' ORDER BY created_at,route_id",
+                (profile,),
+            ).fetchall()
             return [self._record(row) for row in rows]
         except (sqlite3.Error, ValueError, TypeError) as exc:
             raise BridgeError("dynamic_route_state_unavailable", "Dynamic routes could not be read.") from exc
@@ -161,7 +197,9 @@ class DynamicRouteStore:
     def list_all(self) -> list[dict[str, Any]]:
         db = self._connect()
         try:
-            rows = db.execute("SELECT * FROM dynamic_routes ORDER BY profile,created_at,route_id").fetchall()
+            rows = db.execute(
+                "SELECT * FROM dynamic_routes WHERE status!='revoked' ORDER BY profile,created_at,route_id"
+            ).fetchall()
             return [self._record(row) for row in rows]
         except (sqlite3.Error, ValueError, TypeError) as exc:
             raise BridgeError("dynamic_route_state_unavailable", "Dynamic routes could not be read.") from exc
@@ -182,10 +220,14 @@ class DynamicRouteStore:
         finally:
             db.close()
 
-    def create(self, *, profile: str, workspace_id: str, name: str, create_key: str,
-               policy: dict[str, Any], status: str, max_routes: int) -> tuple[dict[str, Any], bool]:
+    def create(self, *, profile: str, workspace_id: str, grant_id: str, name: str, create_key: str,
+               policy: dict[str, Any], status: str, max_routes: int,
+               validate_registry: Callable[[list[dict[str, Any]], dict[str, Any]], None] | None = None
+               ) -> tuple[dict[str, Any], bool]:
         if status not in {"pending", "active"}:
             raise ValueError("invalid initial route state")
+        if not isinstance(grant_id, str) or not grant_id or policy.get("grant_id") != grant_id:
+            raise BridgeError("route_grant_denied", "The route grant identity is invalid.")
         policy_json = _json(policy)
         identity = dict(policy)
         identity.pop("route_id", None)
@@ -211,17 +253,26 @@ class DynamicRouteStore:
                 db.rollback()
                 raise BridgeError("route_conflict", "A route with this name already exists in this workspace.")
             count = db.execute(
-                "SELECT COUNT(*) FROM dynamic_routes WHERE profile=? AND workspace_id=? AND status!='revoked'",
-                (profile, workspace_id),
+                "SELECT COUNT(*) FROM dynamic_routes WHERE profile=? AND workspace_id=? AND grant_id=? AND status!='revoked'",
+                (profile, workspace_id, grant_id),
             ).fetchone()[0]
             if count >= max_routes:
                 db.rollback()
                 raise BridgeError("route_limit_exceeded", "The grant route limit has been reached.")
+            current_rows = db.execute(
+                "SELECT * FROM dynamic_routes WHERE profile=? AND status!='revoked' ORDER BY created_at,route_id",
+                (profile,),
+            ).fetchall()
+            candidate = dict(policy)
+            candidate["dynamic_status"] = status
+            candidate["enabled"] = status == "active"
+            if validate_registry is not None:
+                validate_registry([self._record(row) for row in current_rows], candidate)
             db.execute(
-                """INSERT INTO dynamic_routes(route_id,profile,workspace_id,name,name_normalized,create_key,
+                """INSERT INTO dynamic_routes(route_id,profile,workspace_id,grant_id,name,name_normalized,create_key,
                 policy_hash,policy_json,status,created_by_profile,created_at,updated_at,revision)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1)""",
-                (policy["route_id"], profile, workspace_id, name, name.strip().casefold(), create_key,
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1)""",
+                (policy["route_id"], profile, workspace_id, grant_id, name, name.strip().casefold(), create_key,
                  policy_hash, policy_json, status, profile, now, now),
             )
             db.execute("INSERT INTO route_audit(route_id,profile,action,created_at) VALUES(?,?,?,?)",
@@ -232,6 +283,7 @@ class DynamicRouteStore:
             result["enabled"] = status == "active"
             return result, True
         except BridgeError:
+            db.rollback()
             raise
         except sqlite3.IntegrityError as exc:
             db.rollback()

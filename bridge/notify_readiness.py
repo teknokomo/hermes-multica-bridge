@@ -11,11 +11,12 @@ from pathlib import Path
 from typing import Any
 
 from .errors import BridgeError
+from .notify_contract import READINESS_PROFILES, READINESS_SOCKET_PATH
 from .validation import strict_json_loads
 
 MAX_FRAME = 16 * 1024
 MAX_PROJECTS = 32
-DEFAULT_SOCKET = "/run/hermes-multica-notify-readiness/readiness.sock"
+DEFAULT_SOCKET = READINESS_SOCKET_PATH
 
 
 class NotifyReadinessClient:
@@ -24,7 +25,7 @@ class NotifyReadinessClient:
         self.timeout = timeout
 
     def check(self, profile: str, projects: list[dict[str, str]]) -> list[dict[str, Any]]:
-        if (profile not in {"default", "om73"} or not isinstance(projects, list)
+        if (profile not in READINESS_PROFILES or not isinstance(projects, list)
                 or not 1 <= len(projects) <= MAX_PROJECTS):
             raise BridgeError("invalid_arguments", "The wake readiness request is invalid.")
         if any(

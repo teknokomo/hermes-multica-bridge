@@ -11,6 +11,8 @@ import {
   newConnection,
   newRoute,
   newWorkspace,
+  parseRouteGrantsDraft,
+  projectSelectionOptions,
   routeDestinationFieldLocked,
   routeStatus,
   updateWorkspaceConnection,
@@ -107,6 +109,22 @@ test('new Workspace routes expose typed-assignee settings and nested values surv
   const cloned = cloneRegistry({ routes: [route] })
   assert.deepEqual(cloned.routes[0].allowed_assignees, route.allowed_assignees)
   assert.deepEqual(cloned.routes[0].default_assignee, route.default_assignee)
+})
+
+test('route grants drafts must parse to arrays and static routes cannot select all_workspace', () => {
+  assert.deepEqual(parseRouteGrantsDraft('[{"grant_id":"grant-a"}]'), {
+    valid: true,
+    value: [{ grant_id: 'grant-a' }]
+  })
+  assert.equal(parseRouteGrantsDraft('{"grant_id":"grant-a"}').valid, false)
+  assert.equal(parseRouteGrantsDraft('{').valid, false)
+
+  const staticRoute = { route_type: 'workspace' }
+  assert.deepEqual(projectSelectionOptions(staticRoute).map(option => option.value), ['allowlist'])
+  const dynamicRoute = { route_type: 'workspace', dynamic_status: 'active' }
+  assert.deepEqual(projectSelectionOptions(dynamicRoute).map(option => option.value), [
+    'allowlist', 'all_workspace'
+  ])
 })
 
 test('routeStatus selects readiness for the requested route only', () => {
