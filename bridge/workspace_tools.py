@@ -82,18 +82,17 @@ def _load_hermes_context(*, include_attachments: bool = False) -> _HermesMessage
         from gateway import session_context
 
         get_bound = session_context.get_bound_session_env
-        get_env = session_context.get_session_env
     except (ImportError, AttributeError) as exc:  # T38-DEBT-3: Hermes has no plugin tool_context here.
         raise BridgeError("source_unavailable", "Hermes did not expose a bound message source.") from exc
 
     try:
         bound = {key: get_bound(name, "") for key, name in _SOURCE_ENV.items()}
-        values = {key: get_env(name, "") for key, name in _SOURCE_ENV.items()}
     except Exception as exc:
         raise BridgeError("source_unavailable", "Hermes could not provide the current message source.") from exc
-    if (any(not isinstance(value, str) for value in (*bound.values(), *values.values()))
-            or bound != values):
-        raise BridgeError("source_unavailable", "Hermes did not provide a consistent bound message source.")
+    # The bound API resolves USER_ID to the live actor. The legacy getter uses
+    # session-route identity, which can be empty or different in shared chats.
+    if any(not isinstance(value, str) for value in bound.values()):
+        raise BridgeError("source_unavailable", "Hermes did not provide a valid bound message source.")
 
     source = dict(bound)
     source["thread_id"] = source["thread_id"] or None

@@ -167,6 +167,43 @@ class WorkspaceToolsTests(unittest.TestCase):
         self.assertEqual(len(self.api.create_calls), 1)
         self.assertEqual(self.state.issue_mapping("issue-1")["message_id"], "message-1")
 
+    def test_bound_actor_authorizes_shared_chat_with_empty_route_user(self) -> None:
+        modules = self._gateway_modules()
+        original = modules["gateway.session_context"].get_session_env
+        modules["gateway.session_context"].get_session_env = lambda name, default="": (
+            "" if name == "HERMES_SESSION_USER_ID" else original(name, default)
+        )
+        with patch.dict(sys.modules, modules), patch(
+            "bridge.watcher_ipc.WatcherIpcClient",
+            return_value=SimpleNamespace(register_issue=lambda mapping: {"ok": True}),
+        ):
+            result = json.loads(self.runtime.send({"route_id": self.route_id, "title": "Task"}))
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(self.api.create_calls), 1)
+        self.assertEqual(self.state.issue_mapping("issue-1")["user_id"], self.source.user_id)
+
+    def test_cleared_bound_actor_cannot_borrow_authorized_route_user(self) -> None:
+        modules = self._gateway_modules()
+        original = modules["gateway.session_context"].get_bound_session_env
+        modules["gateway.session_context"].get_bound_session_env = lambda name, default="": (
+            "" if name == "HERMES_SESSION_USER_ID" else original(name, default)
+        )
+        with patch.dict(sys.modules, modules):
+            result = json.loads(self.runtime.send({"route_id": self.route_id, "title": "Task"}))
+        self.assertEqual(result["error_code"], "source_unavailable")
+        self.assertEqual(self.api.create_calls, [])
+
+    def test_unauthorized_bound_actor_cannot_borrow_authorized_route_user(self) -> None:
+        modules = self._gateway_modules()
+        original = modules["gateway.session_context"].get_bound_session_env
+        modules["gateway.session_context"].get_bound_session_env = lambda name, default="": (
+            "other-user" if name == "HERMES_SESSION_USER_ID" else original(name, default)
+        )
+        with patch.dict(sys.modules, modules):
+            result = json.loads(self.runtime.send({"route_id": self.route_id, "title": "Task"}))
+        self.assertEqual(result["error_code"], "route_denied")
+        self.assertEqual(self.api.create_calls, [])
+
     def test_failed_watcher_registration_retries_from_persisted_source_on_get(self) -> None:
         ipc = SimpleNamespace(register_issue=Mock(side_effect=[
             BridgeError("watcher_ipc_unavailable", "unavailable"), {"ok": True},
