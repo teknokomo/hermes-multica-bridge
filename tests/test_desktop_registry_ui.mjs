@@ -124,6 +124,9 @@ test('locked route destination fields include the Autopilot event', () => {
   const route = { destination_locked: true }
   assert.equal(routeDestinationFieldLocked(route, 'event'), true)
   assert.equal(routeDestinationFieldLocked(route, 'trigger_id'), true)
+  assert.equal(routeDestinationFieldLocked(route, 'allowed_thread_ids'), true)
+  assert.equal(routeDestinationFieldLocked(route, 'wake_mode'), true)
+  assert.equal(routeDestinationFieldLocked(route, 'watcher_enabled'), true)
   assert.equal(routeDestinationFieldLocked(route, 'allowed_assignees'), false)
   assert.equal(routeDestinationFieldLocked({ destination_locked: false }, 'event'), false)
 })
