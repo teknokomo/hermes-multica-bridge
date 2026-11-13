@@ -10,6 +10,7 @@ recursive-include deploy *.py *.md *.service *.socket
 include dashboard/manifest.json dashboard/plugin_api.py
 include dashboard/dist/index.js dashboard/dist/style.css
 recursive-include desktop *.js *.mjs
+recursive-include skills *.md
 include README.md README-RU.md SECURITY.md CHANGELOG.md LICENSE.md LICENSE-RU.md
 prune tests
 prune memory-bank

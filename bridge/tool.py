@@ -12,7 +12,6 @@ from .protocol import BridgeIpcClient
 from .registry import (
     ConnectionRegistry,
     RegistryRoute,
-    registry_from_mapping,
     route_policy_fingerprint,
     standard_route_secrets,
 )
@@ -20,7 +19,7 @@ from .service import BridgeService, ServiceCredentials
 from .state import DeliverySnapshot, DeliveryStore
 from .validation import request_fingerprint
 from .watcher_ipc import WatcherIpcClient
-from .workspace_tools import register_workspace_tools, trusted_source
+from .workspace_tools import WorkspaceRuntime, register_workspace_tools, trusted_source
 
 PLUGIN_ID = "hermes-multica-bridge"
 TOOLSET = "hermes_multica_bridge"
@@ -69,8 +68,8 @@ RESULT_TOOL_SCHEMA = {
 LIST_ROUTES_TOOL_SCHEMA = {
     "name": "multica_list_routes",
     "description": (
-        "List only Multica Routes authorized for the current pinned Hermes Kanban worker. "
-        "Takes no arguments and never returns credentials or destination secrets."
+        "List only Multica Routes authorized for the current trusted source. "
+        "Takes no arguments and never returns credential values or destination secrets; it may report presence flags."
     ),
     "parameters": {
         "type": "object",
@@ -107,17 +106,7 @@ class PluginRuntime:
         self.ctx = ctx
 
     def _registry(self) -> ConnectionRegistry:
-        raw = self.ctx.get_config("registry", None)
-        if isinstance(raw, dict):
-            return registry_from_mapping(raw)
-        return registry_from_mapping(
-            {
-                "connections": [],
-                "workspaces": [],
-                "routes": [],
-                "operator_grants": [],
-            }
-        )
+        return WorkspaceRuntime(self.ctx)._registry()
 
     @staticmethod
     def _route_arg(args: dict[str, Any]) -> str | None:
@@ -413,22 +402,62 @@ class PluginRuntime:
             if not isinstance(args, dict) or args:
                 raise BridgeError("invalid_arguments", "This tool takes no model-supplied arguments.")
             registry = self._registry()
+            workspace_runtime = WorkspaceRuntime(self.ctx)
             rows = []
             try:
                 source = trusted_source(tool_context)
             except BridgeError:
                 source = None
             if source is not None:
-                for route in registry.authorized_workspace_routes(source):
+                profile_name = getattr(self.ctx, "profile_name", None)
+                profile_name = profile_name if isinstance(profile_name, str) and profile_name else "default"
+                matching_grants = [grant for grant in registry.route_grants
+                    if grant.active and grant.profile == profile_name
+                    and source["platform"] in grant.allowed_source_platforms
+                    and source["user_id"] in grant.allowed_user_ids
+                    and source["chat_id"] in grant.allowed_chat_ids
+                    and (not grant.allowed_thread_ids or source.get("thread_id") in grant.allowed_thread_ids)]
+                for route in registry.authorized_workspace_routes(source, include_pending=True):
                     connection = registry.connection(route.connection_id)
                     workspace = registry.workspace(route.workspace_key)
-                    rows.append({
+                    route_status = route.dynamic_status or ("active" if route.enabled else "disabled")
+                    route_manageable = False
+                    api_credential_present = False
+                    if route.dynamic_status:
+                        route_grant = registry.route_grant(route.grant_id)
+                        if not route_grant.active:
+                            route_status = "grant_inactive"
+                        route_manageable = any(
+                            grant.grant_id == route.grant_id for grant in matching_grants
+                        )
+                        credential_route = registry.route(route_grant.credential_route_id)
+                    else:
+                        credential_route = route
+                    try:
+                        api_credential_present = bool(
+                            standard_route_secrets(
+                                credential_route, require_webhook=False,
+                            ).multica_pat
+                        )
+                    except BridgeError:
+                        pass
+                    row = {
                         "route_id": route.route_id,
                         "type": "workspace",
                         "name": route.name,
-                        "purpose": "Create and track issues in the configured project.",
+                        "purpose": "Create and track issues in the configured project scope.",
                         "workspace": workspace.name,
                         "project_id": route.project_id,
+                        "scope_kind": route.scope_kind,
+                        "project_selection": route.project_selection,
+                        "project_ids": list(route.project_ids),
+                        "default_project_id": route.default_project_id,
+                        "squad_id": route.squad_id or None,
+                        "allowed_thread_ids": list(route.allowed_thread_ids),
+                        "wake_mode": route.wake_mode,
+                        "status": route_status,
+                        "can_manage": route_manageable,
+                        "credential_presence": {"multica_pat": api_credential_present},
                         "platforms": list(route.source_platforms),
                         "watcher_enabled": route.watcher_enabled,
                         "assignees": [
@@ -447,11 +476,29 @@ class PluginRuntime:
                         "test": route.test,
                         "warnings": list(route.config_warnings),
                         "security_mode": connection.security_mode,
-                    })
+                    }
+                    if route.wake_mode == "completion":
+                        project_ids = workspace_runtime._project_ids_for_route(route)
+                        readiness = workspace_runtime._wake_readiness(registry, route, project_ids)
+                        if readiness is None:
+                            row["projects_readiness"] = [{"project_id": project_id,
+                                "wake_ready": False, "reason": "source_unavailable"} for project_id in project_ids]
+                            row["wake_ready"] = False
+                            row["wake_status"] = "source_unavailable"
+                        else:
+                            row["projects_readiness"] = list(readiness)
+                            row["wake_ready"] = (
+                                bool(readiness) and all(item["wake_ready"] for item in readiness)
+                                if route.project_selection == "allowlist" else False
+                            )
+                            row["wake_open_scope"] = route.project_selection == "all_workspace"
+                            if not all(item["wake_ready"] for item in readiness):
+                                row["wake_status"] = "wake_missing"
+                    rows.append(row)
             profile_name = getattr(self.ctx, "profile_name", None)
             profile_name = profile_name if isinstance(profile_name, str) and profile_name else "default"
             for row in rows:
-                if row.get("watcher_enabled"):
+                if row.get("watcher_enabled") and row.get("wake_mode") == "legacy_watcher":
                     try:
                         info = WatcherIpcClient(timeout=0.3).route_policies(profile_name, row["route_id"])
                         row["notifications"] = info["notifications"]

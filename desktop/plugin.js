@@ -18,6 +18,8 @@ import {
   newConnection,
   newRoute,
   newWorkspace,
+  parseRouteGrantsDraft,
+  projectSelectionOptions,
   routeDestinationFieldLocked,
   routeStatus,
   updateWorkspaceConnection,
@@ -510,6 +512,7 @@ function RegistryEditor({ ctx, profile }) {
   const [selectedRoute, setSelectedRoute] = useState('')
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState('')
+  const [routeGrantsDraftError, setRouteGrantsDraftError] = useState('')
   const [grantDraft, setGrantDraft] = useState(() => ({ profile, board: '', task: '' }))
   const { board: grantBoard, task: grantTask } = profileScopedGrantDraft(grantDraft, profile)
   const [listDrafts, setListDrafts] = useState({})
@@ -542,6 +545,7 @@ function RegistryEditor({ ctx, profile }) {
     setSelectedWorkspace('')
     setSelectedRoute('')
     setSaveError('')
+    setRouteGrantsDraftError('')
     setSaving(false)
     setListDrafts({})
     setGrantDraft({ profile, board: '', task: '' })
@@ -657,6 +661,12 @@ function RegistryEditor({ ctx, profile }) {
 
   async function saveRegistry() {
     if (!registry) return
+    if (routeGrantsDraftIsInvalid()) {
+      const message = 'Исправьте JSON route_grants: ожидается JSON-массив.'
+      setRouteGrantsDraftError(message)
+      setSaveError(message)
+      return
+    }
     const saveProfile = profile
     const generation = ++saveGeneration.current
     const submittedDraftGeneration = draftGeneration.current
@@ -748,14 +758,18 @@ function RegistryEditor({ ctx, profile }) {
             autopilot_id: '', trigger_id: '', event: 'hermes.task.dispatched',
             source_boards: [], allowed_profiles: [], operator_grant_required: false,
             result_tracking_enabled: false, allowed_assignees: [], default_assignee: null,
-            require_assignee: true, test: false
+            require_assignee: true, test: false, scope_kind: 'project',
+            project_selection: 'allowlist', project_ids: [], default_project_id: '',
+            squad_id: '', allowed_thread_ids: [], wake_mode: 'legacy_watcher'
           })
         } else {
           Object.assign(item, {
             project_id: '', source_platforms: [], allowed_user_ids: [], allowed_chat_ids: [],
             allow_groups: false, allowed_statuses: [], require_source_attachment: false,
             max_attachments: 0, max_attachment_bytes: 0, allowed_mime_types: [],
-            allowed_extensions: [], watcher_enabled: false, allowed_assignees: []
+            allowed_extensions: [], watcher_enabled: false, allowed_assignees: [],
+            scope_kind: 'project', project_selection: 'allowlist', project_ids: [],
+            default_project_id: '', squad_id: '', allowed_thread_ids: [], wake_mode: 'legacy_watcher'
           })
           delete item.default_assignee
           delete item.require_assignee
@@ -769,6 +783,10 @@ function RegistryEditor({ ctx, profile }) {
         return
       }
       item[key] = value
+      if (key === 'wake_mode' && value === 'completion') item.watcher_enabled = false
+      if (key === 'watcher_enabled' && value === true && item.wake_mode === 'completion') {
+        item.wake_mode = 'legacy_watcher'
+      }
       if (key === 'connection_id') {
         item.workspace_key = workspacesForConnection(next, value)[0]?.workspace_key || ''
       }
@@ -814,6 +832,32 @@ function RegistryEditor({ ctx, profile }) {
     }
   }
 
+  function routeGrantsDraft() {
+    const draftKey = 'registry:route_grants'
+    return Object.prototype.hasOwnProperty.call(listDrafts, draftKey)
+      ? listDrafts[draftKey]
+      : JSON.stringify(registry.route_grants || [], null, 2)
+  }
+
+  function routeGrantsDraftIsInvalid() {
+    const draftKey = 'registry:route_grants'
+    return Object.prototype.hasOwnProperty.call(listDrafts, draftKey)
+      && !parseRouteGrantsDraft(listDrafts[draftKey]).valid
+  }
+
+  function updateRouteGrantsJson(value) {
+    const draftKey = 'registry:route_grants'
+    setListDrafts(current => ({ ...current, [draftKey]: value }))
+    const parsed = parseRouteGrantsDraft(value)
+    if (parsed.valid) {
+      mutate(next => { next.route_grants = parsed.value })
+      setRouteGrantsDraftError('')
+      setSaveError('')
+    } else {
+      setRouteGrantsDraftError('JSON route_grants должен быть корректным JSON-массивом.')
+    }
+  }
+
   function removeRoute() {
     if (!route) return
     const used = route.destination_locked || Boolean(selectedRouteStatus?.latest_delivery)
@@ -850,7 +894,7 @@ function RegistryEditor({ ctx, profile }) {
         children: [
           jsx(Button, {
             onClick: () => void saveRegistry(),
-            disabled: saving,
+            disabled: saving || routeGrantsDraftIsInvalid(),
             children: saving ? 'Сохранение…' : 'Сохранить registry'
           }),
           jsx(Button, { onClick: () => void refresh(), disabled: saving, children: 'Перечитать readiness' })
@@ -938,7 +982,20 @@ function RegistryEditor({ ctx, profile }) {
       jsxs('section', {
         style: cardStyle,
         children: [
-          jsx('h3', { children: '3. Routes' }),
+          jsx('h3', { children: '3. Operator Route Grants' }),
+          jsx('p', { children: 'Операторские grants хранятся в профиле и не создаются инструментом модели. Не добавляйте секреты в JSON.' }),
+          jsx(FormField, {
+            label: 'route_grants (JSON)', type: 'textarea', value: routeGrantsDraft(),
+            onChange: updateRouteGrantsJson
+          }),
+          routeGrantsDraftError ? jsx('div', { role: 'alert', children: routeGrantsDraftError }) : null
+        ]
+      }),
+
+      jsxs('section', {
+        style: cardStyle,
+        children: [
+          jsx('h3', { children: '4. Routes' }),
           jsxs('div', {
             style: rowButtonsStyle,
             children: [
@@ -986,7 +1043,18 @@ function RegistryEditor({ ctx, profile }) {
               route.route_type === 'workspace' ? jsxs('div', {
                 style: cardStyle,
                 children: [
-                  jsx(FormField, { label: 'Project ID', value: route.project_id, disabled: routeDestinationFieldLocked(route, 'project_id'), onChange: value => updateRoute('project_id', value) }),
+                  jsx(SelectField, { label: 'Scope', value: route.scope_kind || 'project', disabled: routeDestinationFieldLocked(route, 'scope_kind'), onChange: value => updateRoute('scope_kind', value), options: [
+                    { value: 'project', label: 'Один проект' }, { value: 'squad', label: 'Squad с allowlist проектов' }, { value: 'workspace', label: 'Workspace' }
+                  ] }),
+                  jsx(SelectField, { label: 'Выбор проектов', value: route.project_selection || 'allowlist', disabled: routeDestinationFieldLocked(route, 'project_selection'), onChange: value => updateRoute('project_selection', value), options: projectSelectionOptions(route) }),
+                  jsx(FormField, { label: 'Project IDs (через запятую)', value: routeListDraft('project_ids'), disabled: routeDestinationFieldLocked(route, 'project_ids'), onChange: value => updateRouteList('project_ids', value) }),
+                  jsx(FormField, { label: 'Default project ID', value: route.default_project_id || route.project_id, disabled: routeDestinationFieldLocked(route, 'default_project_id'), onChange: value => updateRoute('default_project_id', value) }),
+                  jsx(FormField, { label: 'Squad ID', value: route.squad_id || '', disabled: routeDestinationFieldLocked(route, 'squad_id'), onChange: value => updateRoute('squad_id', value) }),
+                  jsx(FormField, { label: 'Разрешённые thread ID (через запятую; пусто = любой)', value: routeListDraft('allowed_thread_ids'), disabled: routeDestinationFieldLocked(route, 'allowed_thread_ids'), onChange: value => updateRouteList('allowed_thread_ids', value) }),
+                  jsx(SelectField, { label: 'Уведомления', value: route.wake_mode || 'legacy_watcher', disabled: routeDestinationFieldLocked(route, 'wake_mode'), onChange: value => updateRoute('wake_mode', value), options: [
+                    { value: 'completion', label: 'Completion wake через notify' }, { value: 'legacy_watcher', label: 'Старый watcher' }
+                  ] }),
+                  jsx(FormField, { label: 'Legacy project ID', value: route.project_id, disabled: routeDestinationFieldLocked(route, 'project_id'), onChange: value => updateRoute('project_id', value) }),
                   jsx(FormField, { label: 'Входящие платформы (max, telegram)', value: routeListDraft('source_platforms'), onChange: value => updateRouteList('source_platforms', value) }),
                   jsx(FormField, { label: 'Разрешённые user ID', value: routeListDraft('allowed_user_ids'), onChange: value => updateRouteList('allowed_user_ids', value) }),
                   jsx(FormField, { label: 'Разрешённые chat ID', value: routeListDraft('allowed_chat_ids'), onChange: value => updateRouteList('allowed_chat_ids', value) }),
@@ -1001,7 +1069,7 @@ function RegistryEditor({ ctx, profile }) {
                   jsx(FormField, { label: 'Общий лимит вложений, байт', type: 'number', value: route.max_attachment_bytes, onChange: value => updateRoute('max_attachment_bytes', value) }),
                   jsx(FormField, { label: 'Разрешённые MIME-типы', value: routeListDraft('allowed_mime_types'), onChange: value => updateRouteList('allowed_mime_types', value) }),
                   jsx(FormField, { label: 'Разрешённые расширения', value: routeListDraft('allowed_extensions'), onChange: value => updateRouteList('allowed_extensions', value) }),
-                  jsx(FormField, { label: 'Использовать watcher', type: 'checkbox', value: route.watcher_enabled, onChange: value => updateRoute('watcher_enabled', value) })
+                  jsx(FormField, { label: 'Использовать watcher', type: 'checkbox', value: route.watcher_enabled, disabled: route.wake_mode === 'completion' || routeDestinationFieldLocked(route, 'watcher_enabled'), onChange: value => updateRoute('watcher_enabled', value) })
                 ]
               }) : jsxs('div', {
                 style: cardStyle,

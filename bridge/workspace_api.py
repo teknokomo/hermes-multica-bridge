@@ -146,9 +146,9 @@ class WorkspaceApiClient:
             "Accept": "application/json",
             "Authorization": f"Bearer {self._pat}",
             "X-Workspace-ID": self.workspace_id,
-            "User-Agent": "hermes-multica-bridge/0.5.0",
+            "User-Agent": "hermes-multica-bridge/0.6.0",
             "X-Client-Platform": "daemon",
-            "X-Client-Version": "0.5.0",
+            "X-Client-Version": "0.6.0",
         }
         if body is not None:
             headers["Content-Type"] = content_type
@@ -233,6 +233,20 @@ class WorkspaceApiClient:
         if not isinstance(result, dict):
             raise BridgeError("invalid_api_response", "Multica returned an invalid issue response.")
         return result
+
+    def get_project(self, project_id: str) -> dict[str, Any]:
+        project_id = _identifier(project_id, "project_id")
+        raw = self._request("GET", f"/api/projects/{urllib.parse.quote(project_id, safe='')}")
+        if not isinstance(raw, bytes):
+            raise BridgeError("invalid_api_response", "Multica returned an invalid project response.")
+        try:
+            project = strict_json_loads(raw)
+        except (ValueError, json.JSONDecodeError, RecursionError):
+            raise BridgeError("invalid_api_response", "Multica returned an invalid project response.") from None
+        if (not isinstance(project, dict) or project.get("id") != project_id
+                or not isinstance(project.get("workspace_id"), str)):
+            raise BridgeError("invalid_api_response", "Multica returned an invalid project identity.")
+        return project
 
     def create_issue(self, *, title: str, description: str, project_id: str, status: str,
                      parent_issue_id: str | None = None, assignee_id: str | None = None,

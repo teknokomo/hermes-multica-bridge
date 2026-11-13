@@ -11,6 +11,8 @@ import {
   newConnection,
   newRoute,
   newWorkspace,
+  parseRouteGrantsDraft,
+  projectSelectionOptions,
   routeDestinationFieldLocked,
   routeStatus,
   updateWorkspaceConnection,
@@ -109,6 +111,22 @@ test('new Workspace routes expose typed-assignee settings and nested values surv
   assert.deepEqual(cloned.routes[0].default_assignee, route.default_assignee)
 })
 
+test('route grants drafts must parse to arrays and static routes cannot select all_workspace', () => {
+  assert.deepEqual(parseRouteGrantsDraft('[{"grant_id":"grant-a"}]'), {
+    valid: true,
+    value: [{ grant_id: 'grant-a' }]
+  })
+  assert.equal(parseRouteGrantsDraft('{"grant_id":"grant-a"}').valid, false)
+  assert.equal(parseRouteGrantsDraft('{').valid, false)
+
+  const staticRoute = { route_type: 'workspace' }
+  assert.deepEqual(projectSelectionOptions(staticRoute).map(option => option.value), ['allowlist'])
+  const dynamicRoute = { route_type: 'workspace', dynamic_status: 'active' }
+  assert.deepEqual(projectSelectionOptions(dynamicRoute).map(option => option.value), [
+    'allowlist', 'all_workspace'
+  ])
+})
+
 test('routeStatus selects readiness for the requested route only', () => {
   const status = {
     routes: [
@@ -124,6 +142,9 @@ test('locked route destination fields include the Autopilot event', () => {
   const route = { destination_locked: true }
   assert.equal(routeDestinationFieldLocked(route, 'event'), true)
   assert.equal(routeDestinationFieldLocked(route, 'trigger_id'), true)
+  assert.equal(routeDestinationFieldLocked(route, 'allowed_thread_ids'), true)
+  assert.equal(routeDestinationFieldLocked(route, 'wake_mode'), true)
+  assert.equal(routeDestinationFieldLocked(route, 'watcher_enabled'), true)
   assert.equal(routeDestinationFieldLocked(route, 'allowed_assignees'), false)
   assert.equal(routeDestinationFieldLocked({ destination_locked: false }, 'event'), false)
 })

@@ -27,6 +27,7 @@ class FakeContext:
     def __init__(self, settings=None):
         self.settings = settings or {}
         self.tools = {}
+        self.skills = {}
         self.dispatch_calls = []
 
     def get_config(self, key, default=None):
@@ -34,6 +35,9 @@ class FakeContext:
 
     def register_tool(self, **kwargs):
         self.tools[kwargs["name"]] = kwargs
+
+    def register_skill(self, name, path):
+        self.skills[name] = path
 
     def dispatch_tool(self, name, arguments):
         self.dispatch_calls.append((name, arguments))
@@ -81,7 +85,7 @@ class ToolTests(unittest.TestCase):
                 {
                     "multica_list_routes", "multica_send_task", "multica_check_task_result",
                     "multica_workspace_send", "multica_workspace_get",
-                    "multica_workspace_comment", "multica_workspace_update",
+                    "multica_workspace_comment", "multica_workspace_update", "multica_route_create",
                 },
             )
             self.assertNotIn("pass_context", ctx.tools["multica_list_routes"])
@@ -89,6 +93,25 @@ class ToolTests(unittest.TestCase):
                          "multica_workspace_comment", "multica_workspace_update"):
                 self.assertNotIn("pass_context", ctx.tools[name])
             self.assertFalse(ctx.tools["multica_send_task"].get("pass_context", False))
+            skill_path = ctx.skills["hermes-multica-bridge"]
+            self.assertEqual(
+                skill_path,
+                root / "skills" / "hermes-multica-bridge" / "SKILL.md",
+            )
+            skill = skill_path.read_text(encoding="utf-8")
+            self.assertTrue(skill.startswith("---\n"))
+            self.assertIn("name: hermes-multica-bridge", skill)
+            for required in (
+                "multica_list_routes", "multica_route_create", "all_workspace",
+                "allowed_thread_ids", "hermes-multica-notify", "pending",
+            ):
+                self.assertIn(required, skill)
+            lowered_skill = skill.casefold()
+            for forbidden_instruction in (
+                "use shell", "run a loop", "wait with sleep", "execute sql",
+                "call the multica cli",
+            ):
+                self.assertNotIn(forbidden_instruction, lowered_skill)
         finally:
             for loaded in list(sys.modules):
                 if loaded == name or loaded.startswith(name + "."):
@@ -129,14 +152,14 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(len(result["routes"]), 1)
         route = result["routes"][0]
         self.assertEqual(route["type"], "workspace")
-        self.assertEqual(route["purpose"], "Create and track issues in the configured project.")
+        self.assertEqual(route["purpose"], "Create and track issues in the configured project scope.")
         self.assertEqual(route["assignees"][0]["type"], "member")
         self.assertTrue(route["assignees"][0]["default"])
         self.assertTrue(route["require_assignee"])
         self.assertFalse(route["test"])
         self.assertEqual(route["warnings"], [])
-        self.assertNotIn("pat", json.dumps(result).lower())
-        self.assertNotIn("credential", json.dumps(result).lower())
+        self.assertFalse(route["credential_presence"]["multica_pat"])
+        self.assertNotIn("fake-pat", json.dumps(result).lower())
 
     def test_list_routes_reports_legacy_assignee_diagnostic_without_secrets(self) -> None:
         registry = workspace_registry_payload()
@@ -152,7 +175,22 @@ class ToolTests(unittest.TestCase):
             result = json.loads(runtime.handle_list_routes({}, tool_context=source))
         self.assertEqual(result["routes"][0]["warnings"], ["legacy_assignee_entry"])
         self.assertEqual(result["routes"][0]["assignees"][0]["type"], "member")
-        self.assertNotIn("credential", json.dumps(result).lower())
+        self.assertFalse(result["routes"][0]["credential_presence"]["multica_pat"])
+
+    def test_list_routes_reports_only_credential_presence(self) -> None:
+        runtime = PluginRuntime(FakeContext({"registry": workspace_registry_payload()}))
+        source = types.SimpleNamespace(
+            platform="telegram", user_id="user-1", chat_id="chat-1", thread_id=None,
+            message_id="message-1", chat_type="dm",
+        )
+        with patch("bridge.tool.standard_route_secrets", return_value=types.SimpleNamespace(
+            multica_pat="fake-pat-value",
+        )), patch("bridge.tool.read_current_task_with_context",
+                 side_effect=BridgeError("source_unavailable", "no kanban source")):
+            result = json.loads(runtime.handle_list_routes({}, tool_context=source))
+        self.assertTrue(result["routes"][0]["credential_presence"]["multica_pat"])
+        self.assertNotIn("fake-pat-value", json.dumps(result))
+        self.assertNotIn("fake-pat", json.dumps(result).lower())
 
     def test_list_routes_uses_bound_session_source_without_tool_context(self) -> None:
         runtime = PluginRuntime(FakeContext({"registry": workspace_registry_payload()}))
@@ -337,7 +375,7 @@ class ToolTests(unittest.TestCase):
             {
                 "multica_list_routes", "multica_send_task", "multica_check_task_result",
                 "multica_workspace_send", "multica_workspace_get",
-                "multica_workspace_comment", "multica_workspace_update",
+                "multica_workspace_comment", "multica_workspace_update", "multica_route_create",
             },
         )
         self.assertTrue(callable(ctx.tools["multica_send_task"]["handler"]))
@@ -402,7 +440,7 @@ class ToolTests(unittest.TestCase):
 
         with (
             patch("bridge.tool.read_current_task_with_context", return_value=self.current()),
-            patch("bridge.tool._profile_state_path", return_value=Path("/tmp/ignored-deliveries.sqlite3")),
+            patch("bridge.tool._profile_state_path", return_value=Path("ignored-deliveries.sqlite3")),
             patch("bridge.tool.DeliveryStore", EmptyProfileStore),
             patch.object(
                 runtime,
@@ -432,7 +470,7 @@ class ToolTests(unittest.TestCase):
             def routes_for_task(self, **_kwargs):
                 return (inactive_route_id,)
 
-        with patch("bridge.tool._profile_state_path", return_value=Path("/tmp/unused-state")), \
+        with patch("bridge.tool._profile_state_path", return_value=Path("unused-state")), \
                 patch("bridge.tool.DeliveryStore", ProfileStore), \
                 patch.object(
                     runtime, "_isolated_client",
@@ -463,7 +501,7 @@ class ToolTests(unittest.TestCase):
 
         failure = BridgeError("sender_unavailable", "sender unavailable", retryable=True)
         with (
-            patch("bridge.tool._profile_state_path", return_value=Path("/tmp/unused-state")),
+            patch("bridge.tool._profile_state_path", return_value=Path("unused-state")),
             patch("bridge.tool.DeliveryStore", EmptyStore),
             patch.object(runtime, "_isolated_client", side_effect=failure),
             self.assertRaises(BridgeError) as raised,

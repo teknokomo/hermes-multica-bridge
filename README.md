@@ -21,9 +21,9 @@ Made with the support of the [73rd Meridian Consortium](https://om73.ru).
 
 ## Overview
 
-`hermes-multica-bridge` is a Hermes plugin for two Multica workflows: sending the current pinned Kanban task to Autopilot and creating/managing Workspace issues from trusted MAX or Telegram message context.
+`hermes-multica-bridge` is a Hermes plugin for Autopilot and Workspace: it sends the current pinned Kanban task, creates and manages Workspace issues from trusted MAX or Telegram messages, and lets users create routes bounded by operator grants.
 
-Version 0.5.0 supports two security modes:
+Version 0.6.0 retains two security modes:
 
 - **Standard** — the plugin sends HTTPS requests itself. Non-secret topology is stored in the profile's `ConnectionRegistry`; each Route's webhook/HMAC/PAT credentials are managed through the public Hermes plugin credential API and read at runtime only through `agent.secret_scope`.
 - **Isolated** — the plugin never receives Multica secrets. Each new Route uses a separate socket-activated systemd sender instance with root-owned configuration and systemd credentials.
@@ -38,13 +38,17 @@ The Bridge is disabled by default: `enabled=false`. The model cannot spoof the m
   - `multica_check_task_result` — reads results only for a previously stored delivery and accepts only an optional `route_id`;
 - Workspace routes with `multica_workspace_send`, `multica_workspace_get`, `multica_workspace_comment`, and `multica_workspace_update`;
 - automatic issue creation in configured Workspaces/projects and attachment of available files from the current Hermes message;
-- a separate restricted watcher that receives Multica events and sends updates to the exact original MAX or Telegram chat/thread;
+- a restricted legacy watcher for source chats and completion wake through the central notify service for new routes;
 - HMAC-SHA256 in the `X-Hub-Signature-256` header, computed over the exact bytes sent;
 - a stable `Idempotency-Key` for each logical card version;
 - bounded retries and a local SQLite ledger;
 - strict HTTPS origin and webhook path validation; redirects and environment proxies are forbidden;
 - any number of Connections, Workspaces, and Routes within one Hermes profile; tests cover at least 10 Routes;
-- separate Standard credentials for each Route;
+- per-route Standard credentials; dynamic routes use the credential anchor from their allowed grant;
+- self-service Workspace routes within operator grants and exact source/thread ACLs;
+- project, squad, or workspace scope with an explicit project required on send;
+- read-only wake coverage checks for each project;
+- an eighth tool, `multica_route_create`, and a packaged Skill for safe usage;
 - separate Isolated instances with their own socket/config/state/credentials for every new Route;
 - new result states are posted as deduplicated comments to the same Hermes Kanban task;
 - profile state stores are created cleanly; unknown and previous internal schemas are rejected without migration.
@@ -60,6 +64,8 @@ flowchart LR
   H --> M
   C[MAX / Telegram message] -->|trusted Hermes source| W[Workspace tools]
   W -->|configured workspace + project| I[Multica issue]
+  I --> N[Notify completion wake]
+  N -->|task.completed snapshot| P
   I --> E[Multica events / polling]
   E --> X[Isolated watcher]
   X -->|exact source reply| C
@@ -104,11 +110,11 @@ Each Route has its own write-only `webhook|hmac|pat` credentials. The public `ct
 
 ## Workspace Bridge
 
-A Workspace route is always bound by configuration to one `workspace_id` and a required `project_id`. The tools do not accept `platform`, author, chat, thread, or message ID as model arguments. In the target Hermes build, the plugin reads these fields from the session context bound to the current Gateway turn through bound-only `get_bound_session_env()` so that stale process environment values are not used. In shared sessions this API returns the current message actor; legacy `get_session_env(USER_ID)` describes the session recipient and is not used for authorization. Incomplete context stops the operation before any Multica write request. A route is authorized only when platform, user ID, and chat ID match. Group, channel, and thread access is disabled until an operator explicitly enables it in policy.
+A static 0.5.0 Workspace route is bound to one `workspace_id` and one project. A 0.6.0 route can be scoped to a project list, squad, or workspace; dynamic `all_workspace` is allowed only by an active operator grant and always requires an explicit `project_id` on send. The tools do not accept `platform`, author, chat, thread, or message ID as model arguments. In the target Hermes build, the plugin reads these fields from the session context bound to the current Gateway turn through bound-only `get_bound_session_env()` so that stale process environment values are not used. In shared sessions this API returns the current message actor; legacy `get_session_env(USER_ID)` describes the session recipient and is not used for authorization. Incomplete context stops the operation before any Multica write request. A route is authorized only when platform, user ID, chat ID, and any configured thread allowlist match.
 
 A redacted single-profile template with four disabled Workspace routes and a separate Autopilot example is in [config/registry.om73.example.json](config/registry.om73.example.json). Replace `REPLACE-*` values only in local configuration.
 
-Workspace routes run in Standard mode and use separate profile-scoped Multica PAT credentials. `allowed_assignees` uses `{id,type,label}` objects with type `member`, `agent`, or `squad`; external IDs must be canonical UUIDs. `default_assignee` must match an allowed pair. Legacy strings load as `member` and expose `legacy_assignee_entry` in `multica_list_routes` and the Dashboard. Autopilot continues to accept its existing string Hermes assignees.
+Static Workspace routes run in Standard mode and use profile-scoped Multica PAT credentials. Dynamic routes read the PAT only through the operator-owned static credential anchor for the same connection/workspace; no PAT is copied into dynamic state. `allowed_assignees` uses `{id,type,label}` objects with type `member`, `agent`, or `squad`; external IDs must be canonical UUIDs. `default_assignee` must match an allowed pair. Legacy strings load as `member` and expose `legacy_assignee_entry` in `multica_list_routes` and the Dashboard. Autopilot continues to accept its existing string Hermes assignees.
 
 `multica_workspace_send` creates an issue; a parent must belong to the same Workspace/project, and a subtask assignee is selected from the typed allowlist. An ID without a type is resolved only when exactly one match exists. Without an assignment, the operation is rejected before POST unless `allow_unassigned=true`; an unassigned issue returns `ok:false`, sends one notice to the current chat through public `ctx.post_message()`, and is not reported as started work. Reads, comments, and updates recheck that the issue belongs to the route. With `require_assignee=true`, an assignment cannot be removed; inviting members is not supported.
 
@@ -224,7 +230,7 @@ Webhook URLs, PATs, HMAC secrets, and secret response bodies are not stored in t
 
 ## Configuration lifecycle
 
-The plugin is version 0.5.0. The registry accepts its current canonical structure without internal versioning. Watcher state supports a one-way migration from 0.2.0; incompatible SQLite schemas are rejected.
+The plugin is version 0.6.0. The 0.5.0 registry loads without rewrites or internal versioning; dynamic routes use a separate store and reject unknown schemas. Watcher state retains its documented one-way migration from 0.2.0.
 
 Switching between Standard and Isolated does not transfer secrets automatically. A new mode is enabled only after its own readiness check. Enabling a Route locks its destination; use a new Route for another destination and disable + tombstone the previous one.
 
@@ -252,7 +258,7 @@ The release gate also includes Ruff, Bandit, package build/metadata checks, `her
 
 ## Development status
 
-The product version is 0.5.0. Existing bridge formats are preserved; notify uses an independent SQLite DB with PRAGMA user_version for store migrations, without internal API versions. Completion wake adds a signed Hermes invocation only for a new transition to done. Server installation, live Multica writes, commit/push, and publication are separate stages.
+The product version is 0.6.0. It adds scoped routes, operator grants, route creation from trusted source context, and read-only per-project notify readiness; it introduces no internal API or registry versions. Completion wake handles only new transitions to done. Server installation, live Multica use, commit/push, and publication remain separate stages.
 
 ## License
 
@@ -350,3 +356,25 @@ hermes-multica-notify --config /REPLACE/notify.toml wake replay REPLACE_WAKE_ID 
 ```
 
 Wake is disabled by default. Live enablement requires preapproved `test=true` project and topic, backups, and a separately agreed Gateway restart window; without a test target, E2E stops with `test_target_not_configured`.
+
+## Scoped routes and grants 0.6.0
+
+The operator-edited registry stores `route_grants`; operators configure grants, not the model. A grant binds a profile, connection, workspace, source chat/thread/user, projects or squad, typed assignees, credential anchor, a route quota counted independently for that grant, and expiry. A disabled or expired grant blocks new operations.
+
+The eighth tool, `multica_route_create`, uses only trusted message source context. If multiple grants match, it returns `grant_required` with IDs of only the eligible grants; the route is created as `pending` unless the operator explicitly enables `auto_approve`. Approval and revocation are available only to operators through the Dashboard.
+
+A route can narrow a grant but cannot broaden its ACL. `allowed_thread_ids` is checked against the exact bound Hermes thread for every Workspace tool; thread IDs are never accepted as model arguments. A mismatch stops the operation before a Multica call.
+
+`project` means one project; `squad` and finite `workspace` scopes use an allowlist. `all_workspace` is available only to a dynamic workspace route with active `allow_all_projects=true`; send always requires an explicit `project_id`. Static 0.5.0 routes are never converted automatically.
+
+A completion route uses `wake_mode=completion` with `watcher_enabled=false`. It does not call the old watcher or its mapping; notify reports readiness separately for every allowed project. Aggregate `wake_ready` never promises coverage for future projects in an open scope.
+
+Notify readiness is checked through a separate read-only Unix socket. The service checks `SO_PEERCRED`, allowed UIDs and profiles, and frame size before parsing JSON; IPC grants no access to the notify SQLite database or credentials. Notify unavailability is a warning and does not block task creation.
+
+A dynamic route reads the Multica PAT through a static credential anchor for the same connection/workspace. The anchor may be disabled for execution while storing the PAT; tombstoned or dynamic anchors are rejected. The secret is never copied to dynamic-route SQLite; the anchor, grant, workspace, and credential are rechecked before each operation.
+
+The package includes the `hermes-multica-bridge` Skill: it directs the agent to bridge tools and forbids bypasses through shell, Multica CLI, or SQL. Installing the Skill creates no grants, routes, or subscriptions.
+
+Dynamic routes live in a separate profile database with private permissions, transactional quotas, and audit records. Unknown schemas are rejected before the file is changed; revocation is retained as a terminal state, and new routes become visible without a Gateway restart.
+
+The product version is 0.6.0. The 0.5.0 registry continues to load without rewrites. Grant, credential-anchor, and notify-subscription setup and publication remain separate operator stages; the old watcher is not started automatically.

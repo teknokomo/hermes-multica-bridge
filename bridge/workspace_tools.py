@@ -15,12 +15,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .dynamic_routes import DynamicRouteStore
 from .errors import BridgeError
+from .notify_readiness import MAX_PROJECTS, NotifyReadinessClient
 from .registry import (
     ConnectionRegistry,
     RegistryRoute,
     WorkspaceAssignee,
+    new_id,
     registry_from_mapping,
+    registry_with_dynamic_routes,
     standard_route_secrets,
 )
 from .validation import _valid_telegram_thread_id
@@ -204,8 +208,16 @@ class WorkspaceRuntime:
     def _registry(self) -> ConnectionRegistry:
         raw = self.ctx.get_config("registry", None)
         if not isinstance(raw, dict):
-            raise BridgeError("route_denied", "No Workspace routes are configured for this Hermes profile.")
-        return registry_from_mapping(raw)
+            raw = {"connections": [], "workspaces": [], "routes": [], "operator_grants": [], "route_grants": []}
+        dynamic_rows = []
+        try:
+            dynamic_rows = self._dynamic_store().list(self._profile())
+        except BridgeError as exc:
+            # Dynamic state is an optional overlay. Never let a broken overlay
+            # disable valid static routes; dynamic writes still fail closed.
+            if exc.code != "hermes_unavailable" and not exc.code.startswith("dynamic_route_state_"):
+                raise
+        return registry_with_dynamic_routes(raw, dynamic_rows)[0]
 
     def _profile(self) -> str:
         value = getattr(self.ctx, "profile_name", None)
@@ -218,6 +230,13 @@ class WorkspaceRuntime:
             raise BridgeError("hermes_unavailable", "Hermes profile storage is unavailable.") from exc
         return _workspace_state(plugin_data_dir("hermes-multica-bridge") / "workspace.sqlite3")
 
+    def _dynamic_store(self) -> DynamicRouteStore:
+        try:
+            from plugins.plugin_storage import plugin_data_dir
+        except ImportError as exc:  # pragma: no cover - Hermes runtime supplies this API
+            raise BridgeError("hermes_unavailable", "Hermes profile storage is unavailable.") from exc
+        return DynamicRouteStore(plugin_data_dir("hermes-multica-bridge") / "dynamic-routes.sqlite3")
+
     def _route(self, registry: ConnectionRegistry, context: Any, requested: Any) -> RegistryRoute:
         source = trusted_source(context)
         routes = registry.authorized_workspace_routes(source)
@@ -226,18 +245,89 @@ class WorkspaceRuntime:
                 raise BridgeError("invalid_arguments", "route_id must be a configured route identifier.")
             routes = tuple(route for route in routes if route.route_id == requested)
             if not routes:
+                existing = next((route for route in registry.routes if route.route_id == requested), None)
+                if existing is not None and existing.dynamic_status and existing.dynamic_status != "active":
+                    raise BridgeError("route_not_active", "The dynamic route is not active.")
+                if existing is not None and WorkspaceRuntime._source_thread_mismatch(
+                    registry, existing, source
+                ):
+                    raise BridgeError("route_thread_denied", "This route is restricted to a different source thread.")
                 raise BridgeError("route_denied", "The requested Workspace route is not authorized for this message.")
         if not routes:
+            if any(WorkspaceRuntime._source_thread_mismatch(registry, route, source)
+                   for route in registry.routes):
+                raise BridgeError("route_thread_denied", "This route is restricted to a different source thread.")
             raise BridgeError("route_denied", "No Workspace route is authorized for this message source.")
         if len(routes) != 1:
             raise BridgeError("route_required", "Choose a route_id from multica_list_routes.")
-        return routes[0]
+        route = routes[0]
+        if route.dynamic_status:
+            grant = registry.route_grant(route.grant_id)
+            profile = self._profile()
+            if not grant.active:
+                raise BridgeError("route_grant_expired", "The operator grant is expired or disabled.")
+            if (grant.profile != profile or grant.connection_id != route.connection_id
+                    or grant.workspace_key != route.workspace_key
+                    or route.credential_route_id != grant.credential_route_id):
+                raise BridgeError("route_grant_denied", "The dynamic route no longer matches its operator grant.")
+            if (not set(route.source_platforms) <= set(grant.allowed_source_platforms)
+                    or not set(route.allowed_user_ids) <= set(grant.allowed_user_ids)
+                    or not set(route.allowed_chat_ids) <= set(grant.allowed_chat_ids)
+                    or grant.allowed_thread_ids and (
+                        not route.allowed_thread_ids
+                        or not set(route.allowed_thread_ids) <= set(grant.allowed_thread_ids)
+                    )
+                    or any((item.id, item.type) not in {(a.id, a.type) for a in grant.allowed_assignees}
+                           for item in route.workspace_assignees)):
+                raise BridgeError("route_grant_denied", "The route exceeds its current operator grant.")
+            if (route.project_selection == "allowlist" and not grant.allow_all_projects
+                    and not set(route.project_ids) <= set(grant.allowed_project_ids)):
+                raise BridgeError("route_project_not_allowed", "The route exceeds its current project grant.")
+            if route.project_selection == "all_workspace" and not grant.allow_all_projects:
+                raise BridgeError("route_grant_denied", "all_workspace is not enabled by the current grant.")
+        return route
+
+    @staticmethod
+    def _source_thread_mismatch(
+        registry: ConnectionRegistry, route: RegistryRoute, source: dict[str, Any],
+    ) -> bool:
+        if (route.route_type != "workspace" or not route.allowed_thread_ids
+                or (source.get("thread_id") or "") in route.allowed_thread_ids
+                or not route.enabled or route.tombstoned
+                or not registry.route_config(route).enabled
+                or source.get("platform") not in route.source_platforms
+                or source.get("user_id") not in route.allowed_user_ids
+                or source.get("chat_id") not in route.allowed_chat_ids):
+            return False
+        if source.get("chat_type") in {"group", "channel", "thread"} and not route.allow_groups:  # noqa: SIM103 - preserve explicit authorization denials
+            return False
+        return True
 
     def _api(self, registry: ConnectionRegistry, route: RegistryRoute) -> WorkspaceApiClient:
         connection = registry.connection(route.connection_id)
         if connection.security_mode != "standard":
             raise BridgeError("configuration_invalid", "Workspace routes require profile-scoped Multica credentials.")
-        secrets = standard_route_secrets(route, require_webhook=False)
+        credential_route = route
+        if route.dynamic_status:
+            grant = registry.route_grant(route.grant_id)
+            if not grant.active:
+                raise BridgeError("route_grant_expired", "The operator grant is expired or disabled.")
+            credential_route = registry.route(grant.credential_route_id)
+            if (
+                credential_route.dynamic_status
+                or credential_route.tombstoned
+                or credential_route.connection_id != route.connection_id
+                or credential_route.workspace_key != route.workspace_key
+            ):
+                raise BridgeError(
+                    "credential_unavailable",
+                    "The dynamic route credential anchor is unavailable.",
+                )
+        secrets = standard_route_secrets(
+            route,
+            require_webhook=False,
+            credential_route_id=credential_route.route_id if route.dynamic_status else None,
+        )
         if not secrets.multica_pat:
             raise BridgeError("credential_unavailable", "The Workspace route has no Multica API credential.")
         workspace = registry.workspace(route.workspace_key)
@@ -245,10 +335,87 @@ class WorkspaceRuntime:
                                   timeout=connection.request_timeout_seconds)
 
     @staticmethod
-    def _issue_in_route(issue: dict[str, Any], registry: ConnectionRegistry, route: RegistryRoute) -> None:
+    def _issue_in_route(issue: dict[str, Any], registry: ConnectionRegistry, route: RegistryRoute,
+                        *, project_id: str | None = None) -> None:
         workspace = registry.workspace(route.workspace_key)
-        if issue.get("workspace_id") != workspace.workspace_id or issue.get("project_id") != route.project_id:
+        allowed_projects = set(route.project_ids)
+        expected_project = project_id or route.default_project_id or route.project_id
+        project_matches = (
+            issue.get("project_id") == expected_project
+            if project_id is not None or route.project_selection == "allowlist" and len(allowed_projects) == 1
+            else issue.get("project_id") in allowed_projects
+        )
+        if route.project_selection == "all_workspace" and project_id is None:
+            project_matches = bool(issue.get("project_id"))
+        if issue.get("workspace_id") != workspace.workspace_id or not project_matches:
             raise BridgeError("route_denied", "The issue does not belong to this Workspace route.")
+
+    def _project_for_send(
+        self, args: dict[str, Any], registry: ConnectionRegistry,
+        route: RegistryRoute, api: WorkspaceApiClient,
+    ) -> str:
+        requested = args.get("project_id")
+        projects = route.project_ids
+        if requested is None:
+            if route.project_selection == "all_workspace":
+                raise BridgeError("project_required", "Specify project_id for an all_workspace route.")
+            if len(projects) != 1:
+                allowed = ", ".join(projects)
+                raise BridgeError(
+                    "project_required",
+                    f"Specify project_id from the route's allowed projects: {allowed}.",
+                )
+            requested = projects[0]
+        if not isinstance(requested, str) or not _ISSUE_IDENTIFIER_RE.fullmatch(requested):
+            raise BridgeError("invalid_arguments", "project_id is invalid.")
+        if route.project_selection == "allowlist" and requested not in projects:
+            raise BridgeError("route_project_not_allowed", "The project is outside this route's allowlist.")
+        if route.project_selection == "all_workspace":
+            workspace = registry.workspace(route.workspace_key)
+            project = api.get_project(requested)
+            if project.get("workspace_id") != workspace.workspace_id:
+                raise BridgeError("route_project_not_allowed", "The selected project is outside this route's workspace.")
+        return requested
+
+    def _verify_issue_scope(
+        self, api: WorkspaceApiClient, issue: dict[str, Any],
+        registry: ConnectionRegistry, route: RegistryRoute,
+    ) -> None:
+        self._issue_in_route(issue, registry, route)
+        if route.project_selection == "all_workspace":
+            project_id = issue.get("project_id")
+            if not isinstance(project_id, str):
+                raise BridgeError("route_denied", "The issue has no valid project identity.")
+            project = api.get_project(project_id)
+            workspace = registry.workspace(route.workspace_key)
+            if project.get("workspace_id") != workspace.workspace_id:
+                raise BridgeError("route_denied", "The issue project is outside this Workspace route.")
+
+    @staticmethod
+    def _project_ids_for_route(route: RegistryRoute) -> tuple[str, ...]:
+        if route.project_selection == "all_workspace":
+            return (route.default_project_id,) if route.default_project_id else ()
+        return route.project_ids
+
+    def _wake_readiness(
+        self, registry: ConnectionRegistry, route: RegistryRoute, project_ids: tuple[str, ...],
+    ) -> tuple[dict[str, Any], ...] | None:
+        workspace = registry.workspace(route.workspace_key)
+        if not project_ids:
+            return ()
+        try:
+            client = NotifyReadinessClient()
+            results = []
+            for offset in range(0, len(project_ids), MAX_PROJECTS):
+                batch = project_ids[offset:offset + MAX_PROJECTS]
+                results.extend(client.check(
+                    self._profile(),
+                    [{"workspace_id": workspace.workspace_id, "project_id": project_id}
+                     for project_id in batch],
+                ))
+            return tuple(results)
+        except BridgeError:
+            return None
 
     @staticmethod
     def _safe_issue(issue: dict[str, Any]) -> dict[str, Any]:
@@ -358,7 +525,7 @@ class WorkspaceRuntime:
         expected: dict[str, Any],
     ) -> dict[str, Any]:
         issue = api.get_issue(issue_id)
-        WorkspaceRuntime._issue_in_route(issue, registry, route)
+        WorkspaceRuntime._issue_in_route(issue, registry, route, project_id=expected.get("project_id"))
         if any(issue.get(key) != value for key, value in expected.items()):
             raise BridgeError("assignee_verification_failed", "Multica readback does not match the requested issue state.")
         return issue
@@ -384,7 +551,10 @@ class WorkspaceRuntime:
 
     @staticmethod
     def _metadata_pseudonym_key(route: RegistryRoute) -> bytes:
-        secrets = standard_route_secrets(route, require_webhook=False)
+        secrets = standard_route_secrets(
+            route, require_webhook=False,
+            credential_route_id=route.credential_route_id or None,
+        )
         if not secrets.multica_pat:
             raise BridgeError("credential_unavailable", "The Workspace route has no Multica API credential.")
         return hmac.new(
@@ -489,7 +659,7 @@ class WorkspaceRuntime:
         return result
 
     def _retry_watcher_mapping(self, state: WorkspaceState, route: RegistryRoute, issue_id: str) -> bool:
-        if not route.watcher_enabled:
+        if route.wake_mode == "completion" or not route.watcher_enabled:
             return False
         stored = state.issue_mapping(issue_id)
         if stored is None or stored["route_id"] != route.route_id:
@@ -599,13 +769,265 @@ class WorkspaceRuntime:
                     break
         return output
 
+    def create_route(self, args: dict[str, Any], *, tool_context: Any = None) -> str:
+        available_grants: list[str] = []
+        try:
+            if tool_context is None:
+                tool_context = _load_hermes_context()
+            source = trusted_source(tool_context)
+            allowed = {
+                "name", "scope_kind", "project_selection", "project_ids", "default_project_id",
+                "squad_id", "allowed_assignees", "default_assignee", "test", "grant_id",
+            }
+            if not isinstance(args, dict) or set(args) - allowed:
+                raise BridgeError("invalid_arguments", "The route request contains unsupported arguments.")
+            name = args.get("name")
+            if not isinstance(name, str) or not name.strip() or len(name.strip()) > 160:
+                raise BridgeError("invalid_arguments", "Route name is empty or too long.")
+            scope_kind = args.get("scope_kind")
+            project_selection = args.get("project_selection", "allowlist")
+            if not isinstance(scope_kind, str) or scope_kind not in {"project", "squad", "workspace"}:
+                raise BridgeError("invalid_arguments", "scope_kind must be project, squad, or workspace.")
+            if not isinstance(project_selection, str) or project_selection not in {"allowlist", "all_workspace"}:
+                raise BridgeError("invalid_arguments", "project_selection is invalid.")
+            registry = self._registry()
+            profile = self._profile()
+            contextual_grants = [grant for grant in registry.route_grants
+                if grant.profile == profile
+                and source["platform"] in grant.allowed_source_platforms
+                and source["user_id"] in grant.allowed_user_ids
+                and source["chat_id"] in grant.allowed_chat_ids
+                and (not grant.allowed_thread_ids or source.get("thread_id") in grant.allowed_thread_ids)]
+            eligible_grants = [grant for grant in contextual_grants if grant.active]
+            available_grants = [grant.grant_id for grant in eligible_grants]
+            requested_grant = args.get("grant_id")
+            if requested_grant is not None:
+                selected = next((grant for grant in contextual_grants
+                                 if grant.grant_id == requested_grant), None)
+                if not isinstance(requested_grant, str) or selected is None:
+                    raise BridgeError("route_grant_denied", "The selected grant is not available in this message context.")
+                if not selected.active:
+                    raise BridgeError("route_grant_expired", "The operator grant is expired or disabled.")
+                eligible_grants = [selected]
+            elif len(eligible_grants) > 1:
+                raise BridgeError("grant_required", "Several active grants match this message; choose one returned for this context.")
+            if not eligible_grants:
+                if contextual_grants:
+                    raise BridgeError("route_grant_expired", "The matching operator grant is expired or disabled.")
+                raise BridgeError("route_grant_denied", "No active operator grant permits route creation from this message.")
+            grant = eligible_grants[0]
+            if not grant.active:
+                raise BridgeError("route_grant_expired", "The operator grant is expired or disabled.")
+            route_name = name.strip()
+            normalized_name = route_name.casefold()
+            if any(
+                not route.dynamic_status
+                and route.workspace_key == grant.workspace_key
+                and route.name.casefold() == normalized_name
+                for route in registry.routes
+            ):
+                raise BridgeError("route_conflict", "A static route already uses this name in the workspace.")
+            route_id = new_id()
+            # Defense in depth: route IDs are random UUIDv7, but the merged
+            # registry must still reject any collision before state is written.
+            if any(route.route_id == route_id for route in registry.routes):
+                raise BridgeError("route_conflict", "The generated route identifier is already in use.")
+            if project_selection == "all_workspace" and (
+                scope_kind != "workspace" or not grant.allow_all_projects
+            ):
+                raise BridgeError("route_grant_denied", "all_workspace requires an active workspace grant with allow_all_projects.")
+            if scope_kind == "squad" and project_selection == "all_workspace":
+                raise BridgeError("route_project_not_allowed", "Squad routes require an explicit project allowlist.")
+
+            requested_projects = args.get("project_ids", [])
+            if not isinstance(requested_projects, list) or len(requested_projects) > 256:
+                raise BridgeError("invalid_arguments", "project_ids must be a bounded list.")
+            if any(not isinstance(item, str) or not _ISSUE_IDENTIFIER_RE.fullmatch(item) for item in requested_projects):
+                raise BridgeError("invalid_arguments", "project_ids contains an invalid project identifier.")
+            if len(set(requested_projects)) != len(requested_projects):
+                raise BridgeError("invalid_arguments", "project_ids contains duplicates.")
+            if project_selection == "allowlist":
+                if not requested_projects:
+                    raise BridgeError("invalid_arguments", "An allowlist route requires project_ids.")
+                if scope_kind == "project" and len(requested_projects) != 1:
+                    raise BridgeError("invalid_arguments", "A project route must contain exactly one project.")
+                if not grant.allow_all_projects and not set(requested_projects) <= set(grant.allowed_project_ids):
+                    raise BridgeError("route_project_not_allowed", "One or more projects are outside the grant.")
+            elif requested_projects:
+                raise BridgeError("invalid_arguments", "all_workspace does not accept project_ids.")
+
+            default_project_id = args.get("default_project_id")
+            if default_project_id is None and project_selection == "allowlist" and len(requested_projects) == 1:
+                default_project_id = requested_projects[0]
+            if not isinstance(default_project_id, str) or not _ISSUE_IDENTIFIER_RE.fullmatch(default_project_id):
+                raise BridgeError("invalid_arguments", "default_project_id is required and must be valid.")
+            if project_selection == "allowlist" and default_project_id not in requested_projects:
+                raise BridgeError("route_project_not_allowed", "default_project_id must be in project_ids.")
+            if project_selection == "all_workspace" and not grant.allow_all_projects:
+                raise BridgeError("route_grant_denied", "The grant does not allow all_workspace.")
+
+            squad_id = args.get("squad_id")
+            if scope_kind == "squad":
+                if not isinstance(squad_id, str) or squad_id not in grant.allowed_squad_ids:
+                    raise BridgeError("route_grant_denied", "The squad is outside the grant.")
+            elif squad_id is not None:
+                raise BridgeError("invalid_arguments", "Only squad routes may specify squad_id.")
+
+            grant_assignees = {(item.id, item.type): item for item in grant.allowed_assignees}
+            raw_assignees = args.get("allowed_assignees")
+            if raw_assignees is None:
+                assignees = tuple(grant.allowed_assignees)
+            else:
+                if not isinstance(raw_assignees, list) or len(raw_assignees) > 64:
+                    raise BridgeError("invalid_arguments", "allowed_assignees must be a bounded list.")
+                parsed = []
+                for item in raw_assignees:
+                    if not isinstance(item, dict) or set(item) - {"id", "type", "label"}:
+                        raise BridgeError("invalid_arguments", "An assignee must contain only id, type, and optional label.")
+                    assignee_id, assignee_type = item.get("id"), item.get("type")
+                    label = item.get("label", "")
+                    if (not isinstance(assignee_id, str) or not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", assignee_id)
+                            or not isinstance(assignee_type, str) or assignee_type not in _WORKSPACE_ASSIGNEE_TYPES
+                            or not isinstance(label, str) or len(label) > 128):
+                        raise BridgeError("invalid_arguments", "An assignee identity is invalid.")
+                    candidate = WorkspaceAssignee(assignee_id, assignee_type, label.strip())
+                    if (candidate.id, candidate.type) not in grant_assignees:
+                        raise BridgeError("route_grant_denied", "An assignee is outside the operator grant.")
+                    parsed.append(candidate)
+                if len({(item.id, item.type) for item in parsed}) != len(parsed):
+                    raise BridgeError("invalid_arguments", "allowed_assignees contains duplicates.")
+                assignees = tuple(parsed)
+            if not assignees:
+                raise BridgeError("route_grant_denied", "The grant has no assignees for a required-assignee route.")
+            default_assignee = None
+            if args.get("default_assignee") is not None:
+                value = args["default_assignee"]
+                if not isinstance(value, dict) or set(value) - {"id", "type", "label"}:
+                    raise BridgeError("invalid_arguments", "default_assignee is invalid.")
+                pair = (value.get("id"), value.get("type"))
+                default_assignee = next((item for item in assignees if (item.id, item.type) == pair), None)
+                if default_assignee is None or pair not in grant_assignees:
+                    raise BridgeError("route_grant_denied", "default_assignee must be allowed by both route and grant.")
+            test = args.get("test", False)
+            if type(test) is not bool:
+                raise BridgeError("invalid_arguments", "test must be a boolean.")
+
+            anchor = registry.route(grant.credential_route_id)
+            connection = registry.connection(grant.connection_id)
+            workspace = registry.workspace(grant.workspace_key)
+            if (not connection.enabled or connection.security_mode != "standard"
+                    or workspace.workspace_id != grant.workspace_id
+                    or anchor.dynamic_status or anchor.tombstoned
+                    or anchor.route_type != "workspace"):
+                raise BridgeError("route_grant_denied", "The grant's credential anchor is not available for this workspace.")
+            api = self._api(registry, anchor)
+            projects_to_check = requested_projects if project_selection == "allowlist" else [default_project_id]
+            for project_id in projects_to_check:
+                project = api.get_project(project_id)
+                if project.get("workspace_id") != workspace.workspace_id:
+                    raise BridgeError("route_project_not_allowed", "A selected project is outside the granted workspace.")
+
+            status = "active" if grant.auto_approve else "pending"
+            source_thread = source.get("thread_id") or ""
+            route_policy = {
+                "route_id": route_id,
+                "connection_id": grant.connection_id,
+                "workspace_key": grant.workspace_key,
+                "name": route_name,
+                "route_type": "workspace",
+                "project_id": default_project_id,
+                "scope_kind": scope_kind,
+                "project_selection": project_selection,
+                "project_ids": requested_projects if project_selection == "allowlist" else [],
+                "default_project_id": default_project_id,
+                "squad_id": squad_id or "",
+                "source_platforms": [source["platform"]],
+                "allowed_user_ids": [source["user_id"]],
+                "allowed_chat_ids": [source["chat_id"]],
+                "allowed_thread_ids": [source_thread] if source_thread else [],
+                "allow_groups": source["chat_type"] in {"group", "channel", "thread"},
+                "allowed_statuses": list(anchor.allowed_statuses),
+                "allowed_assignees": [{"id": item.id, "type": item.type, "label": item.label} for item in assignees],
+                "default_assignee": ({"id": default_assignee.id, "type": default_assignee.type, "label": default_assignee.label}
+                                      if default_assignee else None),
+                "require_assignee": True,
+                "test": test,
+                "enabled": status == "active",
+                "tombstoned": False,
+                "destination_locked": True,
+                "source_boards": [],
+                "allowed_profiles": [],
+                "operator_grant_required": False,
+                "result_tracking_enabled": False,
+                "require_source_attachment": anchor.require_source_attachment,
+                "max_attachments": anchor.max_attachments,
+                "max_attachment_bytes": anchor.max_attachment_bytes,
+                "allowed_mime_types": list(anchor.allowed_mime_types),
+                "allowed_extensions": list(anchor.allowed_extensions),
+                "watcher_enabled": False,
+                "wake_mode": "completion",
+                "credential_route_id": grant.credential_route_id,
+                "grant_id": grant.grant_id,
+                "dynamic_status": status,
+                "created_by_profile": profile,
+            }
+            create_identity = {
+                "profile": profile, "workspace_id": workspace.workspace_id,
+                "project_ids": route_policy["project_ids"], "project_selection": project_selection,
+                "squad_id": route_policy["squad_id"], "chat_id": source["chat_id"],
+                "thread_id": source_thread, "name": normalized_name,
+            }
+            create_key = hashlib.sha256(_json(create_identity).encode()).hexdigest()
+            raw_registry = self.ctx.get_config("registry", None)
+            if not isinstance(raw_registry, dict):
+                raw_registry = {"connections": [], "workspaces": [], "routes": [],
+                                "operator_grants": [], "route_grants": []}
+
+            def validate_registry(existing_rows: list[dict[str, Any]], candidate: dict[str, Any]) -> None:
+                _current, accepted_rows = registry_with_dynamic_routes(raw_registry, existing_rows)
+                combined = dict(raw_registry)
+                combined["routes"] = [*raw_registry.get("routes", []), *accepted_rows, candidate]
+                registry_from_mapping(combined)
+
+            stored, created = self._dynamic_store().create(
+                profile=profile, workspace_id=workspace.workspace_id, name=route_name,
+                grant_id=grant.grant_id, create_key=create_key, policy=route_policy,
+                status=status, max_routes=grant.max_routes, validate_registry=validate_registry,
+            )
+            project_readiness = self._wake_readiness(
+                registry, anchor,
+                tuple(route_policy["project_ids"]) or (default_project_id,),
+            )
+            readiness = list(project_readiness or ())
+            finite_scope = project_selection == "allowlist"
+            wake_ready = bool(readiness) and all(item["wake_ready"] for item in readiness) if finite_scope else False
+            wake_route_id = next((item.get("wake_route_id") for item in readiness if item.get("wake_route_id")), None)
+            return _json({
+                "ok": True, "route_id": stored["route_id"], "status": stored["dynamic_status"],
+                "created": created, "wake_ready": wake_ready,
+                "wake_open_scope": project_selection == "all_workspace",
+                "projects": readiness,
+                "wake_route_id": wake_route_id,
+                "message": "Route created and ready." if stored["dynamic_status"] == "active"
+                           else "Route created as pending; operator approval is required.",
+            })
+        except BridgeError as exc:
+            result: dict[str, Any] = {"ok": False, "error_code": exc.code, "message": exc.message}
+            if exc.retryable:
+                result["retryable"] = True
+            if exc.code == "grant_required":
+                result["available_grant_ids"] = available_grants
+            return _json(result)
+        except Exception:  # noqa: BLE001 - stable public boundary
+            return _json({"ok": False, "error_code": "internal_error", "message": "The route could not be created."})
+
     def send(self, args: dict[str, Any], *, tool_context: Any = None) -> str:
         try:
             if tool_context is None:
                 tool_context = _load_hermes_context(include_attachments=True)
             route_id = self._route_arg(args, {
                 "route_id", "title", "description", "status", "parent_issue_id", "assignee_id",
-                "assignee_type", "allow_unassigned", "related_issue_ids",
+                "assignee_type", "allow_unassigned", "related_issue_ids", "project_id",
             })
             registry = self._registry()
             route = self._route(registry, tool_context, route_id)
@@ -624,28 +1046,31 @@ class WorkspaceRuntime:
                 raise BridgeError("invalid_arguments", "Issue description is too long.")
             parent_id = args.get("parent_issue_id")
             api = self._api(registry, route)
+            project_id = self._project_for_send(args, registry, route, api)
             pseudonym_key = self._metadata_pseudonym_key(route)
             if parent_id is not None:
                 parent = api.get_issue(parent_id)
-                self._issue_in_route(parent, registry, route)
+                self._issue_in_route(parent, registry, route, project_id=project_id)
             assignee_id = assignment.id if assignment else None
             assignee_type = assignment.type if assignment else None
             attachments = self._attachments(tool_context, route)
             state = self._state()
             payload = {"title": title, "description": description, "status": status,
+                       "project_id": project_id,
                        "parent_issue_id": parent_id, "assignee_id": assignee_id,
                        "assignee_type": assignee_type, "allow_unassigned": args.get("allow_unassigned", False),
                        "related_issue_ids": related_ids,
                        "attachment_hashes": [item[2] for item in attachments]}
             issue = self._operation(
                 state, route, tool_context, "create_issue", payload,
-                lambda: api.create_issue(title=title, description=description, project_id=route.project_id,
+                lambda: api.create_issue(title=title, description=description, project_id=project_id,
                                          status=status, parent_issue_id=parent_id, assignee_id=assignee_id,
                                          assignee_type=assignee_type),
             )
-            self._issue_in_route(issue, registry, route)
+            self._issue_in_route(issue, registry, route, project_id=project_id)
             issue_id = issue["id"]
             expected = {"title": title.strip(), "description": description, "status": status,
+                        "project_id": project_id,
                         "assignee_id": assignee_id, "assignee_type": assignee_type}
             if parent_id is not None:
                 expected["parent_issue_id"] = parent_id
@@ -672,11 +1097,12 @@ class WorkspaceRuntime:
                     "The issue was created, but Multica readback is unavailable.",
                 )
             source = trusted_source(tool_context)
-            if not state.register_issue(issue_id, route.route_id, source):
-                raise BridgeError("mapping_conflict", "This Multica issue is already mapped to a different source message.")
-            mapping_status = "pending"
-            if route.watcher_enabled and self._retry_watcher_mapping(state, route, issue_id):
-                mapping_status = "registered"
+            mapping_status = "not_required" if route.wake_mode == "completion" else "pending"
+            if route.wake_mode == "legacy_watcher":
+                if not state.register_issue(issue_id, route.route_id, source):
+                    raise BridgeError("mapping_conflict", "This Multica issue is already mapped to a different source message.")
+                if route.watcher_enabled and self._retry_watcher_mapping(state, route, issue_id):
+                    mapping_status = "registered"
             metadata_warnings = self._write_metadata(
                 state=state, route=route, context=tool_context, api=api, issue_id=issue_id,
                 values=self._metadata_for_source(route, source, related_ids_json, pseudonym_key),
@@ -686,6 +1112,12 @@ class WorkspaceRuntime:
             notification_status = self._notify_unassigned(state, route, readback_issue) if assignment is None else None
             result = {"issue": self._safe_issue(readback_issue), "issue_id": issue_id,
                       "attachments": files, "watcher_mapping": mapping_status, "warnings": metadata_warnings}
+            wake_status = self._wake_readiness(registry, route, (project_id,))
+            result["wake_readiness"] = (
+                wake_status[0] if wake_status else
+                {"workspace_id": registry.workspace(route.workspace_key).workspace_id,
+                 "project_id": project_id, "wake_ready": False, "reason": "source_unavailable"}
+            )
             if verification_error is not None:
                 return _json({"ok": False, "error_code": verification_error.code,
                               "message": verification_error.message, **result})
@@ -706,10 +1138,11 @@ class WorkspaceRuntime:
             route_id = self._route_arg(args, {"route_id", "issue_id"})
             registry = self._registry()
             route = self._route(registry, tool_context, route_id)
-            issue = self._api(registry, route).get_issue(args.get("issue_id"))
-            self._issue_in_route(issue, registry, route)
+            api = self._api(registry, route)
+            issue = api.get_issue(args.get("issue_id"))
+            self._verify_issue_scope(api, issue, registry, route)
             self._retry_watcher_mapping(self._state(), route, args["issue_id"])
-            comments = self._api(registry, route).list_comments(args.get("issue_id"))
+            comments = api.list_comments(args.get("issue_id"))
             safe_comments = [
                 {key: item[key] for key in ("id", "author_type", "author_id", "content", "type", "created_at")
                  if key in item and isinstance(item[key], (str, int, type(None)))}
@@ -731,7 +1164,7 @@ class WorkspaceRuntime:
             api = self._api(registry, route)
             issue_id = args.get("issue_id")
             issue = api.get_issue(issue_id)
-            self._issue_in_route(issue, registry, route)
+            self._verify_issue_scope(api, issue, registry, route)
             state = self._state()
             self._retry_watcher_mapping(state, route, issue_id)
             result = self._operation(state, route, tool_context, "create_comment",
@@ -756,7 +1189,7 @@ class WorkspaceRuntime:
             issue_id = args.get("issue_id")
             api = self._api(registry, route)
             issue = api.get_issue(issue_id)
-            self._issue_in_route(issue, registry, route)
+            self._verify_issue_scope(api, issue, registry, route)
             state = self._state()
             self._retry_watcher_mapping(state, route, issue_id)
             related_requested = "related_issue_ids" in args
@@ -833,6 +1266,7 @@ ROUTE_PROPERTY = {"route_id": {"type": "string", "description": "Authorized rout
 WORKSPACE_TOOLS = (
     ("multica_workspace_send", "Create an issue in the configured Multica project, using an allowed member, agent, or squad assignment. Current-message attachments are included automatically.",
      {**ROUTE_PROPERTY, "title": {"type": "string"}, "description": {"type": "string"},
+      "project_id": {"type": "string", "description": "Required when the route allows multiple projects or uses all_workspace."},
       "status": {"type": "string"}, "parent_issue_id": {"type": "string"},
       "assignee_id": {"type": "string"}, "assignee_type": {"type": "string", "enum": ["member", "agent", "squad"]},
       "allow_unassigned": {"type": "boolean"},
@@ -852,6 +1286,31 @@ WORKSPACE_TOOLS = (
      ["issue_id"], "update"),
 )
 
+ROUTE_CREATE_TOOL = (
+    "multica_route_create",
+    "Create a Workspace route inside an operator grant that matches the current trusted message. Source and destination are never accepted as model arguments.",
+    {
+        "name": {"type": "string"},
+        "scope_kind": {"type": "string", "enum": ["project", "squad", "workspace"]},
+        "project_selection": {"type": "string", "enum": ["allowlist", "all_workspace"]},
+        "project_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 256, "uniqueItems": True},
+        "default_project_id": {"type": "string"},
+        "squad_id": {"type": "string"},
+        "allowed_assignees": {"type": "array", "items": {
+            "type": "object", "properties": {
+                "id": {"type": "string"}, "type": {"type": "string", "enum": ["member", "agent", "squad"]},
+                "label": {"type": "string"},
+            }, "required": ["id", "type"], "additionalProperties": False,
+        }, "maxItems": 64},
+        "default_assignee": {"type": "object", "properties": {
+            "id": {"type": "string"}, "type": {"type": "string", "enum": ["member", "agent", "squad"]},
+            "label": {"type": "string"},
+        }, "required": ["id", "type"], "additionalProperties": False},
+        "test": {"type": "boolean"},
+        "grant_id": {"type": "string", "description": "Only required when multiple eligible grants match this trusted message."},
+    },
+)
+
 
 def register_workspace_tools(ctx: Any) -> None:
     runtime = WorkspaceRuntime(ctx)
@@ -861,3 +1320,10 @@ def register_workspace_tools(ctx: Any) -> None:
             schema=_schema(name, description, properties, required),
             handler=getattr(runtime, method_name),
         )
+    name, description, properties = ROUTE_CREATE_TOOL
+    ctx.register_tool(
+        name=name,
+        toolset="hermes_multica_bridge",
+        schema=_schema(name, description, properties, ["name", "scope_kind", "project_selection"]),
+        handler=runtime.create_route,
+    )

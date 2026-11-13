@@ -14,17 +14,21 @@ PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
+from bridge.dynamic_routes import DynamicRouteStore
 from bridge.errors import BridgeError
+from bridge.notify_readiness import MAX_PROJECTS, NotifyReadinessClient
 from bridge.protocol import BridgeIpcClient
 from bridge.registry import (
     ConnectionRegistry,
     RegistryRoute,
     new_id,
     registry_from_mapping,
+    registry_with_dynamic_routes,
     route_policy_fingerprint,
     standard_route_secrets,
 )
 from bridge.state import DeliveryStore
+from bridge.workspace_api import WorkspaceApiClient
 
 PLUGIN_ID = "hermes-multica-bridge"
 router = APIRouter()
@@ -146,7 +150,10 @@ def _enable_readiness(
 
 def _route_secret_presence(route: RegistryRoute) -> dict[str, bool]:
     try:
-        secrets = standard_route_secrets(route, require_webhook=False)
+        secrets = standard_route_secrets(
+            route, require_webhook=False,
+            credential_route_id=route.credential_route_id or None,
+        )
     except BridgeError:
         # Boolean presence flags only; this response never contains credential values.
         return {"webhook_url": False, "hmac_signing_secret": False, "multica_pat": False}  # nosec B105
@@ -194,18 +201,18 @@ def _route_status(registry: ConnectionRegistry, route: RegistryRoute) -> dict[st
             readiness.append("multica_origin")
         if not workspace.workspace_id:
             readiness.append("workspace_id")
-        if not route.project_id:
+        if not route.default_project_id:
             readiness.append("project_id")
         if not route.source_platforms or not route.allowed_user_ids or not route.allowed_chat_ids:
             readiness.append("source_policy")
         if not route.allowed_statuses:
             readiness.append("allowed_statuses")
-        if not route.watcher_enabled:
+        if route.wake_mode == "legacy_watcher" and not route.watcher_enabled:
             readiness.append("watcher_disabled")
         if not secrets["multica_pat"]:
             readiness.append("multica_pat")
         watcher_ready = False
-        if route.watcher_enabled:
+        if route.wake_mode == "legacy_watcher" and route.watcher_enabled:
             try:
                 from bridge.watcher_ipc import WatcherIpcClient
                 watcher_ready = WatcherIpcClient().readiness().get("ready") is True
@@ -213,6 +220,38 @@ def _route_status(registry: ConnectionRegistry, route: RegistryRoute) -> dict[st
                 watcher_ready = False
             if not watcher_ready:
                 readiness.append("watcher_unavailable")
+        wake_readiness = None
+        wake_ready = None
+        if route.wake_mode == "completion":
+            project_ids = route.project_ids if route.project_selection == "allowlist" else (route.default_project_id,)
+            workspace_id = workspace.workspace_id
+            try:
+                wake_readiness = []
+                if project_ids:
+                    client = NotifyReadinessClient()
+                    for offset in range(0, len(project_ids), MAX_PROJECTS):
+                        batch = project_ids[offset:offset + MAX_PROJECTS]
+                        wake_readiness.extend(client.check(
+                            route.created_by_profile or "default",
+                            [{"workspace_id": workspace_id, "project_id": project_id} for project_id in batch],
+                        ))
+                wake_ready = bool(wake_readiness) and all(item["wake_ready"] for item in wake_readiness)
+                if route.project_selection == "all_workspace":
+                    wake_ready = False
+            except BridgeError:
+                wake_readiness = [{"project_id": project_id, "wake_ready": False,
+                                   "reason": "source_unavailable", "wake_route_id": None}
+                                  for project_id in project_ids]
+                wake_ready = False
+                readiness.append("wake_readiness_unavailable")
+            if wake_readiness is None:
+                readiness.append("wake_readiness_unavailable")
+            else:
+                for project in wake_readiness:
+                    if not project["wake_ready"]:
+                        readiness.append(
+                            f"wake_not_ready:{project['project_id']}:{project['reason']}"
+                        )
         return {
             "route_id": route.route_id,
             "route_type": route.route_type,
@@ -222,6 +261,16 @@ def _route_status(registry: ConnectionRegistry, route: RegistryRoute) -> dict[st
             "tombstoned": route.tombstoned,
             "security_mode": effective_config.security_mode,
             "project_id": route.project_id,
+            "scope_kind": route.scope_kind,
+            "project_selection": route.project_selection,
+            "project_ids": list(route.project_ids),
+            "default_project_id": route.default_project_id,
+            "squad_id": route.squad_id or None,
+            "allowed_thread_ids": list(route.allowed_thread_ids),
+            "wake_mode": route.wake_mode,
+            "wake_ready": wake_ready,
+            "projects_readiness": wake_readiness,
+            "dynamic_status": route.dynamic_status or None,
             "assignees": [
                 {
                     "id": item.id,
@@ -287,6 +336,14 @@ def _destination(registry: ConnectionRegistry, route: RegistryRoute) -> tuple[st
         route.event,
         route.route_type,
         route.project_id,
+        route.scope_kind,
+        route.project_selection,
+        route.project_ids,
+        route.default_project_id,
+        route.squad_id,
+        route.allowed_thread_ids,
+        route.wake_mode,
+        route.watcher_enabled,
     )
 
 
@@ -338,7 +395,19 @@ def _guard_registry_update(
 def status() -> dict[str, Any]:
     try:
         raw = _effective_registry(_fields())
-        registry = registry_from_mapping(raw)
+        dynamic_store_path = _storage_path().parent / "dynamic-routes.sqlite3"
+        try:
+            store_info = dynamic_store_path.lstat()
+        except FileNotFoundError:
+            dynamic_rows = []
+        except OSError as exc:
+            raise BridgeError("dynamic_route_state_unavailable", "Dynamic routes could not be inspected.") from exc
+        else:
+            if not stat.S_ISREG(store_info.st_mode):
+                raise BridgeError("dynamic_route_state_untrusted", "Dynamic route storage has an unsafe file type.")
+            route_store = DynamicRouteStore(dynamic_store_path)
+            dynamic_rows = route_store.list_all()
+        registry, dynamic_rows = registry_with_dynamic_routes(raw, dynamic_rows)
     except BridgeError as exc:
         return {"ok": False, "configured": False, "error_code": exc.code, "message": exc.message}
     routes = [_route_status(registry, route) for route in registry.routes]
@@ -352,6 +421,7 @@ def status() -> dict[str, Any]:
             "connections": len(registry.connections),
             "workspaces": len(registry.workspaces),
             "routes": len(registry.routes),
+            "dynamic_routes": len(dynamic_rows),
         },
     }
 
@@ -359,6 +429,32 @@ def status() -> dict[str, Any]:
 @router.get("/new-id")
 def allocate_id() -> dict[str, str]:
     return {"id": new_id()}
+
+
+def _dynamic_route_valid_for_registry(raw: dict[str, Any], route: dict[str, Any]) -> bool:
+    _registry, accepted = registry_with_dynamic_routes(raw, [route])
+    return any(item.get("route_id") == route.get("route_id") for item in accepted)
+
+
+def _guard_dynamic_route_grant_edits(old_raw: dict[str, Any], new_raw: dict[str, Any]) -> None:
+    if not old_raw.get("route_grants") and not new_raw.get("route_grants"):
+        return
+    dynamic_store_path = _storage_path().parent / "dynamic-routes.sqlite3"
+    try:
+        info = dynamic_store_path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise BridgeError("dynamic_route_state_unavailable", "Dynamic routes could not be inspected.") from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise BridgeError("dynamic_route_state_untrusted", "Dynamic route storage has an unsafe file type.")
+    for route in DynamicRouteStore(dynamic_store_path).list_all():
+        if (_dynamic_route_valid_for_registry(old_raw, route)
+                and not _dynamic_route_valid_for_registry(new_raw, route)):
+            raise BridgeError(
+                "dynamic_route_grant_in_use",
+                "Revoke or update the affected dynamic route before narrowing or removing its grant.",
+            )
 
 
 @router.put("/registry")
@@ -375,6 +471,7 @@ def update_registry(payload: Annotated[dict[str, Any], Body(...)]) -> dict[str, 
         with _REGISTRY_UPDATE_LOCK:
             current_raw = _effective_registry(_fields())
             old_registry = registry_from_mapping(current_raw)
+            _guard_dynamic_route_grant_edits(current_raw, raw)
             used_route_ids = _used_route_ids()
             locked_route_ids = _guard_registry_update(
                 old_registry,
@@ -424,6 +521,68 @@ def update_registry(payload: Annotated[dict[str, Any], Body(...)]) -> dict[str, 
         detail = exc.message if isinstance(exc, BridgeError) else str(exc)
         raise HTTPException(status_code=400, detail=detail) from exc
     return {"ok": True, "written": written, "registry": normalized}
+
+
+def _review_dynamic_route(route_id: str, *, approve: bool) -> dict[str, Any]:
+    try:
+        raw = _effective_registry(_fields())
+        static_registry = registry_from_mapping(raw)
+        store = DynamicRouteStore(_storage_path().parent / "dynamic-routes.sqlite3")
+        dynamic = store.get(route_id)
+        profile = dynamic["created_by_profile"]
+        if not isinstance(profile, str) or not profile or len(profile) > 128:
+            raise BridgeError("route_grant_denied", "The dynamic route profile is invalid.")
+        if not approve:
+            if dynamic["dynamic_status"] == "revoked":
+                return {"ok": True, "route_id": route_id, "status": "revoked", "changed": False}
+            store.set_status(route_id, profile, "revoked")
+            return {"ok": True, "route_id": route_id, "status": "revoked", "changed": True}
+
+        grant = static_registry.route_grant(dynamic["grant_id"])
+        if profile != grant.profile or dynamic["connection_id"] != grant.connection_id:
+            raise BridgeError("route_grant_denied", "The dynamic route no longer matches its operator grant.")
+        if not grant.active:
+            raise BridgeError("route_grant_expired", "The operator grant is expired or disabled.")
+        if dynamic["dynamic_status"] == "revoked":
+            raise BridgeError("route_immutable", "A revoked dynamic route cannot be approved.")
+        anchor = static_registry.route(grant.credential_route_id)
+        if anchor.dynamic_status or anchor.tombstoned:
+            raise BridgeError("credential_unavailable", "The dynamic route credential anchor is unavailable.")
+        if dynamic["dynamic_status"] == "active":
+            return {"ok": True, "route_id": route_id, "status": "active", "changed": False}
+        complete, _accepted_routes = registry_with_dynamic_routes(raw, store.list(profile))
+        reviewed = complete.route(route_id)
+        if not _route_secret_presence(anchor)["multica_pat"]:
+            raise BridgeError("credential_unavailable", "The operator credential anchor has no Multica PAT.")
+        connection = static_registry.connection(anchor.connection_id)
+        workspace = static_registry.workspace(anchor.workspace_key)
+        secrets = standard_route_secrets(anchor, require_webhook=False)
+        if not secrets.multica_pat:
+            raise BridgeError("credential_unavailable", "The operator credential anchor has no Multica PAT.")
+        api = WorkspaceApiClient(connection.multica_origin, secrets.multica_pat, workspace.workspace_id,
+                                 timeout=connection.request_timeout_seconds)
+        projects = reviewed.project_ids if reviewed.project_selection == "allowlist" else (reviewed.default_project_id,)
+        for project_id in projects:
+            project = api.get_project(project_id)
+            if project.get("workspace_id") != workspace.workspace_id:
+                raise BridgeError("route_project_not_allowed", "A selected project is outside the granted workspace.")
+        status = "active"
+        store.set_status(route_id, profile, status)
+        return {"ok": True, "route_id": route_id, "status": status, "changed": True}
+    except (BridgeError, HTTPException) as exc:
+        if isinstance(exc, HTTPException):
+            raise
+        raise HTTPException(status_code=400, detail=exc.message) from exc
+
+
+@router.post("/dynamic-routes/{route_id}/approve")
+def approve_dynamic_route(route_id: str) -> dict[str, Any]:
+    return _review_dynamic_route(route_id, approve=True)
+
+
+@router.post("/dynamic-routes/{route_id}/reject")
+def reject_dynamic_route(route_id: str) -> dict[str, Any]:
+    return _review_dynamic_route(route_id, approve=False)
 
 
 @router.get("/isolated-instructions")

@@ -7,6 +7,7 @@ import copy
 import io
 import sys
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -101,6 +102,43 @@ def test_reload_rejects_restart_only_delivery_settings(ctx, field, value):
             await service.reload()
         assert service.config is old
         assert not service.collectors
+
+    asyncio.run(check())
+
+
+def test_invalid_readiness_policy_keeps_reload_projection_and_ipc_unchanged(ctx):
+    async def check():
+        socket_path = "/run/hermes-multica-notify-readiness/readiness.sock"
+        raw = copy.deepcopy(ctx.raw)
+        raw["wake"] = {
+            "enabled": True,
+            "routes": {"canary": {"profile": "default", "route": "canary-wake"}},
+        }
+        raw["readiness_ipc"] = {
+            "enabled": True,
+            "socket_path": socket_path,
+            "peers": [{"uid": 1000, "profiles": ["default"]}],
+        }
+        candidate = parse_config(raw)
+        projection_calls = []
+        state = SimpleNamespace(
+            project=lambda config: projection_calls.append(("project", config)),
+            project_wake_routes=lambda routes: projection_calls.append(("wake", routes)),
+        )
+        ipc = SimpleNamespace(path=Path(socket_path), config=ctx.config, _policy={("default", "old"): {}})
+        service = Service.__new__(Service)
+        service.path, service.config, service.state = ctx.root / "notify.toml", ctx.config, state
+        service.readiness_ipc, service.locks, service.collectors = ipc, {}, []
+        old_config = service.config
+        with patch("notify.service.load_config", return_value=candidate), patch(
+            "notify.service.load_webhook_policy", side_effect=NotifyError("wake_webhook_policy_invalid")
+        ):
+            await service.reload()
+        assert service.config is old_config
+        assert service.readiness_ipc is ipc
+        assert ipc.config is ctx.config
+        assert ipc._policy == {("default", "old"): {}}
+        assert projection_calls == []
 
     asyncio.run(check())
 

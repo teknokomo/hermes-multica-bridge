@@ -1,8 +1,8 @@
 name: hermes-multica-bridge
-version: "0.5.0"
+version: "0.6.0"
 manifest_version: 2
 requires_hermes: ">=0.22.4"
-description: "Bridge between Hermes and Multica: Kanban Autopilot routes and MAX/Telegram workspace routes with a separate delivery watcher."
+description: "Bridge between Hermes and Multica with scoped Workspace routes, operator grants, and completion-only wake readiness."
 author: Universo
 license: "LicenseRef-Omsk-Open-License-Basic-Attribution"
 kind: standalone
@@ -16,6 +16,7 @@ provides_tools:
   - multica_workspace_get
   - multica_workspace_comment
   - multica_workspace_update
+  - multica_route_create
 tags:
   - multica
   - kanban
@@ -30,3 +31,4 @@ config_schema:
       workspaces: []
       routes: []
       operator_grants: []
+      route_grants: []

@@ -46,3 +46,8 @@ max_attempts = 1
 profile = "default"
 route = "replace-route"
 test = true
+
+[readiness_ipc]
+enabled = false
+socket_path = "/run/hermes-multica-notify-readiness/readiness.sock"
+peers = []

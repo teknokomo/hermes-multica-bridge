@@ -17,6 +17,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from bridge.notify_contract import READINESS_PROFILES, READINESS_SOCKET_PATH
+
+PROFILE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+
 
 class NotifyError(Exception):
     def __init__(self, code: str):
@@ -122,6 +126,7 @@ class Config:
     workspaces: dict[str, dict[str, Any]]
     workspace_errors: dict[str, str] = field(default_factory=dict)
     wake: dict[str, Any] = field(default_factory=dict)
+    readiness_ipc: dict[str, Any] = field(default_factory=dict)
 
 
 DEFAULTS = {
@@ -156,12 +161,17 @@ WAKE_DEFAULTS = {
     "request_timeout_seconds": 10,
     "max_attempts": 1,
 }
+READINESS_IPC_DEFAULTS = {
+    "enabled": False,
+    "socket_path": READINESS_SOCKET_PATH,
+    "peers": [],
+}
 
 
 def parse_config(raw: Any) -> Config:
     require(
         isinstance(raw, dict)
-        and not set(raw) - {"service", "policy", "accounts", "workspaces", "wake"}
+        and not set(raw) - {"service", "policy", "accounts", "workspaces", "wake", "readiness_ipc"}
     )
     service_raw, policy_raw = raw.get("service", {}), raw.get("policy", {})
     require(isinstance(service_raw, dict) and not set(service_raw) - set(DEFAULTS))
@@ -268,6 +278,41 @@ def parse_config(raw: Any) -> Config:
         }
     require(not wake["enabled"] or bool(routes), "wake_config_invalid")
     wake["routes"] = routes
+    ipc_raw = raw.get("readiness_ipc", {})
+    require(
+        isinstance(ipc_raw, dict)
+        and not set(ipc_raw) - set(READINESS_IPC_DEFAULTS),
+        "notify_config_invalid",
+    )
+    readiness_ipc = READINESS_IPC_DEFAULTS | ipc_raw
+    require(type(readiness_ipc["enabled"]) is bool, "notify_config_invalid")
+    socket_path = readiness_ipc["socket_path"]
+    require(
+        isinstance(socket_path, str) and socket_path == READINESS_SOCKET_PATH,
+        "notify_config_invalid",
+    )
+    peers = readiness_ipc["peers"]
+    require(isinstance(peers, list) and len(peers) <= 64, "notify_config_invalid")
+    normalized_peers = []
+    seen_uids = set()
+    for peer in peers:
+        require(
+            isinstance(peer, dict)
+            and set(peer) == {"uid", "profiles"}
+            and type(peer["uid"]) is int
+            and 1 <= peer["uid"] <= 2**31 - 1
+            and peer["uid"] not in seen_uids
+            and isinstance(peer["profiles"], list)
+            and 1 <= len(peer["profiles"]) <= 8
+            and all(isinstance(p, str) and p in READINESS_PROFILES for p in peer["profiles"])
+            and len(set(peer["profiles"])) == len(peer["profiles"]),
+            "notify_config_invalid",
+        )
+        seen_uids.add(peer["uid"])
+        normalized_peers.append({"uid": peer["uid"], "profiles": tuple(peer["profiles"])})
+    readiness_ipc["peers"] = tuple(normalized_peers)
+    require(not readiness_ipc["enabled"] or bool(normalized_peers), "notify_config_invalid")
+    require(not readiness_ipc["enabled"] or wake["enabled"], "notify_config_invalid")
     require(
         type(policy["lookback_minutes"]) is int
         and 0 <= policy["lookback_minutes"] <= 1440
@@ -341,7 +386,7 @@ def parse_config(raw: Any) -> Config:
         require(pair not in pairs)
         pairs.add(pair)
         valid_workspaces[key] = dict(row, origin=origin)
-    return Config(service, policy, accounts, valid_workspaces, errors, wake)
+    return Config(service, policy, accounts, valid_workspaces, errors, wake, readiness_ipc)
 
 
 def load_config(path: Path) -> Config:

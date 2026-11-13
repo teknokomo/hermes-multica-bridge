@@ -1,5 +1,5 @@
 export function emptyRegistry() {
-  return { connections: [], workspaces: [], routes: [], operator_grants: [] }
+  return { connections: [], workspaces: [], routes: [], operator_grants: [], route_grants: [] }
 }
 
 export function cloneRegistry(value) {
@@ -18,8 +18,27 @@ export function routeStatus(status, routeId) {
   return (status?.routes || []).find(item => item.route_id === routeId) || null
 }
 
+export function parseRouteGrantsDraft(value) {
+  try {
+    const parsed = JSON.parse(value)
+    return Array.isArray(parsed) ? { valid: true, value: parsed } : { valid: false, value: null }
+  } catch {
+    return { valid: false, value: null }
+  }
+}
+
+export function projectSelectionOptions(route) {
+  const options = [{ value: 'allowlist', label: 'Явный allowlist' }]
+  if (route?.route_type === 'workspace' && route?.dynamic_status) {
+    options.push({ value: 'all_workspace', label: 'Все проекты по grant' })
+  }
+  return options
+}
+
 const ROUTE_DESTINATION_FIELDS = new Set([
-  'connection_id', 'workspace_key', 'route_type', 'project_id', 'autopilot_id', 'trigger_id', 'event'
+  'connection_id', 'workspace_key', 'route_type', 'project_id', 'project_ids',
+  'project_selection', 'default_project_id', 'scope_kind', 'squad_id', 'autopilot_id',
+  'allowed_thread_ids', 'wake_mode', 'watcher_enabled', 'trigger_id', 'event'
 ])
 
 export function routeDestinationFieldLocked(route, field) {
@@ -86,6 +105,14 @@ export function mergeServerRouteLocks(currentRegistry, serverRegistry) {
       workspace_key: persisted.workspace_key,
       route_type: persisted.route_type,
       project_id: persisted.project_id,
+      project_ids: persisted.project_ids,
+      project_selection: persisted.project_selection,
+      default_project_id: persisted.default_project_id,
+      scope_kind: persisted.scope_kind,
+      squad_id: persisted.squad_id,
+      allowed_thread_ids: persisted.allowed_thread_ids,
+      wake_mode: persisted.wake_mode,
+      watcher_enabled: persisted.watcher_enabled,
       autopilot_id: persisted.autopilot_id,
       trigger_id: persisted.trigger_id,
       event: persisted.event,
@@ -171,6 +198,13 @@ export function newRoute(routeId, connectionId, workspaceKey) {
     name: 'Новый маршрут',
     route_type: 'autopilot',
     project_id: '',
+    scope_kind: 'project',
+    project_selection: 'allowlist',
+    project_ids: [],
+    default_project_id: '',
+    squad_id: '',
+    allowed_thread_ids: [],
+    wake_mode: 'legacy_watcher',
     autopilot_id: '',
     trigger_id: '',
     event: 'hermes.task.dispatched',
