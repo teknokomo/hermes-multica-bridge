@@ -673,6 +673,8 @@ class State:
                 and row["workspace_enabled"] == 1,
                 "wake_route_unavailable",
             )
+            if row["enabled"]:
+                return
             db.execute(
                 "UPDATE wake_jobs SET status='cancelled',last_error='wake_reenabled',updated_at=? WHERE subscription_id=? AND status='pending'",
                 (now, subscription_id),
@@ -958,6 +960,21 @@ class State:
             ).fetchone()
             if not row or not row["enabled"]:
                 return None
+            wake_registered = db.execute(
+                "SELECT 1 FROM wake_subscriptions WHERE subscription_id=?",
+                (row["subscription_id"],),
+            ).fetchone()
+            if wake_registered:
+                # A live attempt may finish, but neither retries nor lease takeovers
+                # may restart ordinary delivery after the wake cutover.
+                if row["status"] in {"pending", "retry"} or (
+                    row["status"] == "sending" and (row["lease_until"] or 0) <= now
+                ):
+                    db.execute(
+                        "UPDATE notifications SET status='cancelled',last_error='wake_subscription_registered',updated_at=? WHERE id=?",
+                        (now, nid),
+                    )
+                return None
             if (
                 row["status"] == "sending"
                 and row["last_error"] == "subscription_disabled"
@@ -1034,6 +1051,11 @@ class State:
                 status, payload = "delivered", None
             elif not row["enabled"] or row["last_error"] == "subscription_disabled":
                 status, detail = "cancelled", "subscription_disabled"
+            elif db.execute(
+                "SELECT 1 FROM wake_subscriptions WHERE subscription_id=?",
+                (row["subscription_id"],),
+            ).fetchone():
+                status, detail = "cancelled", "wake_subscription_registered"
             elif outcome == "anchor" and not fallback and row["attempts"] < maximum:
                 status, fallback = "retry", 1
                 body = json.loads(payload)

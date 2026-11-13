@@ -7,6 +7,8 @@ import hmac
 import http.client
 import json
 import re
+import socket
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -372,7 +374,29 @@ class WakeSender:
         connection = http.client.HTTPConnection(
             self.host, self.port, timeout=self.timeout
         )
+        deadline = time.monotonic() + self.timeout
+        timer = None
+        response = None
+        expired = threading.Event()
         try:
+            connection.connect()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return WakeResult("delivery_unknown", "wake_transport_uncertain")
+            transport = connection.sock
+
+            def interrupt():
+                expired.set()
+                try:
+                    transport.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+            # Interrupt headers and body reads even if a peer keeps trickling
+            # bytes. Keep this socket reference when HTTPConnection detaches it.
+            timer = threading.Timer(remaining, interrupt)
+            timer.daemon = True
+            timer.start()
             connection.request(
                 "POST",
                 path,
@@ -387,8 +411,17 @@ class WakeSender:
             )
             response = connection.getresponse()
             body = response.read(MAX_RESPONSE_BYTES + 1)
+            if expired.is_set() or time.monotonic() >= deadline:
+                return WakeResult("delivery_unknown", "wake_transport_uncertain")
+            if response.length not in (None, 0):
+                return WakeResult("delivery_unknown", "wake_response_incomplete")
             return classify_admission(response.status, body)
         except (OSError, TimeoutError, http.client.HTTPException):
             return WakeResult("delivery_unknown", "wake_transport_uncertain")
         finally:
+            if timer is not None:
+                timer.cancel()
+                timer.join()
+            if response is not None:
+                response.close()
             connection.close()

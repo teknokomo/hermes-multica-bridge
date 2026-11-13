@@ -2,6 +2,7 @@
 
 ## 0.5.0
 
+- Исправлены идемпотентность wake enable, остановка ожидающих workers, запрет обычных retry после wake-регистрации, выбор CLI alias и точность doctor; webhook transport проверяет полноту ответа и ограничивает общую длительность запроса.
 - Added completion wake jobs for newly observed transitions to `done`, with immutable read-only snapshots and one HMAC V2 request to a profile-scoped loopback Hermes webhook.
 - Added additive notify database migration, wake subscriptions/receipts, exact destination validation through a protected webhook policy export, and suppression of regular notifications for registered wake subscriptions.
 - Classified webhook admission using both HTTP status and response JSON; `ignored` is terminal, `duplicate` is accepted, and uncertain transport outcomes require operator-confirmed replay.

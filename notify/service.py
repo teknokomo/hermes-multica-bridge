@@ -399,6 +399,8 @@ class Service:
         claim = None
         try:
             async with self.wake_slots:
+                if self.stop.is_set():
+                    return
                 config = self.config
                 if not config.wake.get("enabled", False):
                     return
@@ -430,6 +432,8 @@ class Service:
                         self.state.wake_defer_unclaimed, row["id"], exc.code
                     )
                     log("wake_credential_unavailable")
+                    return
+                if self.stop.is_set():
                     return
                 claim = await blocking(
                     self.state.wake_claim,

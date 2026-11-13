@@ -6,7 +6,9 @@ import asyncio
 import hashlib
 import hmac
 import json
+import socket
 import sqlite3
+import threading
 import time
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -14,7 +16,7 @@ from unittest.mock import patch
 
 import pytest
 
-from notify.cli import execute
+from notify.cli import execute, execute_wake
 from notify.config import NotifyError, parse_config
 from notify.service import Service
 from notify.state import INDEXES_V1, SCHEMA, State
@@ -235,14 +237,22 @@ def test_wake_sender_signs_exact_bytes_and_uses_fixed_route():
 
     class Response:
         status = 200
+        length = 0
 
         def read(self, count):
             return b'{"status":"accepted"}'
+
+        def close(self):
+            pass
 
     class Connection:
         def __init__(self, host, port, timeout):
             assert host == "127.0.0.1" and port == 8644 and timeout == 3
             self.status = 200
+            self.sock = SimpleNamespace(shutdown=lambda _how: None)
+
+        def connect(self):
+            pass
 
         def request(self, method, path, *, body, headers):
             assert (method, path) == ("POST", "/p/om73/webhooks/test-route")
@@ -624,6 +634,7 @@ def test_service_sends_one_admitted_wake_and_clears_its_payload(ctx, monkeypatch
         state=ctx.state,
         wake_slots=asyncio.Semaphore(1),
         wake_scheduled={row["id"]},
+        stop=asyncio.Event(),
     )
     asyncio.run(Service.deliver_wake(service, row))
     saved = ctx.state.rows("SELECT status,attempts,payload_json FROM wake_jobs")[0]
@@ -649,3 +660,160 @@ def test_expired_sending_becomes_unknown_without_automatic_retry(ctx):
     assert ctx.state.wake_expire(time.time()) == 1
     assert ctx.state.rows("SELECT status FROM wake_jobs")[0]["status"] == "delivery_unknown"
     assert not ctx.state.wake_due(time.time())
+
+
+@pytest.mark.parametrize("argument,expected", [("a", "b"), ("b", "a"), ("actual", "actual")])
+def test_wake_add_prefers_exact_alias_over_another_route_name(ctx, monkeypatch, argument, expected):
+    routes = {key: {"profile": "default", "route": value} for key, value in
+              (("a", "b"), ("b", "a"), ("alias", "actual"))}
+    ctx.config = parse_config(ctx.raw | {"wake": {"routes": routes}})
+    sid = add(ctx, chat_type="thread", thread_id="999", project_id=PROJECT)
+    policy = {("default", expected): WEBHOOK_POLICY[("default", "default-test")]}
+    monkeypatch.setattr("notify.cli.load_webhook_policy", lambda _path: policy)
+    execute_wake(SimpleNamespace(action="add", route=argument, profile="default",
+                                 subscription=sid, enabled=False), ctx.config, ctx.state)
+    assert ctx.state.wake_binding(sid)["route"] == expected
+
+
+def test_doctor_does_not_claim_verification_when_global_wake_disabled(ctx, monkeypatch, capsys):
+    configure_wake(ctx)
+    ctx.config = parse_config(ctx.raw | {"wake": {"enabled": False}})
+    monkeypatch.setattr("notify.cli.load_config", lambda _path: ctx.config)
+    execute(SimpleNamespace(command="doctor", config=ctx.root / "unused.toml", offline=True))
+    result = json.loads(capsys.readouterr().out)
+    assert result["wake"]["active"] == 1
+    assert result["wake"]["verified_routes"] == 0
+
+
+def test_wake_enable_is_idempotent_and_preserves_pending_completions(ctx):
+    sid = configure_wake(ctx)
+    create_done(ctx)
+    jobs = ctx.state.rows("SELECT * FROM wake_jobs")
+    before = ctx.state.wake_binding(sid)
+    ctx.state.set_wake_enabled(sid, True, ctx.config.wake["routes"], now=time.time() + 100)
+    assert ctx.state.rows("SELECT * FROM wake_jobs") == jobs
+    assert ctx.state.wake_binding(sid) == before
+
+
+@pytest.mark.parametrize("outcome,expected", [("retry", "cancelled"), ("delivered", "delivered")])
+def test_wake_cutover_allows_current_regular_result_but_never_another_claim(ctx, outcome, expected):
+    sid = add(ctx, chat_type="thread", thread_id="999", project_id=PROJECT)
+    run(ctx, comments=[comment(ctx)])
+    nid = ctx.state.rows("SELECT id FROM notifications")[0]["id"]
+    claim = ctx.state.claim(nid, time.time(), 10, 1)
+    assert claim
+    ctx.state.add_wake_subscription(sid, ROUTE["default-test"])
+    assert ctx.state.rows("SELECT status FROM notifications")[0]["status"] == "sending"
+    assert ctx.state.claim(nid, time.time(), 10, 1) is None
+    assert ctx.state.finish(claim, outcome, "test", 10)
+    assert ctx.state.rows("SELECT status FROM notifications")[0]["status"] == expected
+    # An already persisted retry (for example from the previous binary) is also refused.
+    with ctx.state.transaction() as db:
+        db.execute("UPDATE notifications SET status='retry',payload_json=? WHERE id=?",
+                   (claim["payload_json"], nid))
+    assert ctx.state.claim(nid, time.time() + 100, 10, 1) is None
+    assert ctx.state.rows("SELECT status FROM notifications")[0]["status"] == "cancelled"
+
+
+def test_expired_regular_claim_is_cancelled_without_takeover_after_wake_registration(ctx):
+    sid = add(ctx, chat_type="thread", thread_id="999", project_id=PROJECT)
+    run(ctx, comments=[comment(ctx)])
+    nid = ctx.state.rows("SELECT id FROM notifications")[0]["id"]
+    assert ctx.state.claim(nid, time.time(), 10, 1)
+    ctx.state.add_wake_subscription(sid, ROUTE["default-test"])
+    assert ctx.state.claim(nid, time.time() + 100, 10, 1) is None
+    saved = ctx.state.rows("SELECT status,attempts FROM notifications")[0]
+    assert (saved["status"], saved["attempts"]) == ("cancelled", 1)
+
+
+@pytest.mark.parametrize("stop_at", ["semaphore", "policy"])
+def test_shutdown_leaves_unclaimed_wake_pending(ctx, monkeypatch, stop_at):
+    configure_wake(ctx)
+    create_done(ctx)
+    row = ctx.state.wake_due(time.time())[0]
+
+    async def scenario():
+        service = SimpleNamespace(config=ctx.config, state=ctx.state,
+                                  wake_slots=asyncio.Semaphore(0 if stop_at == "semaphore" else 1),
+                                  stop=asyncio.Event(), wake_scheduled={row["id"]})
+
+        def policy(_path):
+            if stop_at == "policy":
+                service.stop.set()
+            return WEBHOOK_POLICY
+
+        monkeypatch.setattr("notify.service.load_webhook_policy", policy)
+        monkeypatch.setattr("notify.service.credential", lambda _name: "fake-secret")
+        task = asyncio.create_task(Service.deliver_wake(service, row))
+        if stop_at == "semaphore":
+            await asyncio.sleep(0)
+            service.stop.set()
+            service.wake_slots.release()
+        await task
+        assert not service.wake_scheduled
+
+    asyncio.run(scenario())
+    saved = ctx.state.rows("SELECT status,attempts FROM wake_jobs")[0]
+    assert (saved["status"], saved["attempts"]) == ("pending", 0)
+
+
+@pytest.mark.parametrize("response_kind", ["short", "complete", "slow_headers", "slow_body"])
+def test_wake_transport_requires_complete_response_within_absolute_deadline(response_kind):
+    body = b'{"status":"accepted","padding":"' + b'x' * 100 + b'"}'
+    halted = threading.Event()
+    errors = []
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(2)
+        port = listener.getsockname()[1]
+
+        def serve():
+            try:
+                with listener.accept()[0] as peer:
+                    peer.settimeout(2)
+                    request = b""
+                    while b"\r\n\r\n" not in request:
+                        request += peer.recv(4096)
+                    head, _, received_body = request.partition(b"\r\n\r\n")
+                    content_length = next(int(line.split(b":", 1)[1]) for line in head.split(b"\r\n")
+                                          if line.lower().startswith(b"content-length:"))
+                    while len(received_body) < content_length:
+                        received_body += peer.recv(4096)
+                    length = len(body) + 100 if response_kind == "short" else len(body)
+                    headers = f"HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n".encode()
+                    if response_kind == "slow_headers":
+                        data = headers + body
+                    else:
+                        peer.sendall(headers)
+                        data = body
+                    if response_kind.startswith("slow"):
+                        for byte in data:
+                            if halted.wait(0.04):
+                                break
+                            peer.sendall(bytes([byte]))
+                    else:
+                        peer.sendall(data)
+            except OSError:
+                # The deadline deliberately shuts down the peer connection.
+                if not response_kind.startswith("slow"):
+                    errors.append("server_socket_error")
+
+        worker = threading.Thread(target=serve, daemon=True)
+        worker.start()
+        started = time.monotonic()
+        try:
+            result = WakeSender(f"http://127.0.0.1:{port}", timeout=0.25).send(
+                b'{}', profile="default", route="test-route",
+                wake_id="6b2d7c11-90bd-4e2d-a9ce-48079b92ff53", secret="fake-secret")
+        finally:
+            elapsed = time.monotonic() - started
+            halted.set()
+            worker.join(2)
+        assert not worker.is_alive()
+        assert not errors
+    assert result.status == ("sent" if response_kind == "complete" else "delivery_unknown")
+    if response_kind == "short":
+        assert result.error_code == "wake_response_incomplete"
+    if response_kind.startswith("slow"):
+        assert elapsed < 1.5

@@ -122,11 +122,11 @@ def resolve_subscription(state: State, value: str) -> str:
 
 def execute_wake(args, config, state: State) -> None:
     if args.action == "add":
-        routes = [
-            row
-            for key, row in config.wake.get("routes", {}).items()
-            if args.route in {key, row["route"]}
-        ]
+        configured = config.wake.get("routes", {})
+        routes = (
+            [configured[args.route]] if args.route in configured else
+            [row for row in configured.values() if row["route"] == args.route]
+        )
         require(len(routes) == 1, "wake_route_unavailable")
         route = routes[0]
         require(route["profile"] == args.profile, "wake_route_profile_mismatch")
@@ -302,6 +302,7 @@ def execute(args) -> None:
                     Multica(config, key).check_cli()
             wake_rows = state.wake_subscriptions()
             active_wake = [row for row in wake_rows if row["enabled"]]
+            verified_routes = 0
             if config.wake.get("enabled", False):
                 webhook_policy = load_webhook_policy(
                     Path(config.wake["webhook_policy_file"])
@@ -319,6 +320,7 @@ def execute(args) -> None:
                         binding["route"],
                         binding,
                     )
+                    verified_routes += 1
                 if not args.offline:
                     credential(config.wake["secret_credential"])
             output(
@@ -329,7 +331,7 @@ def execute(args) -> None:
                         "enabled": bool(config.wake.get("enabled", False)),
                         "registered": len(wake_rows),
                         "active": len(active_wake),
-                        "verified_routes": len(active_wake),
+                        "verified_routes": verified_routes,
                     },
                 }
             )
