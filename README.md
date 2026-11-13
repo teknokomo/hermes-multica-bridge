@@ -5,7 +5,7 @@
 
 ![Teknokomo — 73rd Meridian](docs/assets/teknokomo-om73-en.jpg)
 
-# Important! Grave! Important!
+# Important! Grave! Важно!
 
 -   Workers of the world, unite!
 -   Proletoj el ĉiuj landoj, unuiĝu!
