@@ -31,7 +31,7 @@ Bridge соединяет доверенный контекст Hermes Kanban с
 
 ## Workspace source и операции
 
-- Плагин не регистрирует инструменты с `pass_context` и не принимает source fields в аргументах модели. Для целевой Hermes-сборки он читает текущий turn через `gateway.session_context`: `get_bound_session_env()` подтверждает task-local привязку, а `get_session_env()` должен вернуть те же значения. Несовпадение или неполный контекст означает отказ до Multica write. Это внутренний Hermes API и ограничение совместимости `T38-DEBT-3`; его контракт нужно перепроверять после обновления Hermes.
+- Плагин не регистрирует инструменты с `pass_context` и не принимает source fields в аргументах модели. Для целевой Hermes-сборки он читает текущий turn через `gateway.session_context`: bound-only `get_bound_session_env()` подтверждает task-local привязку и возвращает автора текущего сообщения, включая общие сессии. Legacy `get_session_env(USER_ID)` описывает адресата сессии и не используется для авторизации. Пустой или неполный bound-контекст означает отказ до Multica write; fallback к process env отсутствует. Это внутренний Hermes API и ограничение совместимости `T38-DEBT-3`; его контракт нужно перепроверять после обновления Hermes.
 - Workspace route проверяет платформу и точное членство user/chat IDs в allowlist. Group/channel/thread недоступны без отдельного `allow_groups=true`.
 - Workspace route всегда требует настроенные `workspace_id` и `project_id`; каждый читаемый или изменяемый issue проверяется по обоим ID. Parent issue подзадачи проверяется по той же паре.
 - Assignee и status ограничены route allowlist. Создание подзадачи требует разрешённого человеческого assignee. Инструмент не приглашает пользователей и не изменяет доступ к пространствам.

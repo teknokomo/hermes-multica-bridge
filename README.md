@@ -102,7 +102,7 @@ Each Route has its own write-only `webhook|hmac|pat` credentials. The public `ct
 
 ## Workspace Bridge
 
-A Workspace route is always bound by configuration to one `workspace_id` and a required `project_id`. The tools do not accept `platform`, author, chat, thread, or message ID as model arguments. In the target Hermes build, the plugin reads these fields from the session context bound to the current Gateway turn and compares `get_session_env()` with `get_bound_session_env()` so that stale process environment values are not used. Incomplete or inconsistent context stops the operation before any Multica write request. A route is authorized only when platform, user ID, and chat ID match. Group, channel, and thread access is disabled until an operator explicitly enables it in policy.
+A Workspace route is always bound by configuration to one `workspace_id` and a required `project_id`. The tools do not accept `platform`, author, chat, thread, or message ID as model arguments. In the target Hermes build, the plugin reads these fields from the session context bound to the current Gateway turn through bound-only `get_bound_session_env()` so that stale process environment values are not used. In shared sessions this API returns the current message actor; legacy `get_session_env(USER_ID)` describes the session recipient and is not used for authorization. Incomplete context stops the operation before any Multica write request. A route is authorized only when platform, user ID, and chat ID match. Group, channel, and thread access is disabled until an operator explicitly enables it in policy.
 
 A redacted single-profile template with four disabled Workspace routes and a separate Autopilot example is in [config/registry.om73.example.json](config/registry.om73.example.json). Replace `REPLACE-*` values only in local configuration.
 
@@ -230,7 +230,7 @@ Switching between Standard and Isolated does not transfer secrets automatically.
 
 - Linux with systemd for the watcher and Isolated sender;
 - Python 3.11+;
-- Hermes Agent 0.22.4 or later with `gateway.session_context.get_bound_session_env`, `get_session_env`, and `get_current_attachments` available in the target build; the MAX/Telegram adapter must bind this data to the current turn;
+- Hermes Agent 0.22.4 or later with `gateway.session_context.get_bound_session_env` and `get_current_attachments` available in the target build; the MAX/Telegram adapter must bind this data to the current turn;
 - Linux 6.5+, systemd, unified cgroup v2, `SO_PEERCRED`, and `SO_PEERPIDFD` for Isolated mode only;
 - an HTTPS Multica endpoint;
 - a Multica PAT for Workspace API and the watcher; a read-only PAT for Autopilot result tracking;

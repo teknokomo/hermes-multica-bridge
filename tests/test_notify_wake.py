@@ -14,8 +14,6 @@ from unittest.mock import patch
 
 import pytest
 
-pytest_plugins = ("tests.test_notify",)
-
 from notify.cli import execute
 from notify.config import NotifyError, parse_config
 from notify.service import Service
@@ -31,6 +29,7 @@ from notify.wake import (
     verify_webhook_policy,
 )
 from tests.test_notify import PROJECT, add, comment, issue, run
+from tests.test_notify import ctx as ctx  # noqa: PLC0414 - pytest fixture re-export
 
 ROUTE = {
     "default-test": {"profile": "default", "route": "default-test", "test": True}
