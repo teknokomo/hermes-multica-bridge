@@ -197,9 +197,9 @@ class MulticaApiClient:
                 "Accept": "application/json",
                 "Authorization": f"Bearer {self.pat}",
                 "X-Workspace-ID": self.workspace_id,
-                "User-Agent": "hermes-multica-bridge/0.4.0",
+                "User-Agent": "hermes-multica-bridge/0.5.0",
                 "X-Client-Platform": "daemon",
-                "X-Client-Version": "0.4.0",
+                "X-Client-Version": "0.5.0",
             },
             method="GET",
         )

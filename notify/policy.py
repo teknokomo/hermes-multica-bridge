@@ -7,8 +7,9 @@ import re
 import time
 import uuid
 
-from .config import Config, require
+from .config import Config, NotifyError, require
 from .state import State, encoded, epoch
+from .wake import build_payload
 
 MENTION = re.compile(r"(?<![\w@])@[\w](?:[\w.-]*[\w])?")
 
@@ -134,6 +135,7 @@ def reconcile(
             "assignee_id",
             "labels",
             "title",
+            "description",
         }
     }
     require(
@@ -275,7 +277,7 @@ def reconcile(
             (
                 workspace,
                 issue["id"],
-                encoded(issue),
+                encoded({k: v for k, v in issue.items() if k != "description"}),
                 issue["status"],
                 revision,
                 issue.get("status_entered_at"),
@@ -291,6 +293,10 @@ def reconcile(
                 (baseline_subscription, workspace),
             )
         ]
+        wake_registered = {
+            row[0]
+            for row in db.execute("SELECT subscription_id FROM wake_subscriptions")
+        }
         for key, kind, detail, at in candidates:
             db.execute(
                 "INSERT OR IGNORE INTO events(workspace_id,event_key,event_type,issue_id,created_at) VALUES(?,?,?,?,?)",
@@ -313,7 +319,11 @@ def reconcile(
                 )
                 if not receipt.rowcount:
                     continue
-                if not allowed or baseline_subscription is not None:
+                if (
+                    not allowed
+                    or baseline_subscription is not None
+                    or sub["id"] in wake_registered
+                ):
                     suppressed += 1
                     continue
                 payload = render(sub, issue, kind, detail, link) | {"event_key": key}
@@ -324,6 +334,75 @@ def reconcile(
                     (str(uuid.uuid4()), sub["id"], key, encoded(payload), now, now),
                 )
                 count += 1
+        if (
+            previous is not None
+            and previous["status"] != "done"
+            and issue["status"] == "done"
+            and changed
+            and baseline_subscription is None
+            and config.wake.get("enabled", False)
+        ):
+            wake_rows = db.execute(
+                """SELECT ws.subscription_id,ws.profile,ws.route,ws.enabled,ws.enabled_since,
+                s.* FROM wake_subscriptions ws JOIN subscriptions s ON s.id=ws.subscription_id
+                WHERE ws.enabled=1 AND s.enabled=1 AND s.workspace_id=?""",
+                (workspace,),
+            ).fetchall()
+            route_by_name = {
+                route["route"]: route for route in config.wake.get("routes", {}).values()
+            }
+            for wake_sub in wake_rows:
+                route = route_by_name.get(wake_sub["route"])
+                if (
+                    not route
+                    or route["profile"] != wake_sub["profile"]
+                    or wake_sub["enabled_since"] is None
+                    or issue["_transition_at"] < wake_sub["enabled_since"]
+                    or not matches(dict(wake_sub), issue)
+                ):
+                    continue
+                wake_id = str(uuid.uuid4())
+                status, payload_raw, error_code = "pending", None, ""
+                try:
+                    payload_raw = build_payload(
+                        wake_id=wake_id,
+                        profile=wake_sub["profile"],
+                        subscription=dict(wake_sub),
+                        issue=issue,
+                        comments=comments,
+                        issue_url=link,
+                        workspace_id=config.workspaces[workspace]["workspace_id"],
+                        transition_seq=seq,
+                    ).decode("utf-8")
+                except NotifyError as exc:
+                    if exc.code != "wake_snapshot_insufficient":
+                        raise
+                    status, error_code = "dead", "wake_snapshot_insufficient"
+                inserted = db.execute(
+                    """INSERT OR IGNORE INTO wake_jobs
+                    (id,subscription_id,event_key,issue_id,issue_key,transition_seq,payload_json,
+                    status,attempts,last_error,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?, ?,0,?,?,?)""",
+                    (
+                        wake_id,
+                        wake_sub["subscription_id"],
+                        issue["_transition_key"],
+                        issue["id"],
+                        issue["identifier"],
+                        seq,
+                        payload_raw,
+                        status,
+                        error_code,
+                        now,
+                        now,
+                    ),
+                )
+                if inserted.rowcount:
+                    state._wake_metric(db, "wake_created")
+                    if error_code:
+                        state._wake_metric(db, "wake_snapshot_insufficient")
+                else:
+                    state._wake_metric(db, "wake_duplicate_suppressed")
         if baseline_subscription is not None:
             db.execute(
                 "INSERT OR IGNORE INTO processed_keys VALUES(?,?)",

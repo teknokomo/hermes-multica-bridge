@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import Config, NotifyError, identifier, private_dir, require
+from .wake import verify_webhook_policy
 
 EVENTS = {"question", "blocked", "final", "failed", "cancelled"}
 MAX_PENDING_HINTS_PER_WORKSPACE = 10_000
@@ -50,6 +51,29 @@ SCHEMA = {
         source_history_limited INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '', updated_at REAL NOT NULL""",
     "rate_slots": "key TEXT PRIMARY KEY, next_at REAL NOT NULL",
     "metadata": "key TEXT PRIMARY KEY, value TEXT NOT NULL",
+}
+WAKE_SCHEMA = {
+    "wake_subscriptions": """subscription_id TEXT PRIMARY KEY REFERENCES subscriptions(id),
+        profile TEXT NOT NULL CHECK(profile IN ('default','om73')), route TEXT NOT NULL UNIQUE,
+        statuses_json TEXT NOT NULL, enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+        enabled_since REAL, disabled_reason TEXT NOT NULL DEFAULT '',
+        created_at REAL NOT NULL, updated_at REAL NOT NULL""",
+    "wake_jobs": """id TEXT PRIMARY KEY, subscription_id TEXT NOT NULL REFERENCES wake_subscriptions(subscription_id),
+        event_key TEXT NOT NULL, issue_id TEXT NOT NULL, issue_key TEXT NOT NULL,
+        transition_seq INTEGER NOT NULL, payload_json TEXT,
+        status TEXT NOT NULL CHECK(status IN ('pending','sending','sent','delivery_unknown','dead','cancelled')),
+        attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at REAL, lease_until REAL, lease_token TEXT,
+        last_error TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL, updated_at REAL NOT NULL,
+        UNIQUE(subscription_id,event_key)""",
+}
+INDEXES_V1 = {
+    "due": "CREATE INDEX due ON notifications(status,next_attempt_at)",
+    "subscription_workspace": "CREATE INDEX subscription_workspace ON subscriptions(workspace_id,enabled)",
+    "pending_hint_workspace": "CREATE INDEX pending_hint_workspace ON hints(workspace_id,status)",
+}
+WAKE_INDEXES = {
+    "wake_due": "CREATE INDEX wake_due ON wake_jobs(status,next_attempt_at)",
+    "wake_subscription_created": "CREATE INDEX wake_subscription_created ON wake_jobs(subscription_id,created_at)",
 }
 
 
@@ -214,13 +238,16 @@ class State:
             version = self.db.execute("PRAGMA user_version").fetchone()[0]
             require(
                 (not tables and version == 0 and create)
-                or (tables == set(SCHEMA) and version == 1),
+                or (tables == set(SCHEMA) and version == 1)
+                or (tables == set(SCHEMA) | set(WAKE_SCHEMA) and version == 2),
                 "notify_migration_failed",
             )
             if tables:
+                schema = SCHEMA if version == 1 else SCHEMA | WAKE_SCHEMA
+                expected_indexes = INDEXES_V1 if version == 1 else INDEXES_V1 | WAKE_INDEXES
                 reference = sqlite3.connect(":memory:")
                 try:
-                    for table, columns in SCHEMA.items():
+                    for table, columns in schema.items():
                         reference.execute(f"CREATE TABLE {table} ({columns})")
                         actual = [
                             tuple(r)
@@ -241,6 +268,23 @@ class State:
                             == " ".join(expected_sql.split()),
                             "notify_migration_failed",
                         )
+                    current_indexes = {
+                        row["name"]: row["sql"]
+                        for row in self.db.execute(
+                            "SELECT name,sql FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'"
+                        )
+                    }
+                    require(set(current_indexes) == set(expected_indexes), "notify_migration_failed")
+                    for index, statement in expected_indexes.items():
+                        reference.execute(statement)
+                        reference_sql = reference.execute(
+                            "SELECT sql FROM sqlite_master WHERE name=?", (index,)
+                        ).fetchone()[0]
+                        require(
+                            " ".join(current_indexes[index].split())
+                            == " ".join(reference_sql.split()),
+                            "notify_migration_failed",
+                        )
                 finally:
                     reference.close()
             require(
@@ -250,18 +294,20 @@ class State:
             self.db.execute("PRAGMA foreign_keys=ON")
             if not tables:
                 with self.transaction():
-                    for table, columns in SCHEMA.items():
+                    for table, columns in (SCHEMA | WAKE_SCHEMA).items():
                         self.db.execute(f"CREATE TABLE {table} ({columns})")
-                    self.db.execute(
-                        "CREATE INDEX due ON notifications(status,next_attempt_at)"
-                    )
-                    self.db.execute(
-                        "CREATE INDEX subscription_workspace ON subscriptions(workspace_id,enabled)"
-                    )
-                    self.db.execute(
-                        "CREATE INDEX pending_hint_workspace ON hints(workspace_id,status)"
-                    )
-                    self.db.execute("PRAGMA user_version=1")
+                    for statement in (INDEXES_V1 | WAKE_INDEXES).values():
+                        self.db.execute(statement)
+                    self.db.execute("PRAGMA user_version=2")
+            elif version == 1:
+                # The only accepted upgrade is the exact shipped 0.4.0 schema.
+                # Validate it above, then add wake storage atomically without touching rows.
+                with self.transaction():
+                    for table, columns in WAKE_SCHEMA.items():
+                        self.db.execute(f"CREATE TABLE {table} ({columns})")
+                    for statement in WAKE_INDEXES.values():
+                        self.db.execute(statement)
+                    self.db.execute("PRAGMA user_version=2")
             self.db.execute("PRAGMA journal_mode=WAL")
             os.chmod(path, 0o600)
         except (sqlite3.Error, NotifyError):
@@ -451,6 +497,18 @@ class State:
             (time.time(), sid),
         )
 
+    @staticmethod
+    def _cancel_wake(db, sid: str, reason: str) -> None:
+        now = time.time()
+        db.execute(
+            "UPDATE wake_subscriptions SET enabled=0,disabled_reason=?,updated_at=? WHERE subscription_id=?",
+            (reason, now, sid),
+        )
+        db.execute(
+            "UPDATE wake_jobs SET status='cancelled',last_error=?,updated_at=? WHERE subscription_id=? AND status='pending'",
+            (reason, now, sid),
+        )
+
     def toggle(self, sid: str, enabled: bool) -> None:
         with self.transaction() as db:
             row = db.execute(
@@ -459,6 +517,7 @@ class State:
             require(row is not None, "notify_subscription_invalid")
             if not enabled:
                 self._disable(db, sid, "subscription_disabled")
+                self._cancel_wake(db, sid, "subscription_disabled")
             elif not row["enabled"]:
                 require(
                     db.execute(
@@ -481,6 +540,364 @@ class State:
                     "UPDATE cursors SET last_full=NULL WHERE workspace_id=?",
                     (row["workspace_id"],),
                 )
+
+    def project_wake_routes(self, routes: dict[str, dict]) -> None:
+        by_route = {value["route"]: value for value in routes.values()}
+        with self.transaction() as db:
+            rows = db.execute(
+                """SELECT ws.subscription_id,ws.route,ws.profile,s.enabled AS source_enabled,
+                a.configured AS account_configured,w.configured AS workspace_configured,
+                w.enabled AS workspace_enabled FROM wake_subscriptions ws
+                JOIN subscriptions s ON s.id=ws.subscription_id
+                JOIN accounts a ON a.name=s.account JOIN workspaces w ON w.id=s.workspace_id"""
+            ).fetchall()
+            for row in rows:
+                route = by_route.get(row["route"])
+                reason = ""
+                if route is None:
+                    reason = "wake_route_removed"
+                elif route["profile"] != row["profile"]:
+                    reason = "wake_route_profile_mismatch"
+                elif not row["source_enabled"]:
+                    reason = "subscription_disabled"
+                elif not row["account_configured"] or not row["workspace_configured"] or not row["workspace_enabled"]:
+                    reason = "orphaned_subscription"
+                if reason:
+                    self._cancel_wake(db, row["subscription_id"], reason)
+
+    @staticmethod
+    def _wake_metric(db, key: str, amount: int = 1) -> None:
+        if amount:
+            db.execute(
+                "INSERT INTO metadata(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+excluded.value",
+                ("metric:" + key, str(amount)),
+            )
+
+    def add_wake_subscription(
+        self, subscription_id: str, route_config: dict, *, enabled: bool = False, now: float | None = None
+    ) -> str:
+        now = now or time.time()
+        profile, route = route_config.get("profile"), route_config.get("route")
+        require(profile in {"default", "om73"} and isinstance(route, str), "wake_subscription_invalid")
+        try:
+            with self.transaction() as db:
+                source = db.execute(
+                    """SELECT s.*,a.platform AS account_platform,a.configured AS account_configured,
+                    w.configured AS workspace_configured,w.enabled AS workspace_enabled
+                    FROM subscriptions s JOIN accounts a ON a.name=s.account
+                    JOIN workspaces w ON w.id=s.workspace_id WHERE s.id=?""",
+                    (subscription_id,),
+                ).fetchone()
+                require(source is not None, "wake_subscription_invalid")
+                require(
+                    source["enabled"] == 1
+                    and source["account_configured"] == 1
+                    and source["workspace_configured"] == 1
+                    and source["workspace_enabled"] == 1
+                    and source["project_id"]
+                    and source["platform"] == source["account_platform"],
+                    "wake_subscription_invalid",
+                )
+                require(
+                    (source["platform"] == "telegram" and source["chat_type"] == "thread" and bool(source["thread_id"]))
+                    or (source["platform"] == "max" and source["chat_type"] == "group" and not source["thread_id"]),
+                    "wake_destination_invalid",
+                )
+                existing = db.execute(
+                    "SELECT profile,route,enabled FROM wake_subscriptions WHERE subscription_id=?",
+                    (subscription_id,),
+                ).fetchone()
+                if existing:
+                    require(
+                        existing["profile"] == profile and existing["route"] == route,
+                        "wake_subscription_conflict",
+                    )
+                    if enabled and not existing["enabled"]:
+                        db.execute(
+                            "UPDATE wake_subscriptions SET enabled=1,enabled_since=?,disabled_reason='',updated_at=? WHERE subscription_id=?",
+                            (now, now, subscription_id),
+                        )
+                        db.execute(
+                            "UPDATE wake_jobs SET status='cancelled',last_error='wake_reenabled',updated_at=? WHERE subscription_id=? AND status='pending'",
+                            (now, subscription_id),
+                        )
+                    return subscription_id
+                db.execute(
+                    """INSERT INTO wake_subscriptions
+                    (subscription_id,profile,route,statuses_json,enabled,enabled_since,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?)""",
+                    (
+                        subscription_id,
+                        profile,
+                        route,
+                        encoded(["done"]),
+                        int(enabled),
+                        now if enabled else None,
+                        now,
+                        now,
+                    ),
+                )
+                db.execute(
+                    "UPDATE notifications SET status='cancelled',payload_json=NULL,last_error='wake_subscription_registered',updated_at=? WHERE subscription_id=? AND status IN ('pending','retry')",
+                    (now, subscription_id),
+                )
+                self._wake_metric(db, "wake_registered")
+        except sqlite3.IntegrityError:
+            raise NotifyError("wake_subscription_conflict") from None
+        return subscription_id
+
+    def set_wake_enabled(
+        self, subscription_id: str, enabled: bool, routes: dict[str, dict], *, now: float | None = None
+    ) -> None:
+        now = now or time.time()
+        with self.transaction() as db:
+            row = db.execute(
+                """SELECT ws.*,s.enabled AS source_enabled,s.account,s.workspace_id,
+                a.configured AS account_configured,w.configured AS workspace_configured,
+                w.enabled AS workspace_enabled FROM wake_subscriptions ws
+                JOIN subscriptions s ON s.id=ws.subscription_id JOIN accounts a ON a.name=s.account
+                JOIN workspaces w ON w.id=s.workspace_id WHERE ws.subscription_id=?""",
+                (subscription_id,),
+            ).fetchone()
+            require(row is not None, "wake_subscription_invalid")
+            if not enabled:
+                self._cancel_wake(db, subscription_id, "wake_disabled")
+                return
+            route = next((r for r in routes.values() if r["route"] == row["route"]), None)
+            require(
+                route is not None
+                and route["profile"] == row["profile"]
+                and row["source_enabled"] == 1
+                and row["account_configured"] == 1
+                and row["workspace_configured"] == 1
+                and row["workspace_enabled"] == 1,
+                "wake_route_unavailable",
+            )
+            if row["enabled"]:
+                return
+            db.execute(
+                "UPDATE wake_jobs SET status='cancelled',last_error='wake_reenabled',updated_at=? WHERE subscription_id=? AND status='pending'",
+                (now, subscription_id),
+            )
+            db.execute(
+                "UPDATE wake_subscriptions SET enabled=1,enabled_since=?,disabled_reason='',updated_at=? WHERE subscription_id=?",
+                (now, now, subscription_id),
+            )
+
+    def wake_subscriptions(self) -> list[dict]:
+        return self.rows(
+            """SELECT ws.subscription_id,ws.profile,ws.route,ws.statuses_json,ws.enabled,
+            ws.enabled_since,ws.disabled_reason,ws.created_at,ws.updated_at,s.label,s.workspace_id
+            FROM wake_subscriptions ws JOIN subscriptions s ON s.id=ws.subscription_id
+            ORDER BY ws.created_at"""
+        )
+
+    def wake_binding(self, subscription_id: str) -> dict:
+        rows = self.rows(
+            """SELECT ws.profile,ws.route,s.platform,s.chat_id,s.thread_id,s.chat_type,
+            s.workspace_id,s.project_id,s.enabled FROM wake_subscriptions ws
+            JOIN subscriptions s ON s.id=ws.subscription_id WHERE ws.subscription_id=?""",
+            (subscription_id,),
+        )
+        require(bool(rows), "wake_subscription_invalid")
+        return rows[0]
+
+    def subscription_destination(self, subscription_id: str) -> dict:
+        rows = self.rows(
+            """SELECT platform,chat_id,thread_id,chat_type,workspace_id,project_id,enabled
+            FROM subscriptions WHERE id=?""",
+            (subscription_id,),
+        )
+        require(bool(rows), "wake_subscription_invalid")
+        return rows[0]
+
+    def wake_due(self, now: float, limit: int = 100) -> list[dict]:
+        return self.rows(
+            """SELECT j.id,j.subscription_id,j.event_key,j.issue_id,j.issue_key,j.transition_seq,
+            ws.profile,ws.route,
+            j.payload_json,j.attempts,j.next_attempt_at FROM wake_jobs j
+            JOIN wake_subscriptions ws ON ws.subscription_id=j.subscription_id
+            JOIN subscriptions s ON s.id=ws.subscription_id
+            JOIN accounts a ON a.name=s.account JOIN workspaces w ON w.id=s.workspace_id
+            WHERE j.status='pending' AND COALESCE(j.next_attempt_at,0)<=?
+            AND ws.enabled=1 AND ws.enabled_since IS NOT NULL AND s.enabled=1
+            AND a.configured=1 AND w.configured=1 AND w.enabled=1
+            ORDER BY j.created_at LIMIT ?""",
+            (now, min(max(1, limit), 100)),
+        )
+
+    def wake_defer_unclaimed(self, job_id: str, code: str, delay: int = 30) -> None:
+        now = time.time()
+        with self.transaction() as db:
+            db.execute(
+                "UPDATE wake_jobs SET next_attempt_at=?,last_error=?,updated_at=? WHERE id=? AND status='pending'",
+                (now + min(max(1, delay), 300), code, now, job_id),
+            )
+
+    def wake_claim(
+        self,
+        job_id: str,
+        now: float,
+        lease_seconds: int,
+        routes: dict[str, dict],
+        webhook_policy: dict[tuple[str, str], dict],
+    ) -> dict | None:
+        by_route = {row["route"]: row for row in routes.values()}
+        with self.transaction() as db:
+            row = db.execute(
+                """SELECT j.*,ws.profile,ws.route,ws.enabled AS wake_enabled,ws.enabled_since,
+                s.platform AS source_platform,s.account AS source_account,s.chat_id AS source_chat_id,
+                s.thread_id AS source_thread_id,s.chat_type AS source_chat_type,s.workspace_id AS source_workspace,
+                s.project_id AS source_project,s.enabled AS source_enabled,a.platform AS account_platform,
+                a.configured AS account_configured,w.configured AS workspace_configured,w.enabled AS workspace_enabled
+                FROM wake_jobs j JOIN wake_subscriptions ws ON ws.subscription_id=j.subscription_id
+                JOIN subscriptions s ON s.id=ws.subscription_id JOIN accounts a ON a.name=s.account
+                JOIN workspaces w ON w.id=s.workspace_id WHERE j.id=?""",
+                (job_id,),
+            ).fetchone()
+            if row is None or row["status"] != "pending" or row["payload_json"] is None:
+                return None
+            route = by_route.get(row["route"])
+            if not (
+                route
+                and route["profile"] == row["profile"]
+                and row["wake_enabled"] == 1
+                and row["enabled_since"] is not None
+                and row["source_enabled"] == 1
+                and row["account_configured"] == 1
+                and row["workspace_configured"] == 1
+                and row["workspace_enabled"] == 1
+                and row["source_platform"] == row["account_platform"]
+            ):
+                return None
+            try:
+                verify_webhook_policy(
+                    webhook_policy,
+                    row["profile"],
+                    row["route"],
+                    {
+                        "platform": row["source_platform"],
+                        "chat_id": row["source_chat_id"],
+                        "thread_id": row["source_thread_id"],
+                        "chat_type": row["source_chat_type"],
+                    },
+                )
+            except NotifyError as exc:
+                db.execute(
+                    "UPDATE wake_jobs SET status='dead',last_error=?,updated_at=? WHERE id=? AND status='pending'",
+                    (exc.code, now, job_id),
+                )
+                self._wake_metric(db, "wake_dead")
+                self._wake_metric(db, exc.code)
+                return None
+            token = str(uuid.uuid4())
+            changed = db.execute(
+                """UPDATE wake_jobs SET status='sending',attempts=attempts+1,
+                lease_until=?,lease_token=?,next_attempt_at=NULL,last_error='',updated_at=?
+                WHERE id=? AND status='pending' AND attempts=0""",
+                (now + lease_seconds, token, now, job_id),
+            )
+            if changed.rowcount != 1:
+                return None
+            return dict(row) | {
+                "attempts": row["attempts"] + 1,
+                "lease_token": token,
+                "payload_json": row["payload_json"],
+            }
+
+    def wake_finish(
+        self, claim: dict, status: str, error_code: str = "", *, now: float | None = None
+    ) -> bool:
+        require(status in {"sent", "dead", "delivery_unknown"}, "wake_result_invalid")
+        now = now or time.time()
+        with self.transaction() as db:
+            payload = None if status == "sent" else claim.get("payload_json")
+            changed = db.execute(
+                """UPDATE wake_jobs SET status=?,payload_json=?,last_error=?,lease_until=NULL,
+                lease_token=NULL,updated_at=? WHERE id=? AND status='sending' AND lease_token=? AND attempts=?""",
+                (status, payload, error_code, now, claim["id"], claim["lease_token"], claim["attempts"]),
+            )
+            if changed.rowcount:
+                metric = {
+                    "sent": "wake_sent",
+                    "dead": "wake_dead",
+                    "delivery_unknown": "wake_unknown",
+                }[status]
+                self._wake_metric(db, metric)
+                if error_code == "wake_route_ignored":
+                    self._wake_metric(db, "wake_route_ignored")
+            return changed.rowcount == 1
+
+    def wake_expire(self, now: float) -> int:
+        with self.transaction() as db:
+            changed = db.execute(
+                """UPDATE wake_jobs SET status='delivery_unknown',last_error='wake_sender_lease_expired',
+                lease_until=NULL,lease_token=NULL,updated_at=? WHERE status='sending' AND lease_until<=?""",
+                (now, now),
+            ).rowcount
+            self._wake_metric(db, "wake_unknown", changed)
+            return changed
+
+    def wake_replay(
+        self, job_id: str, retention_days: int, routes: dict[str, dict], *, now: float | None = None
+    ) -> bool:
+        now = now or time.time()
+        by_route = {row["route"]: row for row in routes.values()}
+        with self.transaction() as db:
+            row = db.execute(
+                """SELECT j.*,ws.enabled AS wake_enabled,ws.route,ws.profile,s.enabled AS source_enabled,
+                a.configured AS account_configured,w.configured AS workspace_configured,w.enabled AS workspace_enabled
+                FROM wake_jobs j JOIN wake_subscriptions ws ON ws.subscription_id=j.subscription_id
+                JOIN subscriptions s ON s.id=ws.subscription_id JOIN accounts a ON a.name=s.account
+                JOIN workspaces w ON w.id=s.workspace_id WHERE j.id=?""",
+                (job_id,),
+            ).fetchone()
+            require(
+                row is not None
+                and row["status"] in {"dead", "delivery_unknown"}
+                and row["payload_json"]
+                and now - row["updated_at"] <= retention_days * 86400
+                and row["wake_enabled"] == 1
+                and row["source_enabled"] == 1
+                and row["account_configured"] == 1
+                and row["workspace_configured"] == 1
+                and row["workspace_enabled"] == 1
+                and (route := by_route.get(row["route"])) is not None
+                and route["profile"] == row["profile"],
+                "wake_replay_unavailable",
+            )
+            try:
+                payload = json.loads(row["payload_json"])
+            except (ValueError, TypeError):
+                raise NotifyError("wake_replay_unavailable") from None
+            require(
+                isinstance(payload, dict)
+                and payload.get("wake_id") == row["id"]
+                and payload.get("event_type") == "task.completed"
+                and isinstance(payload.get("snapshot"), dict),
+                "wake_replay_unavailable",
+            )
+            changed = db.execute(
+                """UPDATE wake_jobs SET status='pending',attempts=0,next_attempt_at=NULL,
+                lease_until=NULL,lease_token=NULL,last_error='',updated_at=? WHERE id=? AND status IN ('dead','delivery_unknown')""",
+                (now, job_id),
+            )
+            if changed.rowcount:
+                self._wake_metric(db, "wake_replayed")
+            return changed.rowcount == 1
+
+    def wake_status(self) -> dict:
+        return {
+            "subscriptions": self.rows(
+                "SELECT enabled,COUNT(*) AS count FROM wake_subscriptions GROUP BY enabled"
+            ),
+            "jobs": self.rows(
+                "SELECT status,COUNT(*) AS count,MIN(created_at) AS oldest FROM wake_jobs GROUP BY status"
+            ),
+            "metrics": self.rows(
+                "SELECT key,value FROM metadata WHERE key LIKE 'metric:wake_%' ORDER BY key"
+            ),
+        }
 
     def due(self, now: float) -> list[dict]:
         with self.transaction() as db:
@@ -542,6 +959,21 @@ class State:
                 (nid,),
             ).fetchone()
             if not row or not row["enabled"]:
+                return None
+            wake_registered = db.execute(
+                "SELECT 1 FROM wake_subscriptions WHERE subscription_id=?",
+                (row["subscription_id"],),
+            ).fetchone()
+            if wake_registered:
+                # A live attempt may finish, but neither retries nor lease takeovers
+                # may restart ordinary delivery after the wake cutover.
+                if row["status"] in {"pending", "retry"} or (
+                    row["status"] == "sending" and (row["lease_until"] or 0) <= now
+                ):
+                    db.execute(
+                        "UPDATE notifications SET status='cancelled',last_error='wake_subscription_registered',updated_at=? WHERE id=?",
+                        (now, nid),
+                    )
                 return None
             if (
                 row["status"] == "sending"
@@ -619,6 +1051,11 @@ class State:
                 status, payload = "delivered", None
             elif not row["enabled"] or row["last_error"] == "subscription_disabled":
                 status, detail = "cancelled", "subscription_disabled"
+            elif db.execute(
+                "SELECT 1 FROM wake_subscriptions WHERE subscription_id=?",
+                (row["subscription_id"],),
+            ).fetchone():
+                status, detail = "cancelled", "wake_subscription_registered"
             elif outcome == "anchor" and not fallback and row["attempts"] < maximum:
                 status, fallback = "retry", 1
                 body = json.loads(payload)
@@ -800,6 +1237,17 @@ class State:
             db.execute(
                 "DELETE FROM hints WHERE (status='processed' AND processed_at<?) OR (status='rejected' AND processed_at<?)",
                 (now - 86400, now - 7 * 86400),
+            )
+
+    def prune_wake(self, now: float | None = None) -> None:
+        now = now or time.time()
+        with self.transaction() as db:
+            # Terminal receipts remain for the life of their subscription; only the
+            # replayable request body is removed after the operator replay window.
+            db.execute(
+                """UPDATE wake_jobs SET payload_json=NULL WHERE status IN ('dead','delivery_unknown','cancelled')
+                AND payload_json IS NOT NULL AND updated_at<?""",
+                (now - 30 * 86400,),
             )
 
     def status(self) -> dict:

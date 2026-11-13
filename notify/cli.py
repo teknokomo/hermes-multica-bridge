@@ -26,6 +26,11 @@ from .config import (
 from .importer import import_issues, import_watcher, watcher_bundle, watcher_plan
 from .service import Service
 from .state import State, encoded, subscription
+from .wake import (
+    load_webhook_policy,
+    verify_configured_route,
+    verify_webhook_policy,
+)
 
 DEFAULT_CONFIG = "/etc/hermes-multica-notify/notify.toml"
 
@@ -85,11 +90,115 @@ def parser() -> argparse.ArgumentParser:
     issues = command(commands, "import-issues")
     issues.add_argument("--subscription", required=True)
     issues.add_argument("--dry-run", action="store_true")
+    wake = command(commands, "wake").add_subparsers(dest="action", required=True)
+    wake_add = command(wake, "add")
+    wake_add.add_argument("--subscription", required=True)
+    wake_add.add_argument("--profile", choices=["default", "om73"], required=True)
+    wake_add.add_argument("--route", required=True)
+    wake_add.add_argument("--status", choices=["done"], default="done")
+    wake_add.add_argument("--enabled", action="store_true")
+    command(wake, "list").add_argument("--json", action="store_true")
+    command(wake, "status").add_argument("--json", action="store_true")
+    for action in ("enable", "disable"):
+        command(wake, action).add_argument("subscription")
+    wake_replay = command(wake, "replay")
+    wake_replay.add_argument("id")
+    wake_replay.add_argument("--confirm", action="store_true")
     return root
 
 
 def output(value) -> None:
     print(encoded(value))
+
+
+def resolve_subscription(state: State, value: str) -> str:
+    rows = state.rows(
+        "SELECT id FROM subscriptions WHERE id=? OR label=? ORDER BY id LIMIT 2",
+        (value, value),
+    )
+    require(len(rows) == 1, "wake_subscription_ambiguous")
+    return rows[0]["id"]
+
+
+def execute_wake(args, config, state: State) -> None:
+    if args.action == "add":
+        configured = config.wake.get("routes", {})
+        routes = (
+            [configured[args.route]] if args.route in configured else
+            [row for row in configured.values() if row["route"] == args.route]
+        )
+        require(len(routes) == 1, "wake_route_unavailable")
+        route = routes[0]
+        require(route["profile"] == args.profile, "wake_route_profile_mismatch")
+        if args.enabled:
+            require(config.wake.get("enabled", False), "wake_disabled")
+        sid = resolve_subscription(state, args.subscription)
+        policy = load_webhook_policy(Path(config.wake["webhook_policy_file"]))
+        verify_webhook_policy(
+            policy,
+            route["profile"],
+            route["route"],
+            state.subscription_destination(sid),
+        )
+        state.add_wake_subscription(sid, route, enabled=args.enabled)
+        output(
+            {
+                "ok": True,
+                "subscription": sid,
+                "profile": route["profile"],
+                "route": route["route"],
+                "enabled": bool(args.enabled),
+            }
+        )
+    elif args.action == "list":
+        output(state.wake_subscriptions())
+    elif args.action == "status":
+        output(state.wake_status())
+    elif args.action in {"enable", "disable"}:
+        sid = resolve_subscription(state, args.subscription)
+        enabled = args.action == "enable"
+        if enabled:
+            require(config.wake.get("enabled", False), "wake_disabled")
+            binding = state.wake_binding(sid)
+            verify_configured_route(
+                config.wake.get("routes", {}), binding["profile"], binding["route"]
+            )
+            policy = load_webhook_policy(Path(config.wake["webhook_policy_file"]))
+            verify_webhook_policy(
+                policy,
+                binding["profile"],
+                binding["route"],
+                binding,
+            )
+        state.set_wake_enabled(sid, enabled, config.wake.get("routes", {}))
+        output({"ok": True, "subscription": sid, "enabled": enabled})
+    else:
+        require(args.confirm, "wake_replay_confirmation_required")
+        require(config.wake.get("enabled", False), "wake_disabled")
+        job_rows = state.rows(
+            "SELECT subscription_id FROM wake_jobs WHERE id=?", (args.id,)
+        )
+        require(bool(job_rows), "wake_replay_unavailable")
+        binding = state.wake_binding(job_rows[0]["subscription_id"])
+        verify_configured_route(
+            config.wake.get("routes", {}), binding["profile"], binding["route"]
+        )
+        policy = load_webhook_policy(Path(config.wake["webhook_policy_file"]))
+        verify_webhook_policy(
+            policy,
+            binding["profile"],
+            binding["route"],
+            binding,
+        )
+        require(
+            state.wake_replay(
+                args.id,
+                config.service["replay_retention_days"],
+                config.wake.get("routes", {}),
+            ),
+            "wake_replay_unavailable",
+        )
+        output({"ok": True, "id": args.id, "requeued": True})
 
 
 def execute(args) -> None:
@@ -139,7 +248,9 @@ def execute(args) -> None:
         return
     state = State(Path(config.service["db_path"]))
     try:
-        if args.command == "subscription":
+        if args.command == "wake":
+            execute_wake(args, config, state)
+        elif args.command == "subscription":
             if args.action == "add":
                 row = subscription(
                     {
@@ -175,7 +286,9 @@ def execute(args) -> None:
                 state.toggle(args.id, args.action == "enable")
                 output({"ok": True})
         elif args.command == "status":
-            output(state.status())
+            result = state.status()
+            result["wake"] = state.wake_status()
+            output(result)
         elif args.command == "doctor":
             require(not config.workspace_errors, "notify_config_invalid")
             require(
@@ -187,7 +300,41 @@ def execute(args) -> None:
                     credential(row["token_credential"])
                 for key in config.workspaces:
                     Multica(config, key).check_cli()
-            output({"ok": True, "offline": args.offline})
+            wake_rows = state.wake_subscriptions()
+            active_wake = [row for row in wake_rows if row["enabled"]]
+            verified_routes = 0
+            if config.wake.get("enabled", False):
+                webhook_policy = load_webhook_policy(
+                    Path(config.wake["webhook_policy_file"])
+                )
+                for row in active_wake:
+                    binding = state.wake_binding(row["subscription_id"])
+                    verify_configured_route(
+                        config.wake.get("routes", {}),
+                        binding["profile"],
+                        binding["route"],
+                    )
+                    verify_webhook_policy(
+                        webhook_policy,
+                        binding["profile"],
+                        binding["route"],
+                        binding,
+                    )
+                    verified_routes += 1
+                if not args.offline:
+                    credential(config.wake["secret_credential"])
+            output(
+                {
+                    "ok": True,
+                    "offline": args.offline,
+                    "wake": {
+                        "enabled": bool(config.wake.get("enabled", False)),
+                        "registered": len(wake_rows),
+                        "active": len(active_wake),
+                        "verified_routes": verified_routes,
+                    },
+                }
+            )
         elif args.command == "import-watcher":
             rows, accounts, workspaces = watcher_bundle(
                 config, args.watcher_config, args.bindings

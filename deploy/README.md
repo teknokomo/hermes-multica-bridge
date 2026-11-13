@@ -1,4 +1,4 @@
-# Развёртывание Hermes Multica Bridge 0.4.0
+# Развёртывание Hermes Multica Bridge 0.5.0
 
 Эта инструкция описывает настройку после копирования публичного пакета на целевой хост. Она не выполняет deployment автоматически.
 
@@ -80,7 +80,7 @@ Socket unit создаёт общий каталог `/run/hermes-multica-bridge
 
 Workspace routes работают через профильный Hermes plugin process в Standard, а обратные события доставляет отдельный постоянный watcher. Соберите production wheel локально и установите его в отдельный venv watcher; в `/opt/hermes-multica-bridge` не копируйте `.env`, credentials, тесты, memory-bank, `.agents` или development state.
 
-Workspace tools не требуют изменений `PluginContext.register_tool()` или `model_tools`: они используют стандартный вызов инструмента без `pass_context`. В целевой Hermes-сборке должны быть доступны `gateway.session_context.get_bound_session_env()`, `get_session_env()` и `get_current_attachments()`, а inbound adapter обязан устанавливать корректные значения для каждого текущего сообщения. Плагин сравнивает bound context с `get_session_env()` и отказывает при расхождении.
+Workspace tools не требуют изменений `PluginContext.register_tool()` или `model_tools`: они используют стандартный вызов инструмента без `pass_context`. В целевой Hermes-сборке должны быть доступны `gateway.session_context.get_bound_session_env()` и `get_current_attachments()`, а inbound adapter обязан устанавливать корректные значения для каждого текущего сообщения. Плагин читает только bound context: его USER_ID должен представлять автора текущего сообщения, а не адресата общей сессии. Пустой bound author блокирует операцию; legacy `get_session_env()` и process env не используются для авторизации.
 
 Это внутренний стык Hermes, помеченный `T38-DEBT-3`; его нужно перепроверять после каждого обновления. Перед включением маршрута выполните `hermes plugins validate` и `hermes plugins doctor --ci` на точной целевой сборке, а также runtime-проверку source IDs и вложения из MAX/Telegram. Doctor подтверждает загрузку плагина, но не доказывает, что Gateway adapter привязал session context во время реального сообщения.
 
@@ -256,7 +256,7 @@ sudo systemctl stop hermes-multica-bridge@<instance>.service
 
 ## Чистая установка профиля
 
-Версия продукта — 0.4.0. ConnectionRegistry и Workspace ledger сохраняют текущую структуру без внутренних версий. Watcher state поддерживает только документированную одностороннюю миграцию с 0.2.0; неизвестные схемы отклоняются. Credentials задаются заново через предназначенные для них Hermes/systemd интерфейсы и не выводятся в терминал или отчёты.
+Версия продукта — 0.5.0. ConnectionRegistry и Workspace ledger сохраняют текущую структуру без внутренних версий. Watcher state поддерживает только документированную одностороннюю миграцию с 0.2.0; notify выполняет additive-миграцию только с точной схемы 0.4.0. Неизвестные схемы отклоняются. Credentials задаются через предназначенные для них Hermes/systemd интерфейсы и не выводятся в терминал или отчёты.
 
 При первом включении Route его destination фиксируется. После появления deliveries нельзя удалять ledger или переиспользовать их `route_id` для другого назначения. Включённый или использованный Route должен остаться в registry и при выводе из эксплуатации перейти в disable + tombstone: result lookup использует immutable snapshot исходной доставки.
 
@@ -320,7 +320,7 @@ Notify устанавливается в собственный venv и рабо
 
 1. Сохранить согласованные SQLite backup, TOML, SHA-256 и S3-копии действующего watcher. Не заменять custom units и credentials.
 2. Создать системного пользователя `hermes-notify`, StateDirectory/RuntimeDirectory 0700 и приватный каталог конфигурации. Конфигурацией и CLI-файлами владеет hermes-notify; административные CLI-команды выполнять от этого пользователя.
-3. Установить wheel 0.4.0 в `/opt/hermes-multica-notify/venv`. Положить unit из репозитория; добавить operator-owned drop-in с точными `LoadCredential=<имя>:<приватный-путь>` для используемых accounts/workspaces. Не создавать пустые credentials.
+3. Установить wheel 0.5.0 в `/opt/hermes-multica-notify/venv`. Положить unit из репозитория; добавить operator-owned drop-in с точными `LoadCredential=<имя>:<приватный-путь>` для используемых accounts/workspaces. Не создавать пустые credentials.
 4. Инициализировать конфигурацию через `init`, заполнить TOML и credentials. Пример содержит нерабочие плейсхолдеры. Основной CLI 0.8.2 должен поддерживать updated-since/until, сортировку и paging; doctor проверяет capabilities. Перед live отдельно проверить точный серверный бинарник.
 5. После запуска `run` сервис строит infrastructure projection. Затем добавлять подписки. Изменения workspace через CLI append-only сохраняют комментарии и требуют SIGHUP; invalid reload оставляет рабочую проекцию.
 
@@ -344,3 +344,18 @@ CLI-профиль создаётся в runtime HOME workspace с правам�
 Пилоты отдельно: shadow24ч → одна production-подписка7д → остальные по одной. Перед включением production отключить соответствующий старый watcher-путь: реестры независимы и не предотвращают двойную доставку между сервисами. Откат: остановить notify, вернуть старые watcher-маршруты, проверить readiness. Notify DB не восстанавливается поверх watcher DB; cron автоматически не меняется.
 
 Notify reload отклоняет изменения db_path, runtime_dir, delivery_workers и request_timeout_seconds: они требуют отдельного перезапуска. Отправки сериализованы до завершения HTTP для консервативного pacing; сбор workspace выполняется независимо. Постоянно недоступные по 403/404 issue из hints изолируются как rejected и не блокируют остальные задачи; текст ответа не журналируется.
+
+## Completion wake 0.5.0
+
+Wake выключен по умолчанию. Его включение требует отдельной loopback webhook platform и route для каждой пары подписка/тема. Не добавляйте route для production темы до проверки тестовой темы, credentials, snapshot-политики и rollback.
+
+1. В `[wake]` настройте loopback `base_url`, root-only HMAC credential и пути к service-owned webhook policy export. Добавьте systemd drop-in `LoadCredential=hermes-wake-hmac:<private-path>`; источник credential должен существовать и быть непустым. Не передавайте HMAC в аргументах.
+2. После проверки через поддерживаемый Hermes interface создайте sanitized `webhook-policy.json` по образцу `config/wake-webhook-policy.example.json`. Укажите фактические profile/route/event/target/thread, HMAC presence, toolsets без Multica plugin, отсутствие route script/skills/coalesce и проверенную snapshot-only/final-only политику. Не копируйте `secret` в export.
+3. Установите export как `root:hermes-notify 0640` в каталог, доступный этому сервису; он содержит реальные chat/thread IDs. Команда `doctor` и `wake add|enable` сверяют его с destination notify-подписки и запрещают несовпадения.
+4. Выполните `hermes-multica-notify doctor`, затем добавьте wake сначала для утверждённой тестовой подписки. Проверьте `wake status --json` и журналы. `wake add` не отправляет пробное сообщение; реальный E2E создаёт тестовую issue и требует отдельной авторизации.
+
+Hermes webhook route должен иметь точные `events = ["task.completed"]`, профиль-получатель, HMAC, `deliver_only=false`, фиксированные `deliver`/`deliver_extra.chat_id`/`thread_id`, выключенные mirror, script, skills и coalesce, а также route toolsets без Multica tools. Prompt ограничивает агента snapshot и одним финальным ответом. При отсутствии подтверждения темы не направляйте ответ в родительский чат.
+
+Одна автоматическая попытка POST не гарантирует exactly-once. `delivery_unknown` не повторяется автоматически. Перед `wake replay ID --confirm` оператор сверяет Hermes journal и целевой тред; тот же wake ID позволяет Hermes дедуплицировать уже принятый запрос, но доставка ответа всё ещё может быть неоднозначной.
+
+Откат: отключить wake-подписки, остановить notify и только затем восстановить согласованные БД/TOML/credential drop-ins. Не удаляйте receipts и сохранённые `delivery_unknown` без записи audit. Gateway restart выполняется только в согласованное окно и после готовности обоих профилей и тестовой цели.

@@ -48,7 +48,7 @@ class _Api:
         self.readback_error = None
         self.readback_override = None
         self.issue = {"id": "issue-1", "workspace_id": "workspace-1", "project_id": "project-1",
-                      "identifier": "73AN-7", "title": "Task", "description": "", "status": "todo",
+                      "identifier": "TEST-7", "title": "Task", "description": "", "status": "todo",
                       "assignee_id": MEMBER_UUID, "assignee_type": "member", "revision": 1}
         self.parent = {"id": "parent-1", "workspace_id": "workspace-1", "project_id": "project-1"}
 
@@ -166,6 +166,43 @@ class WorkspaceToolsTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(len(self.api.create_calls), 1)
         self.assertEqual(self.state.issue_mapping("issue-1")["message_id"], "message-1")
+
+    def test_bound_actor_authorizes_shared_chat_with_empty_route_user(self) -> None:
+        modules = self._gateway_modules()
+        original = modules["gateway.session_context"].get_session_env
+        modules["gateway.session_context"].get_session_env = lambda name, default="": (
+            "" if name == "HERMES_SESSION_USER_ID" else original(name, default)
+        )
+        with patch.dict(sys.modules, modules), patch(
+            "bridge.watcher_ipc.WatcherIpcClient",
+            return_value=SimpleNamespace(register_issue=lambda mapping: {"ok": True}),
+        ):
+            result = json.loads(self.runtime.send({"route_id": self.route_id, "title": "Task"}))
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(self.api.create_calls), 1)
+        self.assertEqual(self.state.issue_mapping("issue-1")["user_id"], self.source.user_id)
+
+    def test_cleared_bound_actor_cannot_borrow_authorized_route_user(self) -> None:
+        modules = self._gateway_modules()
+        original = modules["gateway.session_context"].get_bound_session_env
+        modules["gateway.session_context"].get_bound_session_env = lambda name, default="": (
+            "" if name == "HERMES_SESSION_USER_ID" else original(name, default)
+        )
+        with patch.dict(sys.modules, modules):
+            result = json.loads(self.runtime.send({"route_id": self.route_id, "title": "Task"}))
+        self.assertEqual(result["error_code"], "source_unavailable")
+        self.assertEqual(self.api.create_calls, [])
+
+    def test_unauthorized_bound_actor_cannot_borrow_authorized_route_user(self) -> None:
+        modules = self._gateway_modules()
+        original = modules["gateway.session_context"].get_bound_session_env
+        modules["gateway.session_context"].get_bound_session_env = lambda name, default="": (
+            "other-user" if name == "HERMES_SESSION_USER_ID" else original(name, default)
+        )
+        with patch.dict(sys.modules, modules):
+            result = json.loads(self.runtime.send({"route_id": self.route_id, "title": "Task"}))
+        self.assertEqual(result["error_code"], "route_denied")
+        self.assertEqual(self.api.create_calls, [])
 
     def test_failed_watcher_registration_retries_from_persisted_source_on_get(self) -> None:
         ipc = SimpleNamespace(register_issue=Mock(side_effect=[
@@ -477,7 +514,7 @@ class WorkspaceToolsTests(unittest.TestCase):
         self.assertFalse(second["ok"])
         self.assertEqual(len(self.api.create_calls), 1)
         self.assertEqual(len(self.ctx.posted_messages), 1)
-        self.assertIn("73AN-7", self.ctx.posted_messages[0])
+        self.assertIn("TEST-7", self.ctx.posted_messages[0])
 
     def test_unassigned_notice_unknown_is_terminal(self) -> None:
         payload = copy.deepcopy(self.payload)
@@ -507,18 +544,18 @@ class WorkspaceToolsTests(unittest.TestCase):
         self.assertEqual(self.api.create_calls, [])
 
     def test_related_issue_metadata_is_compact_and_validated_before_post(self) -> None:
-        related = ["73AN-8", "73FIN-3"]
+        related = ["TEST-8", "FINTEST-3"]
         result = json.loads(self.runtime.send(
             {"route_id": self.route_id, "title": "Task", "related_issue_ids": related},
             tool_context=self.source,
         ))
         self.assertTrue(result["ok"])
-        self.assertIn(("set", "issue-1", "related_issue_ids", '["73AN-8","73FIN-3"]'), self.api.metadata_calls)
+        self.assertIn(("set", "issue-1", "related_issue_ids", '["TEST-8","FINTEST-3"]'), self.api.metadata_calls)
 
         self.api = _Api()
         self.runtime._api = lambda registry, route: self.api
         invalid = json.loads(self.runtime.send(
-            {"route_id": self.route_id, "title": "Task", "related_issue_ids": ["73AN-8", "73AN-8"]},
+            {"route_id": self.route_id, "title": "Task", "related_issue_ids": ["TEST-8", "TEST-8"]},
             tool_context=SimpleNamespace(**{**vars(self.source), "message_id": "duplicate-message"}),
         ))
         self.assertEqual(invalid["error_code"], "invalid_arguments")
@@ -648,7 +685,7 @@ class WorkspaceToolsTests(unittest.TestCase):
         self.api = _Api()
         self.runtime._api = lambda registry, route: self.api
         rejected = json.loads(self.runtime.send(
-            {"route_id": self.route_id, "title": "Task", "related_issue_ids": accepted + ["73AN-16"]},
+            {"route_id": self.route_id, "title": "Task", "related_issue_ids": accepted + ["TEST-16"]},
             tool_context=SimpleNamespace(**{**vars(self.source), "message_id": "too-many-related"}),
         ))
         self.assertEqual(rejected["error_code"], "invalid_arguments")

@@ -28,7 +28,8 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ReadOnlyPaths=/etc/hermes-multica-notify
-# Add explicit LoadCredential entries for configured accounts/workspaces in an operator-owned drop-in.
+# Add explicit LoadCredential entries for accounts/workspaces and hermes-wake-hmac
+# in an operator-owned drop-in. Keep webhook-policy.json root-owned and readable only by this service.
 
 [Install]
 WantedBy=multi-user.target

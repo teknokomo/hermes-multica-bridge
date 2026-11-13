@@ -33,3 +33,16 @@ workspace_id = "REPLACE_WORKSPACE_UUID"
 cli_profile = "notify-test"
 pat_credential = "notify-pat-test"
 enabled = false
+
+[wake]
+enabled = false
+base_url = "http://127.0.0.1:8644"
+secret_credential = "hermes-wake-hmac"
+webhook_policy_file = "/etc/hermes-multica-notify/webhook-policy.json"
+request_timeout_seconds = 10
+max_attempts = 1
+
+[wake.routes.test-wake]
+profile = "default"
+route = "replace-route"
+test = true

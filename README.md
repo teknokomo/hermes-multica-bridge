@@ -21,7 +21,7 @@ Made with the support of the [73rd Meridian Consortium](https://om73.ru).
 
 `hermes-multica-bridge` is a Hermes plugin for two Multica workflows: sending the current pinned Kanban task to Autopilot and creating/managing Workspace issues from trusted MAX or Telegram message context.
 
-Version 0.4.0 supports two security modes:
+Version 0.5.0 supports two security modes:
 
 - **Standard** — the plugin sends HTTPS requests itself. Non-secret topology is stored in the profile's `ConnectionRegistry`; each Route's webhook/HMAC/PAT credentials are managed through the public Hermes plugin credential API and read at runtime only through `agent.secret_scope`.
 - **Isolated** — the plugin never receives Multica secrets. Each new Route uses a separate socket-activated systemd sender instance with root-owned configuration and systemd credentials.
@@ -102,7 +102,7 @@ Each Route has its own write-only `webhook|hmac|pat` credentials. The public `ct
 
 ## Workspace Bridge
 
-A Workspace route is always bound by configuration to one `workspace_id` and a required `project_id`. The tools do not accept `platform`, author, chat, thread, or message ID as model arguments. In the target Hermes build, the plugin reads these fields from the session context bound to the current Gateway turn and compares `get_session_env()` with `get_bound_session_env()` so that stale process environment values are not used. Incomplete or inconsistent context stops the operation before any Multica write request. A route is authorized only when platform, user ID, and chat ID match. Group, channel, and thread access is disabled until an operator explicitly enables it in policy.
+A Workspace route is always bound by configuration to one `workspace_id` and a required `project_id`. The tools do not accept `platform`, author, chat, thread, or message ID as model arguments. In the target Hermes build, the plugin reads these fields from the session context bound to the current Gateway turn through bound-only `get_bound_session_env()` so that stale process environment values are not used. In shared sessions this API returns the current message actor; legacy `get_session_env(USER_ID)` describes the session recipient and is not used for authorization. Incomplete context stops the operation before any Multica write request. A route is authorized only when platform, user ID, and chat ID match. Group, channel, and thread access is disabled until an operator explicitly enables it in policy.
 
 A redacted single-profile template with four disabled Workspace routes and a separate Autopilot example is in [config/registry.om73.example.json](config/registry.om73.example.json). Replace `REPLACE-*` values only in local configuration.
 
@@ -222,7 +222,7 @@ Webhook URLs, PATs, HMAC secrets, and secret response bodies are not stored in t
 
 ## Configuration lifecycle
 
-The plugin is version 0.4.0. The registry accepts its current canonical structure without internal versioning. Watcher state supports a one-way migration from 0.2.0; incompatible SQLite schemas are rejected.
+The plugin is version 0.5.0. The registry accepts its current canonical structure without internal versioning. Watcher state supports a one-way migration from 0.2.0; incompatible SQLite schemas are rejected.
 
 Switching between Standard and Isolated does not transfer secrets automatically. A new mode is enabled only after its own readiness check. Enabling a Route locks its destination; use a new Route for another destination and disable + tombstone the previous one.
 
@@ -230,7 +230,7 @@ Switching between Standard and Isolated does not transfer secrets automatically.
 
 - Linux with systemd for the watcher and Isolated sender;
 - Python 3.11+;
-- Hermes Agent 0.22.4 or later with `gateway.session_context.get_bound_session_env`, `get_session_env`, and `get_current_attachments` available in the target build; the MAX/Telegram adapter must bind this data to the current turn;
+- Hermes Agent 0.22.4 or later with `gateway.session_context.get_bound_session_env` and `get_current_attachments` available in the target build; the MAX/Telegram adapter must bind this data to the current turn;
 - Linux 6.5+, systemd, unified cgroup v2, `SO_PEERCRED`, and `SO_PEERPIDFD` for Isolated mode only;
 - an HTTPS Multica endpoint;
 - a Multica PAT for Workspace API and the watcher; a read-only PAT for Autopilot result tracking;
@@ -250,7 +250,7 @@ The release gate also includes Ruff, Bandit, package build/metadata checks, `her
 
 ## Development status
 
-The product version is 0.4.0. Existing bridge formats are preserved; notify uses an independent SQLite DB with PRAGMA user_version and no internal API versions. Server installation, live Multica writes, commit/push, and publication are separate stages.
+The product version is 0.5.0. Existing bridge formats are preserved; notify uses an independent SQLite DB with PRAGMA user_version for store migrations, without internal API versions. Completion wake adds a signed Hermes invocation only for a new transition to done. Server installation, live Multica writes, commit/push, and publication are separate stages.
 
 ## License
 
@@ -327,3 +327,24 @@ Installation, LoadCredential drop-ins, cutover, cron, and live pilots are separa
 Pacing serializes dispatch through request completion so scheduler delays cannot bunch POST requests; this is a conservative limit, not a throughput promise of 20/s. Changing delivery_workers or request_timeout_seconds requires a restart; reload rejects that candidate. Status exposes heartbeat, cursor lag, and degraded state.
 
 Before combining an issue with comments and task runs, the service rereads the issue and retries up to three times to obtain a coherent snapshot. If it keeps changing, the event is deferred and the cursor does not advance.
+
+## Completion wake 0.5.0
+
+Notify detects a new issue transition to `done`, stores an immutable read-only snapshot, and makes one automatic HMAC V2 request to the loopback Hermes webhook. The `event`, `event_type`, and `type` payload fields are all `task.completed`.
+
+Hermes starts the agent in the pinned profile and sends only its final response to the configured Telegram topic or MAX group. `sent` means the webhook admitted the wake; it does not confirm response delivery.
+
+Regular notify messages are suppressed for every registered wake subscription. The first baseline does not wake; repeated scans do not duplicate a job; after reopening, a new transition to `done` creates a new job.
+
+Timeouts, lost responses, and expired sends become `delivery_unknown` with no automatic retry. A confirmed `duplicate` counts as admitted; `ignored` is an error. Manual replay keeps the wake ID and can duplicate a response if Hermes already handled the request.
+
+Before enable, the CLI and doctor compare profile, event, HMAC presence, target, thread, absence of route scripts/skills/coalescing, and safe toolset against the protected operator export `webhook-policy.json`. Notify does not read Hermes home; the export contains private chat/thread IDs but no secrets and must be readable only by the administrator and service.
+
+```bash
+hermes-multica-notify --config /REPLACE/notify.toml wake add --subscription REPLACE_LABEL --profile default --route REPLACE_ROUTE
+hermes-multica-notify --config /REPLACE/notify.toml wake list
+hermes-multica-notify --config /REPLACE/notify.toml wake status --json
+hermes-multica-notify --config /REPLACE/notify.toml wake replay REPLACE_WAKE_ID --confirm
+```
+
+Wake is disabled by default. Live enablement requires preapproved `test=true` project and topic, backups, and a separately agreed Gateway restart window; without a test target, E2E stops with `test_target_not_configured`.

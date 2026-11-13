@@ -227,6 +227,7 @@ class Multica:
             "assignee_id",
             "labels",
             "title",
+            "description",
         )
         for _ in range(3):
             issue = self.reader.get_issue(issue_id)
