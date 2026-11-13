@@ -136,7 +136,8 @@ class ReadinessServer:
                 await writer.drain()
                 return
             if (not isinstance(request, dict) or set(request) != {"profile", "projects"}
-                    or request.get("profile") not in _PROFILE_SET
+                    or not isinstance(request.get("profile"), str)
+                    or request["profile"] not in _PROFILE_SET
                     or not isinstance(request.get("projects"), list)
                     or not 1 <= len(request["projects"]) <= MAX_PROJECTS):
                 writer.write(_encode({"ok": False, "error_code": "ipc_request_invalid"}))

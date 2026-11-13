@@ -113,6 +113,15 @@ def test_readiness_ipc_returns_only_project_readiness_and_authenticates_peer(tmp
                 assert denied == {"ok": False, "error_code": "ipc_peer_denied"}
                 assert len(state.queries) == 1
 
+                malformed_profile = await _raw_request(
+                    str(socket_path),
+                    json.dumps({"profile": [], "projects": [{
+                        "workspace_id": WORKSPACE_ID, "project_id": PROJECT_ID,
+                    }]}).encode(),
+                )
+                assert malformed_profile == {"ok": False, "error_code": "ipc_request_invalid"}
+                assert len(state.queries) == 1
+
                 oversized = await _raw_request(str(socket_path), b" " * (MAX_FRAME + 1))
                 assert oversized == {"ok": False, "error_code": "ipc_request_invalid"}
                 assert len(state.queries) == 1
