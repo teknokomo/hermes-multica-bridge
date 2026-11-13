@@ -5,6 +5,12 @@
 
 ![Teknokomo — 73rd Meridian](docs/assets/teknokomo-om73-en.jpg)
 
+## Developers
+
+Developed by [Teknokomo](https://universo.pro/).
+
+Made with the support of the [73rd Meridian Consortium](https://om73.ru).
+
 # Important! Grave! Важно!
 
 -   Workers of the world, unite!
@@ -12,12 +18,6 @@
 -   Пролетарии всех стран, соединяйтесь!
 
 # Hermes Multica Bridge
-
-## Developers
-
-Developed by [Teknokomo](https://universo.pro/).
-
-Made with the support of the [73rd Meridian Consortium](https://om73.ru).
 
 ## Overview
 
