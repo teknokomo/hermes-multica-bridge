@@ -489,7 +489,7 @@ class WorkspaceRuntime:
         return result
 
     def _retry_watcher_mapping(self, state: WorkspaceState, route: RegistryRoute, issue_id: str) -> bool:
-        if not route.watcher_enabled:
+        if route.wake_mode == "completion" or not route.watcher_enabled:
             return False
         stored = state.issue_mapping(issue_id)
         if stored is None or stored["route_id"] != route.route_id:

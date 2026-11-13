@@ -29,6 +29,7 @@ from .config import (
 )
 from .delivery import Sender
 from .policy import reconcile
+from .readiness_ipc import ReadinessServer
 from .state import State, epoch
 from .wake import MAX_BODY_BYTES, WakeSender, load_webhook_policy
 
@@ -88,6 +89,7 @@ class Service:
         self.collectors: list[asyncio.Task] = []
         self.deliveries: set[asyncio.Task] = set()
         self.wake_deliveries: set[asyncio.Task] = set()
+        self.readiness_ipc: ReadinessServer | None = None
 
     def scan(self, key: str, api: Multica, full: bool) -> None:
         now = time.time()
@@ -560,11 +562,41 @@ class Service:
                 == self.config.service["request_timeout_seconds"],
                 "notify_config_reload_failed",
             )
+            candidate_policy = None
+            if candidate.readiness_ipc.get("enabled"):
+                candidate_policy = await blocking(
+                    load_webhook_policy,
+                    Path(candidate.wake["webhook_policy_file"]),
+                )
+                if self.readiness_ipc is not None:
+                    require(
+                        candidate.readiness_ipc["socket_path"]
+                        == str(self.readiness_ipc.path),
+                        "notify_config_reload_failed",
+                    )
             async with AsyncExitStack() as stack:
                 for key in sorted(self.locks):
                     await stack.enter_async_context(self.locks[key])
-                self.state.project(candidate)
-                self.state.project_wake_routes(candidate.wake.get("routes", {}))
+                next_ipc = self.readiness_ipc
+                started_ipc = False
+                if candidate.readiness_ipc.get("enabled"):  # noqa: SIM102 - retain explicit reload staging branch
+                    if next_ipc is None:
+                        next_ipc = ReadinessServer(candidate, self.state)
+                        await next_ipc.start(policy=candidate_policy)
+                        started_ipc = True
+                try:
+                    self.state.project(candidate)
+                    self.state.project_wake_routes(candidate.wake.get("routes", {}))
+                except Exception:
+                    if started_ipc and next_ipc is not None:
+                        await next_ipc.close()
+                    raise
+                if candidate.readiness_ipc.get("enabled"):
+                    if not started_ipc and next_ipc is not None:
+                        await next_ipc.refresh(candidate, policy=candidate_policy)
+                elif next_ipc is not None:
+                    await next_ipc.close()
+                    next_ipc = None
                 for task in self.collectors:
                     task.cancel()
                 await asyncio.gather(*self.collectors, return_exceptions=True)
@@ -572,6 +604,7 @@ class Service:
                 with self.state.transaction() as db:
                     db.execute("UPDATE cursors SET ws_connected=0")
                 self.config = candidate
+                self.readiness_ipc = next_ipc
                 self.full_slots = asyncio.Semaphore(
                     candidate.service["full_reconcile_parallelism"]
                 )
@@ -596,6 +629,9 @@ class Service:
             self.state = State(Path(self.config.service["db_path"]), create=True)
             self.state.project(self.config)
             self.state.project_wake_routes(self.config.wake.get("routes", {}))
+            if self.config.readiness_ipc.get("enabled"):
+                self.readiness_ipc = ReadinessServer(self.config, self.state)
+                await self.readiness_ipc.start()
             with self.state.transaction() as db:
                 db.execute("UPDATE cursors SET ws_connected=0")
             start = Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[19]
@@ -648,6 +684,9 @@ class Service:
                 await self.pause(0.2)
         finally:
             self.stop.set()
+            if self.readiness_ipc is not None:
+                await self.readiness_ipc.close()
+                self.readiness_ipc = None
             for task in self.collectors:
                 task.cancel()
             await asyncio.gather(
