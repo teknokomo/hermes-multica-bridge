@@ -40,3 +40,28 @@ Use `multica_route_create` only when the user explicitly requests a new route an
 - Route creation does not create a workspace, project, squad, wake subscription, or credential. Do not represent it as having done so.
 
 Do not bypass bridge results by switching integrations or altering task source. Never expose credentials or copy a credential from another route.
+
+## Self-service grants and topic isolation
+
+- Grants are operator-managed policy. Never edit grants, create connections/workspaces/projects/PATs, or request broader credentials from a chat tool call.
+- An empty grant thread allowlist permits creation from any otherwise-authorized topic; each created route captures the current trusted topic. Never remove that route's thread restriction. Use a distinct route name for each topic.
+- A grant allowlist does not select a default assignee. When the user wants a default, pass the permitted typed `{id,type}` pair as `default_assignee` in `multica_route_create`.
+- A successful create may return pending rather than active. Respect operator approval and grant quota/expiry; never approve your own pending route.
+- `wake_ready` reports project coverage. Creating an intake route in another topic does not move an existing completion webhook target or create a wake subscription. Do not promise delivery to the intake topic unless the operator has confirmed that destination.
+- During topic-isolation checks, inspect dynamic route IDs separately from pre-existing static routes that are legitimately visible in that topic. Do not create an issue just to test route creation.
+
+## Agents and squads: separate CLI operations
+
+Issue creation and updates must continue through bridge tools. Explicitly authorized agent/squad administration uses the installed Multica CLI, with an explicit approved profile and workspace:
+
+```bash
+multica --profile <service-profile> --workspace-id <workspace-id> runtime list --output json
+multica --profile <approved-profile> --workspace-id <workspace-id> agent create --name <name> --runtime-id <allowed-runtime-id> --permission-mode private --max-concurrent-tasks 1 --output json
+multica --profile <approved-profile> --workspace-id <workspace-id> squad create --name <name> --leader <allowed-agent-id> --output json
+```
+
+- CLI 0.8.2 uses singular `agent` and `squad`, with `--profile` as a global flag. Do not assume a configured default profile or a token environment variable.
+- A member can create a squad. Agent creation also requires access to the selected runtime; workspace admin rights do not bypass runtime ownership/sharing. Confirm actual permissions rather than treating the role alone as a capability check.
+- An operator profile is used only for explicitly authorized administrative operations. Never switch to it automatically after an authorization error, use it to bypass an issue route, or copy its token into a service profile.
+- Trial objects belong only in the owner-approved canary workspace. Do not assign issues or start runs as part of a capability probe.
+- Keep tokens out of command arguments, chat, and logs. Use existing private CLI profiles; never expose configuration secrets through `config show`.
