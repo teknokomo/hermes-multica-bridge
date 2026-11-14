@@ -255,9 +255,9 @@ Repository Skill задаёт предпочтительный путь чере
 
 ## Runtime Router 0.7.0
 
-- `principal_identities` связывает доверенный platform user ID с одним операторски созданным principal. Автоматическое объединение по display name запрещено; запрос без identity/binding закрывается.
+- `principal_identities` связывает доверенный platform user ID с одним операторски созданным principal. Автоматическое объединение по display name запрещено; запрос без identity/binding закрывается по умолчанию. Только при явном `unbound_policy=keep_current` worker после разрешения identity может использовать текущий runtime как временный strict binding.
 - Resolver не выполняет I/O. `strict` всегда использует default binding; `exceptions` требует совпадения всех заданных selectors и при равном priority/specificity закрывается с `rule_conflict`.
-- Runtime выбирается только из явного `allowed_runtime_ids`; он дополнительно должен быть online, accessible и принадлежать тому же Multica instance. Model mapping сверяется с runtime catalog и agent readback.
+- Runtime выбирается только из явного `allowed_runtime_ids`; он дополнительно должен быть online, доступным для текущего пользователя по `owner_id`/`visibility`/`shared_with` и принадлежать тому же Multica instance. CLI 0.8.2 не выдаёт поле `accessible` или каталог моделей: доступность вычисляется после сопоставления email из `auth status` с ID из `workspace member list`. Явный model mapping проверяется по runtime catalog, если CLI его выдаёт, и всегда по `agent get` readback; фактическое выполнение модели требует target canary.
 - Worker сериализуется на `(instance_id, agent_id)`, проверяет отсутствие активных/queued runs до runtime switch и повторяет проверку непосредственно перед issue POST. Agent concurrency должна быть ровно 1.
 - SQLite и профильные snapshots должны быть в одном локальном каталоге с режимом `0700`, принадлежащем одному OS UID. Hermes Gateway, plugin process и systemd worker используют этот UID и один общий `state_path`; включённый `${HERMES_HOME}` path отвергается.
 - Multica CLI запускается с фиксированными argv, без proxy environment, без shell и без token arguments. CLI HOME расположен в приватном `state_path.parent/cli-home`, отдельно от Hermes HOME. Credentials остаются в операторском CLI profile и не попадают в queue, logs или tool output.

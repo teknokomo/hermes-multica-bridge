@@ -275,7 +275,8 @@ class RouterWorker:
             row["id"]: {
                 **row,
                 "instance_id": agent.instance_id,
-                "accessible": row["id"] in agent.allowed_runtime_ids,
+                "accessible": row.get("accessible") is True
+                and row["id"] in agent.allowed_runtime_ids,
             }
             for row in catalog_rows
         }
@@ -366,7 +367,15 @@ class RouterWorker:
         enabled_profiles: set[str],
     ) -> int:
         changed = 0
-        for request in self.store.active(limit=100):
+        # Keep one tick below the systemd timeout while rotating through every
+        # active request across later ticks. Slow or unchanged issues cannot pin
+        # the first page and starve queued work indefinitely.
+        sweep_limit = max(1, min(4, 120 // config.cli_timeout_seconds))
+        cursor = self.store.terminal_sweep_cursor()
+        for request in self.store.active(
+            limit=sweep_limit, after_request_id=cursor
+        ):
+            self.store.set_terminal_sweep_cursor(request["request_id"])
             if request["state"] not in {"waiting", "reconciling", "cancelling"}:
                 continue
             try:
@@ -738,7 +747,11 @@ class RouterWorker:
                 or agent_state["max_concurrent_tasks"] != 1
             ):
                 raise RouterConfigError("agent_concurrency_invalid")
-            if agent_state.get("runtime_id") != resolution.runtime_id:
+            if (
+                agent_state.get("runtime_id") != resolution.runtime_id
+                or resolution.model is not None
+                and agent_state.get("model") != resolution.model
+            ):
                 self._event(
                     request_id,
                     "switch_started",
@@ -792,13 +805,21 @@ class RouterWorker:
             if self.adapter.active_runs(
                 self.adapter.agent_runs(latest_instance, latest_agent.agent_id)
             ):
-                self.store.transition(
+                requeued = self.store.transition(
                     request_id,
                     "queued",
                     token=token,
                     expected={"creating"},
                     error="agent_busy",
                 )
+                if not requeued:
+                    current = self.store.get(request_id)
+                    return {
+                        "ok": True,
+                        "request_id": request_id,
+                        "state": current["state"] if current else "unknown",
+                        "state_changed": True,
+                    }
                 return {
                     "ok": True,
                     "processed": terminal_count,

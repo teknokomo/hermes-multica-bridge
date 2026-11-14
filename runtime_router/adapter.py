@@ -20,6 +20,10 @@ from .config import Instance
 
 _ERROR_CODE = re.compile(r"\A[a-z][a-z0-9_]{0,63}\Z")
 _MARKER = re.compile(r"<!-- router-request:[0-9a-f-]{36} -->")
+_AUTH_EMAIL = re.compile(r"(?m)^\s*User:\s*.*?\(([^()\s]+@[^()\s]+)\)\s*$")
+_RUN_CURSOR = re.compile(
+    r'(?i)More runs available; use --before\s+["\']([^"\']+)["\']'
+)
 _TERMINAL_RUN_STATES = {
     "cancelled",
     "canceled",
@@ -37,6 +41,7 @@ _ACTIVE_RUN_STATES = {
     "waiting_local_directory",
 }
 _MAX_CLI_RESPONSE_BYTES = 1_048_576
+_MAX_CLI_STDERR_BYTES = 65_536
 
 
 class MulticaCliError(RuntimeError):
@@ -89,56 +94,74 @@ class MulticaCliAdapter:
 
     def _run_bounded(
         self, argv: list[str], *, input_text: str | None, env: dict[str, str]
-    ) -> tuple[int, bytes, bool, bool]:
+    ) -> tuple[int, bytes, bytes, bool, bool, bool]:
         """Read CLI output incrementally and stop the process group at the cap."""
         process = subprocess.Popen(
             argv,
             stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             env=env,
             start_new_session=os.name == "posix",
             bufsize=0,
         )
-        assert process.stdout is not None
+        assert process.stdout is not None and process.stderr is not None
         selector = selectors.DefaultSelector()
         output = bytearray()
+        errors = bytearray()
         timed_out = False
-        too_large = False
+        output_too_large = False
+        errors_too_large = False
         pending_input = (
             memoryview(input_text.encode("utf-8")) if input_text is not None else None
         )
         stdout_open = True
+        stderr_open = True
         stdin_open = process.stdin is not None
         deadline = time.monotonic() + self.timeout
 
         try:
             os.set_blocking(process.stdout.fileno(), False)
             selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+            os.set_blocking(process.stderr.fileno(), False)
+            selector.register(process.stderr, selectors.EVENT_READ, "stderr")
             if process.stdin is not None:
                 os.set_blocking(process.stdin.fileno(), False)
                 selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
 
-            while stdout_open or process.poll() is None:
+            while stdout_open or stderr_open or process.poll() is None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     timed_out = True
                     self._stop_process(process)
                     break
                 for key, _mask in selector.select(min(remaining, 0.1)):
-                    if key.data == "stdout":
-                        room = _MAX_CLI_RESPONSE_BYTES + 1 - len(output)
-                        chunk = os.read(process.stdout.fileno(), min(65536, room))
+                    if key.data in {"stdout", "stderr"}:
+                        stream = process.stdout if key.data == "stdout" else process.stderr
+                        buffer = output if key.data == "stdout" else errors
+                        maximum = (
+                            _MAX_CLI_RESPONSE_BYTES
+                            if key.data == "stdout"
+                            else _MAX_CLI_STDERR_BYTES
+                        )
+                        room = maximum + 1 - len(buffer)
+                        chunk = os.read(stream.fileno(), min(65536, room))
                         if not chunk:
-                            selector.unregister(process.stdout)
-                            process.stdout.close()
-                            stdout_open = False
-                        elif len(output) + len(chunk) > _MAX_CLI_RESPONSE_BYTES:
-                            too_large = True
+                            selector.unregister(stream)
+                            stream.close()
+                            if key.data == "stdout":
+                                stdout_open = False
+                            else:
+                                stderr_open = False
+                        elif len(buffer) + len(chunk) > maximum:
+                            if key.data == "stdout":
+                                output_too_large = True
+                            else:
+                                errors_too_large = True
                             self._stop_process(process)
                             break
                         else:
-                            output.extend(chunk)
+                            buffer.extend(chunk)
                     else:
                         assert process.stdin is not None and pending_input is not None
                         try:
@@ -152,10 +175,10 @@ class MulticaCliAdapter:
                             selector.unregister(process.stdin)
                             process.stdin.close()
                             stdin_open = False
-                if too_large:
+                if output_too_large or errors_too_large:
                     break
 
-            if timed_out or too_large:
+            if timed_out or output_too_large or errors_too_large:
                 if stdin_open and process.stdin is not None:
                     try:
                         selector.unregister(process.stdin)
@@ -170,6 +193,13 @@ class MulticaCliAdapter:
                         pass
                     process.stdout.close()
                     stdout_open = False
+                if stderr_open:
+                    try:
+                        selector.unregister(process.stderr)
+                    except KeyError:
+                        pass
+                    process.stderr.close()
+                    stderr_open = False
             try:
                 returncode = process.wait(timeout=2)
             except subprocess.TimeoutExpired:
@@ -181,7 +211,14 @@ class MulticaCliAdapter:
                 process.stdin.close()
             if process.stdout is not None and not process.stdout.closed:
                 process.stdout.close()
-        return returncode, bytes(output), too_large, timed_out
+        return (
+            returncode,
+            bytes(output),
+            bytes(errors),
+            output_too_large,
+            errors_too_large,
+            timed_out,
+        )
 
     @staticmethod
     def _object(value: Any, key: str) -> dict[str, Any]:
@@ -198,7 +235,14 @@ class MulticaCliAdapter:
         *,
         input_text: str | None = None,
         uncertain_on_failure: bool = False,
-    ) -> dict[str, Any] | list[Any]:
+        capture_stderr: bool = False,
+        text_response: bool = False,
+    ) -> (
+        dict[str, Any]
+        | list[Any]
+        | str
+        | tuple[dict[str, Any] | list[Any] | str, str]
+    ):
         if any(
             not isinstance(arg, str) or "\x00" in arg or "\n" in arg or "\r" in arg
             for arg in args
@@ -222,7 +266,14 @@ class MulticaCliAdapter:
         }
         try:
             if self.runner is None:
-                returncode, raw_stdout, too_large, timed_out = self._run_bounded(
+                (
+                    returncode,
+                    raw_stdout,
+                    raw_stderr,
+                    too_large,
+                    stderr_too_large,
+                    timed_out,
+                ) = self._run_bounded(
                     argv, input_text=input_text, env=env
                 )
                 if timed_out:
@@ -232,20 +283,54 @@ class MulticaCliAdapter:
                         "multica_cli_response_too_large",
                         uncertain=uncertain_on_failure,
                     )
-                stdout = raw_stdout.decode("utf-8")
+                if capture_stderr and stderr_too_large:
+                    raise MulticaCliError("multica_cli_response_too_large")
+                try:
+                    stdout = raw_stdout.decode("utf-8")
+                    stderr = raw_stderr.decode("utf-8") if capture_stderr else ""
+                except UnicodeDecodeError:
+                    raise MulticaCliError(
+                        "multica_cli_invalid_encoding",
+                        uncertain=uncertain_on_failure,
+                    ) from None
             else:
                 result = self.runner(
                     argv,
                     input=input_text,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
                     check=False,
                     timeout=self.timeout,
                     env=env,
-                    text=True,
+                    text=False,
                 )
                 returncode = result.returncode
-                stdout = result.stdout if isinstance(result.stdout, str) else ""
+                raw_stdout = result.stdout if isinstance(result.stdout, bytes) else (
+                    result.stdout.encode("utf-8")
+                    if isinstance(result.stdout, str)
+                    else b""
+                )
+                result_stderr = getattr(result, "stderr", None)
+                raw_stderr = result_stderr if isinstance(result_stderr, bytes) else (
+                    result_stderr.encode("utf-8")
+                    if isinstance(result_stderr, str)
+                    else b""
+                )
+                if len(raw_stdout) > _MAX_CLI_RESPONSE_BYTES or (
+                    capture_stderr and len(raw_stderr) > _MAX_CLI_STDERR_BYTES
+                ):
+                    raise MulticaCliError(
+                        "multica_cli_response_too_large",
+                        uncertain=uncertain_on_failure,
+                    )
+                try:
+                    stdout = raw_stdout.decode("utf-8")
+                    stderr = raw_stderr.decode("utf-8") if capture_stderr else ""
+                except UnicodeDecodeError:
+                    raise MulticaCliError(
+                        "multica_cli_invalid_encoding",
+                        uncertain=uncertain_on_failure,
+                    ) from None
                 if len(stdout.encode("utf-8", "replace")) > _MAX_CLI_RESPONSE_BYTES:
                     raise MulticaCliError(
                         "multica_cli_response_too_large",
@@ -255,13 +340,18 @@ class MulticaCliAdapter:
             raise MulticaCliError("multica_cli_timeout", uncertain=True) from None
         except OSError:
             raise MulticaCliError("multica_cli_unavailable") from None
-        try:
-            body = json.loads(stdout)
-        except (ValueError, RecursionError):
-            raise MulticaCliError(
-                "multica_cli_invalid_response",
-                uncertain=uncertain_on_failure or returncode == 0,
-            ) from None
+        if text_response:
+            if returncode:
+                raise MulticaCliError("multica_cli_rejected")
+            body: dict[str, Any] | list[Any] | str = stdout
+        else:
+            try:
+                body = json.loads(stdout)
+            except (ValueError, RecursionError):
+                raise MulticaCliError(
+                    "multica_cli_invalid_response",
+                    uncertain=uncertain_on_failure or returncode == 0,
+                ) from None
         if returncode:
             raw_code = body.get("error_code") if isinstance(body, dict) else None
             code = (
@@ -270,11 +360,13 @@ class MulticaCliAdapter:
                 else "multica_cli_rejected"
             )
             raise MulticaCliError(code, uncertain=uncertain_on_failure)
-        if not isinstance(body, (dict, list)):
+        if not isinstance(body, (dict, list, str)) or (
+            isinstance(body, str) and not text_response
+        ):
             raise MulticaCliError(
                 "multica_cli_invalid_response", uncertain=uncertain_on_failure
             )
-        return body
+        return (body, stderr) if capture_stderr else body
 
     def workspace_list(self, instance: Instance) -> list[dict[str, Any]]:
         value = self._call(instance, ["workspace", "list", "--output", "json"])
@@ -290,6 +382,46 @@ class MulticaCliAdapter:
             raise MulticaCliError("multica_cli_invalid_response")
         return project
 
+    def _current_workspace_user_id(self, instance: Instance) -> str:
+        auth_result = self._call(
+            instance, ["auth", "status"],
+            text_response=True,
+            capture_stderr=True,
+        )
+        assert isinstance(auth_result, tuple)
+        auth_output, auth_stderr = auth_result
+        assert isinstance(auth_output, str)
+        match = _AUTH_EMAIL.search(auth_output) or _AUTH_EMAIL.search(auth_stderr)
+        if match is None:
+            raise MulticaCliError("multica_cli_identity_unavailable")
+        email = match.group(1).casefold()
+        members_value = self._call(
+            instance, ["workspace", "member", "list", "--output", "json"]
+        )
+        members = (
+            members_value
+            if isinstance(members_value, list)
+            else members_value.get("members")
+            if isinstance(members_value, dict)
+            else None
+        )
+        if not isinstance(members, list):
+            raise MulticaCliError("multica_cli_invalid_response")
+        matches = [
+            row
+            for row in members
+            if isinstance(row, dict)
+            and isinstance(row.get("email"), str)
+            and row["email"].casefold() == email
+        ]
+        if (
+            len(matches) != 1
+            or not isinstance(matches[0].get("user_id"), str)
+            or not matches[0]["user_id"]
+        ):
+            raise MulticaCliError("multica_cli_identity_unavailable")
+        return matches[0]["user_id"]
+
     def runtime_list(self, instance: Instance) -> list[dict[str, Any]]:
         value = self._call(instance, ["runtime", "list", "--output", "json"])
         rows = value if isinstance(value, list) else value.get("runtimes")
@@ -299,8 +431,19 @@ class MulticaCliAdapter:
             or any(
                 not isinstance(row.get("id"), str)
                 or not row.get("id")
+                or row.get("workspace_id") != instance.workspace_id
                 or row.get("status") not in {"online", "offline"}
-                or type(row.get("accessible")) is not bool
+                or row.get("visibility") not in {"private", "public"}
+                or row.get("owner_id") is not None
+                and (not isinstance(row.get("owner_id"), str) or not row["owner_id"])
+                or "shared_with" in row
+                and (
+                    not isinstance(row["shared_with"], list)
+                    or any(
+                        not isinstance(user_id, str) or not user_id
+                        for user_id in row["shared_with"]
+                    )
+                )
                 or "models" in row
                 and (
                     not isinstance(row["models"], list)
@@ -313,7 +456,22 @@ class MulticaCliAdapter:
             )
         ):
             raise MulticaCliError("multica_cli_invalid_response")
-        return rows
+        user_id = self._current_workspace_user_id(instance)
+        return [
+            {
+                **row,
+                "accessible": bool(
+                    isinstance(row.get("owner_id"), str)
+                    and (
+                        row["owner_id"] == user_id
+                        or row["visibility"] == "public"
+                        or row["visibility"] == "private"
+                        and user_id in row.get("shared_with", [])
+                    )
+                ),
+            }
+            for row in rows
+        ]
 
     def agent_get(self, instance: Instance, agent_id: str) -> dict[str, Any]:
         value = self._call(instance, ["agent", "get", agent_id, "--output", "json"])
@@ -345,22 +503,17 @@ class MulticaCliAdapter:
             raise MulticaCliError("agent_concurrency_invalid")
         if agent.get("runtime_id") != runtime_id:
             raise MulticaCliError("runtime_switch_failed", uncertain=True)
+        agent_model = agent.get("model")
+        if not isinstance(agent_model, str) or not agent_model:
+            raise MulticaCliError("runtime_default_model_unverified", uncertain=True)
+        models = target.get("models")
         if model is not None:
-            if agent.get("model") != model:
+            if agent_model != model:
                 raise MulticaCliError("runtime_switch_failed", uncertain=True)
-            models = target.get("models")
-            if not isinstance(models, list) or model not in models:
+            if isinstance(models, list) and model not in models:
                 raise MulticaCliError("model_unsupported")
-        else:
-            models = target.get("models")
-            if (
-                not isinstance(models, list)
-                or not isinstance(agent.get("model"), str)
-                or agent["model"] not in models
-            ):
-                raise MulticaCliError(
-                    "runtime_default_model_unverified", uncertain=True
-                )
+        elif isinstance(models, list) and agent_model not in models:
+            raise MulticaCliError("runtime_default_model_unverified", uncertain=True)
         return agent
 
     def agent_runs(self, instance: Instance, agent_id: str) -> list[dict[str, Any]]:
@@ -371,11 +524,13 @@ class MulticaCliAdapter:
             args = ["agent", "tasks", agent_id, "--output", "json", "--limit", "200"]
             if before:
                 args.extend(["--before", before])
-            page = self._call(instance, args)
+            page, stderr = self._call(instance, args, capture_stderr=True)
+            assert isinstance(stderr, str)
             if isinstance(page, list):
                 items = page
-                next_before = None
                 has_more = len(items) == 200
+                cursor = _RUN_CURSOR.search(stderr)
+                next_before = cursor.group(1) if cursor else None
             elif isinstance(page, dict):
                 items = page.get("tasks", page.get("runs"))
                 next_before = page.get("next_before", page.get("next_cursor"))
@@ -425,8 +580,11 @@ class MulticaCliAdapter:
         ):
             raise MulticaCliError("runtime_not_allowed")
         models = target.get("models")
-        if model is not None and (not isinstance(models, list) or model not in models):
+        if model is not None and isinstance(models, list) and model not in models:
             raise MulticaCliError("model_unsupported")
+        current_agent = self.agent_get(instance, agent_id)
+        if model is None and current_agent.get("runtime_id") != runtime_id:
+            raise MulticaCliError("runtime_default_model_unverified")
         args = ["agent", "update", agent_id, "--runtime-id", runtime_id]
         if model is not None:
             args.extend(["--model", model])
@@ -479,6 +637,8 @@ class MulticaCliAdapter:
                 raise MulticaCliError("multica_cli_invalid_response")
             for row in rows:
                 description = row.get("description")
+                if description is None:
+                    continue
                 if not isinstance(description, str):
                     raise MulticaCliError("multica_cli_invalid_response")
                 if marker not in description:

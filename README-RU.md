@@ -387,7 +387,7 @@ Runtime Router связывает trusted Telegram/MAX identity с runtime bindi
 `multica_runtime_task_create` ставит запрос в очередь; `multica_runtime_status` показывает его состояние; `multica_runtime_cancel` отменяет его. Инструменты bindings позволяют пользователю управлять только собственной привязкой в разрешённых границах.
 
 - В режиме `strict` действует только default binding; `exceptions` допускает правила с явным priority и fail-closed разрешением равенств.
-- Runtime переключается только после проверки, что у canonical agent нет активных или queued runs; затем readback подтверждает runtime и модель.
+- Runtime переключается только после проверки, что у canonical agent нет активных или queued runs; затем readback подтверждает runtime и модель. CLI 0.8.2 не возвращает каталог моделей runtime, поэтому явный `model_by_runtime` сверяется с readback `agent get`; фактический запуск всё равно требует target canary.
 - Неопределённый результат создания issue не повторяется вслепую. Запрос проходит reconciliation по стабильному marker.
 - Обычный маршрут 0.6.0 и `multica_workspace_send` не меняются; router-enabled route принимает задачу только через очередь.
 
@@ -399,7 +399,7 @@ CLI profile живёт в отдельном приватном `state_path.pare
 
 `kanban_mirror=true` отвергается: отдельный worker не имеет поддерживаемого публичного Hermes projection API в 0.7.0. Очередь и её состояние находятся только в plugin-owned SQLite.
 
-Перед enable выполните backup state/config, проверьте CLI profile, workspace, agent, доступность runtime и model mapping. Создание задачи через очередь запускает worker и может создать issue; не используйте его как read-only probe.
+Перед enable выполните backup state/config, проверьте CLI profile, workspace, agent, доступность runtime и model mapping. Отправка задачи только записывает её в очередь; отдельно запланированный worker обработает запись и может создать issue, поэтому не используйте этот вызов как read-only probe.
 
 Миграция SQLite additive и transactional. Откат выполняется остановкой timer, возвратом прежней версии и восстановлением совместимого snapshot; неизвестная схема не переписывается.
 

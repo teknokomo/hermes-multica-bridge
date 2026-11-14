@@ -410,7 +410,13 @@ def _dispatch(
             if set(overlay) - {"instances"}:
                 raise RouterConfigError("operator_config_invalid")
             instances = overlay.get("instances", {})
-            if not isinstance(instances, dict) or args.instance_id in instances:
+            baseline_instances = raw.get("instances", {})
+            if (
+                not isinstance(instances, dict)
+                or not isinstance(baseline_instances, dict)
+                or args.instance_id in instances
+                or args.instance_id in baseline_instances
+            ):
                 raise RouterConfigError("instance_id_conflict")
             candidate_instances = {
                 **raw.get("instances", {}),

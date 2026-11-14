@@ -10,13 +10,14 @@ import threading
 import time
 import unittest
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from bridge.registry import new_id, registry_from_mapping, route_policy_fingerprint
 from runtime_router.adapter import MulticaCliAdapter, MulticaCliError
-from runtime_router.cli import _check_runtime, _doctor
+from runtime_router.cli import _check_runtime, _dispatch, _doctor, _parser
 from runtime_router.config import RouterConfig, RouterConfigError, service_cli_home
 from runtime_router.policy import (
     ResolutionError,
@@ -117,6 +118,7 @@ class FakeAdapter:
         self.created = []
         self.switched = []
         self.current_runtime = RUNTIME_A
+        self.current_model = None
         self.issue = None
 
     def runtime_list(self, _instance):
@@ -139,7 +141,8 @@ class FakeAdapter:
         return {
             "id": agent_id,
             "runtime_id": self.current_runtime,
-            "model": MODEL_A if self.current_runtime == RUNTIME_A else MODEL_B,
+            "model": self.current_model
+            or (MODEL_A if self.current_runtime == RUNTIME_A else MODEL_B),
             "max_concurrent_tasks": 1,
         }
 
@@ -152,11 +155,12 @@ class FakeAdapter:
             raise MulticaCliError("runtime_switch_failed", uncertain=True)
         return record
 
-    def switch_runtime(self, _instance, _agent_id, runtime_id, _model):
+    def switch_runtime(self, _instance, _agent_id, runtime_id, model):
         if self.switch_error:
             raise self.switch_error
         self.switched.append(runtime_id)
         self.current_runtime = runtime_id
+        self.current_model = model
         return self.agent_get(_instance, _agent_id)
 
     def agent_runs(self, _instance, _agent_id):
@@ -272,6 +276,22 @@ class RuntimeRouterTests(unittest.TestCase):
             model=model,
         )
 
+    @staticmethod
+    def set_valid_route_policy_hash(
+        store: RouterStore, request: dict, registry_mapping: dict
+    ) -> None:
+        registry = registry_from_mapping(registry_mapping)
+        route = registry.routes[0]
+        payload = json.loads(request["payload_json"])
+        payload["route_policy_hash"] = route_request_policy_hash(
+            route_policy_fingerprint(registry, route), request["project_id"]
+        )
+        with store.connect() as db:
+            db.execute(
+                "UPDATE router_requests SET payload_json=? WHERE request_id=?",
+                (json.dumps(payload, separators=(",", ":")), request["request_id"]),
+            )
+
     def publish_snapshot(self, registry: dict) -> None:
         profiles = self.db_path.parent / "profiles"
         profiles.mkdir(mode=0o700)
@@ -362,6 +382,119 @@ class RuntimeRouterTests(unittest.TestCase):
                     RouterConfigError, "router_profile_snapshots_unavailable"
                 ):
                     RouterWorker(valid)._profile_snapshots()
+
+    def test_state_path_change_disables_old_snapshot_before_publishing_new_path(self):
+        old_config = RouterConfig.parse(self.raw_config)
+        new_path = self.root / "new-state" / "router.sqlite3"
+        new_config_raw = json.loads(json.dumps(self.raw_config))
+        new_config_raw["state_path"] = str(new_path)
+        new_config = RouterConfig.parse(new_config_raw)
+        RouterStore(old_config.state_path)
+        RouterStore(new_config.state_path)
+        data_root = self.root / "hermes-plugin-data"
+        data_root.mkdir(mode=0o700)
+        storage_package = ModuleType("plugins")
+        storage_package.__path__ = []
+        storage_module = ModuleType("plugins.plugin_storage")
+        storage_module.plugin_data_dir = lambda _plugin_name: data_root
+
+        class Context:
+            profile_name = "default"
+
+            def get_config(self, key, default=None):
+                return workspace_router_registry() if key == "registry" else default
+
+        runtime = RuntimeRouterTools(Context())
+        registry = workspace_router_registry()
+        with patch.dict(
+            "sys.modules",
+            {"plugins": storage_package, "plugins.plugin_storage": storage_module},
+        ):
+            runtime._snapshot_profile(
+                old_config,
+                "default",
+                runtime_config_snapshot=self.raw_config,
+                registry_snapshot=registry,
+            )
+            runtime._snapshot_profile(
+                new_config,
+                "default",
+                runtime_config_snapshot=new_config_raw,
+                registry_snapshot=registry,
+            )
+            old_snapshot = json.loads(
+                (old_config.state_path.parent / "profiles/default.json").read_text()
+            )
+            new_snapshot = json.loads(
+                (new_config.state_path.parent / "profiles/default.json").read_text()
+            )
+            from runtime_router.tools import _read_profile_state_pointer
+
+            self.assertEqual(
+                _read_profile_state_pointer("default"), new_config.state_path
+            )
+        self.assertEqual(
+            old_snapshot["runtime_router"], {"__invalid_configuration__": True}
+        )
+        self.assertTrue(new_snapshot["runtime_router"]["enabled"])
+        with self.assertRaisesRegex(
+            RouterConfigError, "router_profile_snapshots_unavailable"
+        ):
+            RouterWorker(old_config)._profile_snapshots()
+
+    def test_instance_add_rejects_id_already_in_baseline_config(self):
+        operator_path = self.root / "operator.json"
+        operator_path.write_text('{"instances":{}}', encoding="utf-8")
+        operator_path.chmod(0o600)
+        raw = {**self.raw_config, "operator_config_path": str(operator_path)}
+        config = RouterConfig.parse(raw)
+        args = _parser().parse_args(
+            [
+                "--config",
+                str(self.root / "router.json"),
+                "instance",
+                "add",
+                "--instance-id",
+                INSTANCE,
+                "--cli-profile",
+                "another-profile",
+                "--workspace-id",
+                "workspace-2",
+                "--base-url",
+                "https://multica.example",
+            ]
+        )
+        adapter = SimpleNamespace(workspace_list=Mock())
+        with (
+            patch("runtime_router.cli._adapter", return_value=adapter),
+            self.assertRaisesRegex(RouterConfigError, "instance_id_conflict"),
+        ):
+            _dispatch(args, raw, config, os.geteuid())
+        adapter.workspace_list.assert_not_called()
+        self.assertEqual(json.loads(operator_path.read_text()), {"instances": {}})
+
+    def test_terminal_sweep_rotates_active_page_across_ticks(self):
+        store = self.initialized_store()
+        store.record_worker_heartbeat("worker", "running")
+        for index in range(6):
+            request, _ = self.enqueue(
+                store,
+                key=f"sweep-{index}",
+                agent_id=f"agent-{index}",
+            )
+            with store.connect() as db:
+                db.execute(
+                    "UPDATE router_requests SET state='switching' WHERE request_id=?",
+                    (request["request_id"],),
+                )
+        ids = sorted(row["request_id"] for row in store.active(limit=100))
+        worker = RouterWorker(self.config, adapter=FakeAdapter())
+        worker._terminal_sweep(self.config, {}, {"default"})
+        self.assertEqual(store.terminal_sweep_cursor(), ids[3])
+        worker._terminal_sweep(self.config, {}, {"default"})
+        self.assertEqual(store.terminal_sweep_cursor(), ids[1])
+        worker._terminal_sweep(self.config, {}, {"default"})
+        self.assertEqual(store.terminal_sweep_cursor(), ids[5])
 
     def test_config_rejects_duplicate_canonical_agent_per_instance(self):
         duplicate = dict(self.raw_config)
@@ -528,15 +661,23 @@ class RuntimeRouterTests(unittest.TestCase):
             {"status": "offline", "accessible": True, "models": [MODEL_A]},
             {"status": "online", "accessible": False, "models": [MODEL_A]},
             {"status": "online", "accessible": True, "models": [MODEL_B]},
-            {"status": "online", "accessible": True},
         ):
             with self.subTest(runtime=runtime), self.assertRaises(ResolutionError):
                 resolve_runtime(**{**common, "runtime_catalog": {RUNTIME_A: runtime}})
+        without_model_catalog = resolve_runtime(
+            **{
+                **common,
+                "runtime_catalog": {
+                    RUNTIME_A: {"status": "online", "accessible": True}
+                },
+            }
+        )
+        self.assertEqual(without_model_catalog.model, MODEL_A)
 
     def test_fresh_schema_integrity_and_private_modes(self):
         store = RouterStore(self.db_path)
         result = store.check()
-        self.assertEqual(result["schema"], 3)
+        self.assertEqual(result["schema"], 4)
         self.assertEqual(result["journal_mode"].lower(), "wal")
         self.assertEqual(self.db_path.stat().st_mode & 0o777, 0o600)
 
@@ -548,17 +689,18 @@ class RuntimeRouterTests(unittest.TestCase):
             db.execute("DROP TABLE router_worker_state")
             db.execute("PRAGMA user_version=1")
         migrated = RouterStore(self.db_path)
-        self.assertEqual(migrated.check()["schema"], 3)
-        self.assertEqual(RouterStore(self.db_path).check()["schema"], 3)
+        self.assertEqual(migrated.check()["schema"], 4)
+        self.assertEqual(RouterStore(self.db_path).check()["schema"], 4)
 
     def test_additive_v2_migration_is_idempotent(self):
         RouterStore(self.db_path)
         with sqlite3.connect(self.db_path) as db:
             db.execute("ALTER TABLE router_requests DROP COLUMN cancel_source_state")
             db.execute("ALTER TABLE router_requests DROP COLUMN reconcile_source_state")
+            db.execute("ALTER TABLE router_worker_state DROP COLUMN terminal_sweep_cursor")
             db.execute("PRAGMA user_version=2")
         migrated = RouterStore(self.db_path)
-        self.assertEqual(migrated.check()["schema"], 3)
+        self.assertEqual(migrated.check()["schema"], 4)
         columns = {
             row[1]
             for row in sqlite3.connect(self.db_path).execute(
@@ -567,7 +709,40 @@ class RuntimeRouterTests(unittest.TestCase):
         }
         self.assertIn("cancel_source_state", columns)
         self.assertIn("reconcile_source_state", columns)
-        self.assertEqual(RouterStore(self.db_path).check()["schema"], 3)
+        self.assertEqual(RouterStore(self.db_path).check()["schema"], 4)
+
+    def test_additive_v3_migration_and_terminal_sweep_cursor(self):
+        RouterStore(self.db_path)
+        with sqlite3.connect(self.db_path) as db:
+            db.execute("ALTER TABLE router_worker_state DROP COLUMN terminal_sweep_cursor")
+            db.execute("PRAGMA user_version=3")
+        migrated = RouterStore(self.db_path)
+        self.assertEqual(migrated.check()["schema"], 4)
+        migrated.record_worker_heartbeat("worker", "running")
+        migrated.set_terminal_sweep_cursor("request-cursor")
+        self.assertEqual(RouterStore(self.db_path).terminal_sweep_cursor(), "request-cursor")
+
+        for index in range(5):
+            request, _ = self.enqueue(
+                migrated,
+                key=f"active-{index}",
+                agent_id=f"agent-{index}",
+            )
+            with migrated.connect() as db:
+                db.execute(
+                    "UPDATE router_requests SET state='waiting' WHERE request_id=?",
+                    (request["request_id"],),
+                )
+        ordered = sorted(
+            row["request_id"] for row in migrated.active(limit=100)
+        )
+        first = migrated.active(limit=2)
+        second = migrated.active(limit=2, after_request_id=first[-1]["request_id"])
+        self.assertEqual(
+            [row["request_id"] for row in first + second], ordered[:4]
+        )
+        wrapped = migrated.active(limit=2, after_request_id=ordered[-1])
+        self.assertEqual([row["request_id"] for row in wrapped], ordered[:2])
 
     def test_unknown_schema_is_rejected_without_rewriting_file(self):
         with sqlite3.connect(self.db_path) as db:
@@ -637,6 +812,7 @@ class RuntimeRouterTests(unittest.TestCase):
                 },
             },
             model_by_runtime={RUNTIME_A: MODEL_A, RUNTIME_B: MODEL_B},
+            now=datetime(2026, 11, 14, tzinfo=UTC),
         )
         self.assertEqual(resolved.runtime_id, RUNTIME_B)
         self.assertEqual(resolved.rule_id, "exception-1")
@@ -843,6 +1019,149 @@ class RuntimeRouterTests(unittest.TestCase):
         with self.assertRaisesRegex(MulticaCliError, "invalid_response"):
             adapter.runtime_list(self.config.instance(INSTANCE))
 
+    def test_cli_adapter_derives_runtime_access_from_multica_082_fields(self):
+        user_id = "member-user-id"
+        email = "service@example.test"
+        rows = [
+            {
+                "id": RUNTIME_A,
+                "workspace_id": "workspace-1",
+                "owner_id": "owner-1",
+                "visibility": "private",
+                "shared_with": [user_id],
+                "status": "online",
+            },
+            {
+                "id": RUNTIME_B,
+                "workspace_id": "workspace-1",
+                "owner_id": "owner-2",
+                "visibility": "private",
+                "shared_with": [],
+                "status": "online",
+            },
+            {
+                "id": "runtime-public",
+                "workspace_id": "workspace-1",
+                "owner_id": "owner-3",
+                "visibility": "public",
+                "shared_with": [],
+                "status": "online",
+            },
+            {
+                "id": "runtime-public-no-owner",
+                "workspace_id": "workspace-1",
+                "owner_id": None,
+                "visibility": "public",
+                "shared_with": [],
+                "status": "online",
+            },
+            {
+                "id": "runtime-shared-no-owner",
+                "workspace_id": "workspace-1",
+                "owner_id": None,
+                "visibility": "private",
+                "shared_with": [user_id],
+                "status": "online",
+            },
+        ]
+
+        def runner(argv, **_kwargs):
+            command = argv[7:]
+            if command[:2] == ["runtime", "list"]:
+                stdout, stderr = json.dumps(rows), ""
+            elif command[:2] == ["auth", "status"]:
+                stdout, stderr = "User: Service Account (service@example.test)\n", "token prefix hidden"
+            elif command[:3] == ["workspace", "member", "list"]:
+                stdout, stderr = json.dumps(
+                    {"members": [{"user_id": user_id, "email": email, "role": "member"}]}
+                ), ""
+            else:
+                self.fail(f"unexpected CLI command shape: {command[:3]}")
+            return SimpleNamespace(
+                returncode=0, stdout=stdout.encode(), stderr=stderr.encode()
+            )
+
+        adapter = MulticaCliAdapter(runner=runner)
+        result = adapter.runtime_list(self.config.instance(INSTANCE))
+        self.assertEqual(
+            [row["accessible"] for row in result],
+            [True, False, True, False, False],
+        )
+        self.assertNotIn("token prefix hidden", repr(result))
+
+    def test_cli_adapter_marks_invalid_utf8_create_output_uncertain(self):
+        calls = 0
+
+        def runner(_argv, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return SimpleNamespace(
+                returncode=0,
+                stdout=b"[]" if calls == 1 else b"\xff",
+                stderr=b"",
+            )
+
+        adapter = MulticaCliAdapter(runner=runner)
+        with self.assertRaisesRegex(MulticaCliError, "invalid_encoding") as caught:
+            adapter.create_issue(
+                self.config.instance(INSTANCE),
+                request_id=ROUTE,
+                agent_id=AGENT,
+                project_id="project-1",
+                title="Test",
+                description="Body",
+            )
+        self.assertTrue(caught.exception.uncertain)
+
+    def test_agent_runs_uses_stderr_cursor_for_full_json_page(self):
+        calls = []
+        full_page = [{"id": f"run-{index}", "status": "completed"} for index in range(200)]
+
+        def runner(argv, **_kwargs):
+            command = argv[7:]
+            calls.append(command)
+            if "--before" not in command:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps(full_page).encode(),
+                    stderr=b'More runs available; use --before "cursor-1" to fetch the next page.',
+                )
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([{"id": "run-last", "status": "completed"}]).encode(),
+                stderr=b"",
+            )
+
+        rows = MulticaCliAdapter(runner=runner).agent_runs(
+            self.config.instance(INSTANCE), AGENT
+        )
+        self.assertEqual(len(rows), 201)
+        self.assertEqual(calls[1][calls[1].index("--before") + 1], "cursor-1")
+
+    def test_find_request_issue_skips_nullable_descriptions(self):
+        marker = f"<!-- router-request:{ROUTE} -->"
+
+        def runner(_argv, **_kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(
+                    [
+                        {"description": None, "project_id": "project-1"},
+                        {
+                            "id": "issue-1",
+                            "description": marker,
+                            "project_id": "project-1",
+                        },
+                    ]
+                ).encode(),
+                stderr=b"",
+            )
+
+        issue = MulticaCliAdapter(runner=runner).find_request_issue(
+            self.config.instance(INSTANCE), marker, "project-1"
+        )
+        self.assertEqual(issue["id"], "issue-1")
+
     def test_cli_adapter_stops_child_when_incremental_output_exceeds_limit(self):
         import shlex
 
@@ -954,6 +1273,36 @@ class RuntimeRouterTests(unittest.TestCase):
 
         self.assertTrue(result["ok"], result)
         self.assertEqual(store.get(result["request_id"])["state"], "queued")
+
+    def test_create_enforces_required_attachment_when_context_is_empty(self):
+        store = self.initialized_store()
+        source = {
+            key: value
+            for key, value in source_context().items()
+            if key not in {"profile", "thread_id"}
+        }
+        source.update({"thread_id": "123", "chat_type": "thread"})
+        raw_registry = workspace_router_registry()
+        raw_registry["routes"][0]["require_source_attachment"] = True
+        registry = registry_from_mapping(raw_registry)
+        route = registry.routes[0]
+        tools = RuntimeRouterTools(SimpleNamespace())
+        tools._context = lambda _tool_context=None: (  # type: ignore[method-assign]
+            source,
+            "default",
+            self.config,
+            store,
+        )
+        message = SimpleNamespace(source=source, attachments=[], **source)
+        with (
+            patch("runtime_router.tools.WorkspaceRuntime._registry", return_value=registry),
+            patch("runtime_router.tools.WorkspaceRuntime._route", return_value=route),
+            patch("runtime_router.tools.MulticaCliAdapter", return_value=FakeAdapter()),
+            patch("runtime_router.tools._load_hermes_context", return_value=message),
+        ):
+            result = json.loads(tools.create({"route_id": ROUTE, "title": "Fixture"}))
+        self.assertEqual(result["error_code"], "attachment_required")
+        self.assertEqual(store.runtime_metrics()["queue_depth"], 0)
 
     def test_spool_serializes_failed_rollback_against_shared_blob_store(self):
         spool = AttachmentSpool(self.root / "serialized-spool")
@@ -1206,10 +1555,44 @@ class RuntimeRouterTests(unittest.TestCase):
         self.publish_snapshot(registry)
         adapter = FakeAdapter(runs=[{"status": "running"}])
         result = RouterWorker(self.config, adapter=adapter).tick()
-        self.assertTrue(result["queued"])
+        self.assertTrue(result["queued"], result)
         self.assertEqual(store.get(request["request_id"])["state"], "queued")
         self.assertEqual(adapter.created, [])
         self.assertEqual(adapter.switched, [])
+
+    def test_worker_requeues_if_run_appears_at_pre_post_check(self):
+        store = self.initialized_store()
+        request, _ = self.enqueue(store, key="late-agent-busy")
+        registry = workspace_router_registry()
+        self.set_valid_route_policy_hash(store, request, registry)
+        self.publish_snapshot(registry)
+        adapter = FakeAdapter()
+        calls = 0
+
+        def runs_on_second_check(_instance, _agent_id):
+            nonlocal calls
+            calls += 1
+            return [] if calls == 1 else [{"status": "running"}]
+
+        adapter.agent_runs = runs_on_second_check
+        result = RouterWorker(self.config, adapter=adapter).tick()
+        self.assertTrue(result["queued"])
+        self.assertEqual(store.get(request["request_id"])["state"], "queued")
+        self.assertEqual(adapter.created, [])
+
+    def test_worker_reapplies_configured_model_when_runtime_is_unchanged(self):
+        store = self.initialized_store()
+        request, _ = self.enqueue(store, key="model-drift")
+        registry = workspace_router_registry()
+        self.set_valid_route_policy_hash(store, request, registry)
+        self.publish_snapshot(registry)
+        adapter = FakeAdapter()
+        adapter.current_model = MODEL_B
+        result = RouterWorker(self.config, adapter=adapter).tick()
+        self.assertEqual(result["state"], "waiting", result)
+        self.assertEqual(store.get(request["request_id"])["state"], "waiting")
+        self.assertEqual(adapter.switched, [RUNTIME_A])
+        self.assertEqual(adapter.current_model, MODEL_A)
 
     def test_worker_never_retries_uncertain_issue_creation(self):
         store = self.initialized_store()

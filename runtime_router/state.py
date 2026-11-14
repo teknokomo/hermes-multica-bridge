@@ -16,7 +16,7 @@ from typing import Any
 
 from .config import RouterConfigError
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 ACTIVE_STATES = ("switching", "creating", "waiting", "reconciling", "cancelling")
 TERMINAL_STATES = {"done", "failed", "cancelled"}
 _PRINCIPAL_ID = re.compile(
@@ -142,6 +142,13 @@ _V3_COLUMNS = {
         "reconcile_source_state",
     ),
 }
+_V4_COLUMNS = {
+    **_V3_COLUMNS,
+    "router_worker_state": (
+        *_V3_COLUMNS["router_worker_state"],
+        "terminal_sweep_cursor",
+    ),
+}
 _TRANSITIONS = {
     "queued": {"switching", "cancelled", "blocked"},
     "switching": {
@@ -152,7 +159,14 @@ _TRANSITIONS = {
         "blocked",
         "failed",
     },
-    "creating": {"waiting", "cancelling", "reconciling", "blocked", "failed"},
+    "creating": {
+        "queued",
+        "waiting",
+        "cancelling",
+        "reconciling",
+        "blocked",
+        "failed",
+    },
     "waiting": {"done", "failed", "cancelled", "cancelling", "reconciling", "blocked"},
     "reconciling": {
         "queued",
@@ -325,9 +339,25 @@ class RouterStore:
                     raise RouterConfigError("router_database_migration_failed") from exc
                 names = self._table_names(db)
                 version = db.execute("PRAGMA user_version").fetchone()[0]
+            if names == _TABLES and version == 3:
+                if not RouterStore._schema_matches(db, _V3_COLUMNS):
+                    raise RouterConfigError("router_database_schema_unsupported")
+                try:
+                    db.executescript("""
+                        BEGIN IMMEDIATE;
+                        ALTER TABLE router_worker_state ADD COLUMN terminal_sweep_cursor TEXT;
+                        PRAGMA user_version=4;
+                        COMMIT;
+                    """)
+                except sqlite3.Error as exc:
+                    if db.in_transaction:
+                        db.rollback()
+                    raise RouterConfigError("router_database_migration_failed") from exc
+                names = self._table_names(db)
+                version = db.execute("PRAGMA user_version").fetchone()[0]
             if names and (
                 version != SCHEMA_VERSION
-                or not RouterStore._schema_matches(db, _V3_COLUMNS)
+                or not RouterStore._schema_matches(db, _V4_COLUMNS)
             ):
                 raise RouterConfigError("router_database_schema_unsupported")
             if names:
@@ -439,8 +469,9 @@ class RouterStore:
                     state TEXT NOT NULL CHECK(state IN ('running','idle','error')),
                     heartbeat_at INTEGER NOT NULL,
                     last_tick_at INTEGER NOT NULL,
-                    last_error_code TEXT);
-                PRAGMA user_version=3;
+                    last_error_code TEXT,
+                    terminal_sweep_cursor TEXT);
+                PRAGMA user_version=4;
                 COMMIT;
             """)
         except sqlite3.Error as exc:
@@ -774,11 +805,29 @@ class RouterStore:
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             db.execute(
-                "INSERT INTO router_worker_state(singleton,worker_id,state,heartbeat_at,last_tick_at,last_error_code) "
-                "VALUES(1,?,?,?,?,?) ON CONFLICT(singleton) DO UPDATE SET worker_id=excluded.worker_id, "
+                "INSERT INTO router_worker_state(singleton,worker_id,state,heartbeat_at,last_tick_at,last_error_code,terminal_sweep_cursor) "
+                "VALUES(1,?,?,?,?,?,NULL) ON CONFLICT(singleton) DO UPDATE SET worker_id=excluded.worker_id, "
                 "state=excluded.state,heartbeat_at=excluded.heartbeat_at,last_tick_at=excluded.last_tick_at, "
                 "last_error_code=excluded.last_error_code",
                 (worker_id, state, now, now, error),
+            )
+            db.commit()
+
+    def terminal_sweep_cursor(self) -> str | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT terminal_sweep_cursor FROM router_worker_state WHERE singleton=1"
+            ).fetchone()
+        return row["terminal_sweep_cursor"] if row else None
+
+    def set_terminal_sweep_cursor(self, request_id: str) -> None:
+        if not isinstance(request_id, str) or not request_id or len(request_id) > 128:
+            raise RouterConfigError("invalid_worker_cursor")
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "UPDATE router_worker_state SET terminal_sweep_cursor=? WHERE singleton=1",
+                (request_id,),
             )
             db.commit()
 
@@ -798,7 +847,7 @@ class RouterStore:
             integrity = db.execute("PRAGMA integrity_check").fetchone()[0]
             version = db.execute("PRAGMA user_version").fetchone()[0]
             journal_mode = db.execute("PRAGMA journal_mode").fetchone()[0]
-            schema_matches = RouterStore._schema_matches(db, _V3_COLUMNS)
+            schema_matches = RouterStore._schema_matches(db, _V4_COLUMNS)
         finally:
             db.close()
         if (
@@ -1394,18 +1443,41 @@ class RouterStore:
     def request_context(self, request_id: str) -> dict[str, Any] | None:
         return self.get(request_id)
 
-    def active(self, limit: int = 8) -> list[dict[str, Any]]:
-        if type(limit) is not int or not 1 <= limit <= 100:
+    def active(
+        self, limit: int = 8, *, after_request_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        if (
+            type(limit) is not int
+            or not 1 <= limit <= 100
+            or after_request_id is not None
+            and (
+                not isinstance(after_request_id, str)
+                or not after_request_id
+                or len(after_request_id) > 128
+            )
+        ):
             raise RouterConfigError("invalid_arguments")
         with self.connect() as db:
-            return [
-                dict(row)
-                for row in db.execute(
+            if after_request_id is None:
+                rows = db.execute(
                     "SELECT * FROM router_requests WHERE state IN (?,?,?,?,?) "
-                    "ORDER BY updated_at,request_id LIMIT ?",
+                    "ORDER BY request_id LIMIT ?",
                     (*ACTIVE_STATES, limit),
-                )
-            ]
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    "SELECT * FROM router_requests WHERE state IN (?,?,?,?,?) "
+                    "AND request_id>? ORDER BY request_id LIMIT ?",
+                    (*ACTIVE_STATES, after_request_id, limit),
+                ).fetchall()
+                if len(rows) < limit:
+                    wrapped = db.execute(
+                        "SELECT * FROM router_requests WHERE state IN (?,?,?,?,?) "
+                        "AND request_id<=? ORDER BY request_id LIMIT ?",
+                        (*ACTIVE_STATES, after_request_id, limit - len(rows)),
+                    ).fetchall()
+                    rows.extend(wrapped)
+            return [dict(row) for row in rows]
 
     def recent_events(self, limit: int = 50) -> list[dict[str, Any]]:
         if type(limit) is not int or not 1 <= limit <= 500:

@@ -169,6 +169,37 @@ def _read_profile_state_pointer(profile: str) -> Path | None:
     return config.state_path
 
 
+def _write_profile_snapshot_file(root: Path, profile: str, payload: bytes) -> None:
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = root.lstat()
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) & 0o077
+    ):
+        raise RouterConfigError("router_config_permissions_unsafe")
+    fd, name = tempfile.mkstemp(prefix=".profile-", dir=root)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, root / f"{profile}.json")
+        dirfd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(dirfd)
+        finally:
+            os.close(dirfd)
+    except OSError:
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
+        raise
+
+
 def _get_runtime_config(ctx: Any) -> RouterConfig:
     raw = ctx.get_config("runtime_router", {})
     return RouterConfig.parse(raw)
@@ -235,42 +266,35 @@ class RuntimeRouterTools:
         ).encode("utf-8")
         if len(payload) > 524288:
             raise RouterConfigError("router_config_too_large")
-        root = config.state_path.parent / "profiles"
-        root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        info = root.lstat()
-        if (
-            not stat.S_ISDIR(info.st_mode)
-            or stat.S_ISLNK(info.st_mode)
-            or info.st_uid != os.geteuid()
-            or stat.S_IMODE(info.st_mode) & 0o077
-        ):
-            raise RouterConfigError("router_config_permissions_unsafe")
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", profile):
             raise RouterConfigError("profile_unavailable")
+        previous_state_path = _read_profile_state_pointer(profile)
+        if previous_state_path is not None and previous_state_path != config.state_path:
+            invalid_payload = json.dumps(
+                {
+                    "profile": profile,
+                    "runtime_router": {"__invalid_configuration__": True},
+                    "registry": {
+                        "connections": [],
+                        "workspaces": [],
+                        "routes": [],
+                        "operator_grants": [],
+                        "route_grants": [],
+                    },
+                    "updated_at": int(time.time()),
+                },
+                separators=(",", ":"),
+            ).encode("utf-8")
+            _write_profile_snapshot_file(
+                previous_state_path.parent / "profiles", profile, invalid_payload
+            )
         # Remember the last validated shared state path in Hermes-owned profile
         # storage. If the config later disappears or becomes invalid, registration
         # can still replace the worker snapshot at its previous location.
         _write_profile_state_pointer(config, profile)
-        destination = root / f"{profile}.json"
-        fd, name = tempfile.mkstemp(prefix=".profile-", dir=root)
-        try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(payload)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(name, destination)
-            dirfd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-            try:
-                os.fsync(dirfd)
-            finally:
-                os.close(dirfd)
-        except OSError:
-            try:
-                os.unlink(name)
-            except OSError:
-                pass
-            raise
+        _write_profile_snapshot_file(
+            config.state_path.parent / "profiles", profile, payload
+        )
 
     def create(self, args: dict[str, Any], *, tool_context: Any = None) -> str:
         try:
@@ -423,12 +447,13 @@ class RuntimeRouterTools:
                     "source_unavailable",
                     "The attachment context is not bound to this message.",
                 )
-            if ctx_message.attachments:
+            if ctx_message.attachments or route.require_source_attachment:
                 workspace_runtime = WorkspaceRuntime(self.ctx)
                 validated = workspace_runtime._attachments(ctx_message, route)
-                spool = AttachmentSpool(
-                    config.state_path.parent / "runtime-router-spool"
-                )
+                if validated:
+                    spool = AttachmentSpool(
+                        config.state_path.parent / "runtime-router-spool"
+                    )
                 validated_attachments = validated
             source_key = "\0".join(
                 str(source.get(key) or "")

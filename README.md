@@ -387,7 +387,7 @@ Runtime Router binds trusted Telegram/MAX identities to runtime bindings and use
 `multica_runtime_task_create` queues a request; `multica_runtime_status` shows its state; `multica_runtime_cancel` cancels it. Binding tools let users manage only their own binding within the configured limits.
 
 - `strict` mode uses only the default binding; `exceptions` allows rules with explicit priority and fails closed on ties.
-- Runtime switches only after the canonical agent has no active or queued runs; readback then confirms the runtime and model.
+- Runtime switches only after the canonical agent has no active or queued runs; readback confirms the runtime and model. The 0.8.2 CLI does not return a runtime model catalog, so an explicit `model_by_runtime` is checked against agent readback; execution still requires a target canary.
 - An uncertain issue-create result is never blindly retried. The request is reconciled by its stable marker.
 - Ordinary 0.6.0 routes and `multica_workspace_send` are unchanged; a router-enabled route accepts tasks only through the queue.
 
@@ -399,7 +399,7 @@ The CLI profile lives in a separate private `state_path.parent/cli-home`, indepe
 
 `kanban_mirror=true` is rejected: the separate worker has no supported public Hermes projection API in 0.7.0. The plugin-owned SQLite queue is the only source of queue state.
 
-Before enablement, back up state/config and verify the CLI profile, workspace, agent, runtime access, and model mapping. Creating a queued task starts the worker and can create an issue; do not use it as a read-only probe.
+Before enablement, back up state/config and verify the CLI profile, workspace, agent, runtime access, and model mapping. Task submission only records a queue entry; the separately scheduled worker processes it and may create an issue, so do not use it as a read-only probe.
 
 SQLite migration is additive and transactional. Rollback stops the timer, restores the previous version, and restores a compatible snapshot; unknown schemas are not rewritten.
 

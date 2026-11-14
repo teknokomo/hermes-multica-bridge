@@ -70,17 +70,20 @@ systemd-analyze verify deploy/systemd/hermes-multica-router@.service deploy/syst
 | Hermes target | `/usr/local/bin/multica` | `0.8.2`, commit `b7f8efcaa` | `/usr/local/bin/multica` | не выбран и не проверялся | CLI help подтверждает синтаксис; integration JSON и canary не проверялись |
 | Hermes Desktop runtime | отдельно не проверялся | отдельно не проверялся | Desktop может иметь bundled CLI вне PATH | Desktop profile не используется для target | не является источником target integration credentials |
 
-На target read-only проверены `multica --help` и help подкоманд `workspace list`, `workspace get`, `project get`, `runtime list`, `agent get`, `agent tasks`, `agent update`, `issue list`, `issue create`, `issue get`, `issue update` и `issue status`. Подтверждены имена команд, перечисленные флаги, `--output json`, `agent tasks --before`, issue list `--offset/--fields`, create `--description-stdin/--assignee-id/--attachment` и update `--no-start`.
+На target read-only проверены `multica --help` и help подкоманд `workspace list`, `workspace get`, `project get`, `runtime list`, `agent get`, `agent tasks`, `agent update`, `issue list`, `issue create`, `issue get`, `issue update` и `issue status`. Подтверждены имена команд, перечисленные флаги, `--output json`, `agent tasks --before`, issue list `--offset/--fields`, create `--description-stdin/--assignee-id/--attachment` и update `--no-start`. Исходники версии 0.8.2 дополнительно подтверждают команды `auth status` и `workspace member list --output json`, которые адаптер использует для проверки runtime access.
 
-Help не подтверждает фактические JSON response shapes или доступ сервиса. На target не выполнялись workspace/project/runtime/agent/issue API reads, runtime switch, issue write, canary или production операция. Поэтому интеграционный контракт остаётся `NOT VERIFIED` для фактических полей:
+Help не подтверждает фактические JSON response shapes или доступ сервиса. Сверка исходников Multica CLI v0.8.2 подтверждает, что `runtime list` возвращает строки `/api/runtimes` без полей `accessible` и `models`. Адаптер сопоставляет пользователя из `auth status` с `user_id` из `workspace member list` и вычисляет доступ по `owner_id`, `visibility` и `shared_with`; неоднозначная или неполная identity закрывается. Каталог моделей CLI 0.8.2 не предоставляет: явная операторская модель проверяется по `agent get` readback, а её фактический запуск остаётся непроверенным до target canary.
+
+На target не выполнялись workspace/project/runtime/agent/issue API reads, runtime switch, issue write, canary или production операция. Поэтому интеграционный контракт остаётся `NOT VERIFIED` для фактических полей:
 
 - workspace list: список `workspaces` и ID;
 - project get: `id` и `workspace_id`;
-- runtime list: `id`, `status`, `accessible`, `models`;
+- runtime list: `id`, `workspace_id`, `owner_id`, `visibility`, `shared_with`, `status`; `accessible` вычисляется адаптером, `models` в 0.8.2 не выдаётся;
+- auth status email ↔ workspace member list `user_id`;
 - agent get: `id`, `runtime_id`, `model`, `max_concurrent_tasks`;
-- agent tasks: статусы runs и курсор/признак следующей страницы;
+- agent tasks: статусы runs и stderr cursor `More runs available; use --before "…"` на полной странице;
 - issue list/get/create/update: обёртка JSON, project/workspace/assignee, marker, issue ID и readback;
-- real CLI login/profile selection в service-owned HOME и фактический output при отказе/таймауте.
+- real CLI login/profile selection в service-owned HOME, фактический output при отказе/таймауте и target execution выбранной модели.
 
 Перед target canary владелец должен назначить отдельный profile, workspace/project, canonical test agent, два разрешённых runtime и тестовых получателей. До подтверждения этих JSON контрактов и canary-политики не включайте `runtime_router`, не запускайте timer и не ставьте issue. Тесты fixtures проверяют принятые структуры, но не заменяют эту проверку.
 

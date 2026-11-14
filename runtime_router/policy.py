@@ -180,7 +180,7 @@ def resolve_runtime(
         raise ResolutionError("runtime_not_allowed")
     model = model_by_runtime.get(selected)
     models = runtime.get("models")
-    if model and (not isinstance(models, (list, tuple)) or model not in models):
+    if model and isinstance(models, (list, tuple)) and model not in models:
         raise ResolutionError("model_unsupported")
     if strict_expired and reason == "binding_default":
         reason, source = "strict_expired_fallback", "strict_expired_fallback"
