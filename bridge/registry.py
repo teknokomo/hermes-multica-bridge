@@ -96,13 +96,15 @@ ROUTE_FIELDS = frozenset(
         "dynamic_status",
         "grant_id",
         "created_by_profile",
+        "instance_id",
+        "runtime_router",
     }
 )
 GRANT_FIELDS = frozenset({"board", "task_id", "route_id"})
 ASSIGNEE_FIELDS = frozenset({"id", "type", "label"})
 ASSIGNEE_TYPES = frozenset({"member", "agent", "squad"})
 ROUTE_GRANT_FIELDS = frozenset({
-    "grant_id", "profile", "connection_id", "workspace_key", "workspace_id",
+    "grant_id", "profile", "connection_id", "workspace_key", "workspace_id", "instance_id",
     "allowed_project_ids", "allowed_squad_ids", "allow_all_projects",
     "allowed_source_platforms", "allowed_chat_ids", "allowed_thread_ids",
     "allowed_user_ids", "allowed_assignees", "credential_route_id", "max_routes",
@@ -242,6 +244,9 @@ class RegistryRoute:
     dynamic_status: str = ""
     grant_id: str = ""
     created_by_profile: str = ""
+    instance_id: str = "default"
+    runtime_router_enabled: bool = False
+    runtime_router_agent_ref: str = ""
 
     @property
     def isolated_instance_id(self) -> str:
@@ -262,6 +267,7 @@ class RouteGrant:
     connection_id: str
     workspace_key: str
     workspace_id: str
+    instance_id: str
     allowed_project_ids: tuple[str, ...]
     allowed_squad_ids: tuple[str, ...]
     allow_all_projects: bool
@@ -492,6 +498,12 @@ def route_policy_fingerprint(registry: ConnectionRegistry, route: RegistryRoute)
             require_assignee=route.require_assignee,
             test=route.test,
         )
+        if route.runtime_router_enabled or route.instance_id != "default":
+            payload.update(
+                instance_id=route.instance_id,
+                runtime_router_enabled=route.runtime_router_enabled,
+                runtime_router_agent_ref=route.runtime_router_agent_ref,
+            )
     return (
         "route-policy-"
         + hashlib.sha256(
@@ -634,6 +646,20 @@ def _parse_route(row: Any) -> RegistryRoute:
     route_type = row.get("route_type")
     if not isinstance(route_type, str) or route_type not in {"autopilot", "workspace"}:
         raise _fail("route.route_type must be autopilot or workspace.")
+    instance_id = row.get("instance_id", "default")
+    if not isinstance(instance_id, str) or not PROFILE_RE.fullmatch(instance_id):
+        raise _fail("route.instance_id is invalid.")
+    runtime_router = row.get("runtime_router", {})
+    if not isinstance(runtime_router, Mapping) or set(runtime_router) - {"enabled", "agent_ref"}:
+        raise _fail("route.runtime_router must contain only enabled and agent_ref.")
+    router_enabled = runtime_router.get("enabled", False)
+    agent_ref = runtime_router.get("agent_ref", "")
+    if type(router_enabled) is not bool or not isinstance(agent_ref, str):
+        raise _fail("route.runtime_router fields are invalid.")
+    if router_enabled and (route_type != "workspace" or not agent_ref or not PROFILE_RE.fullmatch(agent_ref)):
+        raise _fail("Runtime router routes require a Workspace route and valid agent_ref.")
+    if not router_enabled and agent_ref:
+        raise _fail("Disabled runtime router routes cannot select agent_ref.")
     project_id = _identifier(row.get("project_id"), "route.project_id", required=False)
     scope_kind = row.get("scope_kind", "project")
     project_selection = row.get("project_selection", "allowlist")
@@ -850,6 +876,9 @@ def _parse_route(row: Any) -> RegistryRoute:
         dynamic_status=dynamic_status,
         grant_id=grant_id,
         created_by_profile=created_by_profile,
+        instance_id=instance_id,
+        runtime_router_enabled=router_enabled,
+        runtime_router_agent_ref=agent_ref,
     )
 
 
@@ -890,6 +919,9 @@ def _parse_route_grant(row: Any) -> RouteGrant:
     profile = row.get("profile")
     if not isinstance(profile, str) or not PROFILE_RE.fullmatch(profile):
         raise _fail("route grant profile is invalid.")
+    instance_id = row.get("instance_id", "default")
+    if not isinstance(instance_id, str) or not PROFILE_RE.fullmatch(instance_id):
+        raise _fail("route grant instance_id is invalid.")
     expires_at = row.get("expires_at")
     if not isinstance(expires_at, str) or len(expires_at) > 64:
         raise _fail("route grant expiry is invalid.")
@@ -915,6 +947,7 @@ def _parse_route_grant(row: Any) -> RouteGrant:
         connection_id=_uuid7(row.get("connection_id"), "route_grant.connection_id"),
         workspace_key=_uuid7(row.get("workspace_key"), "route_grant.workspace_key"),
         workspace_id=_identifier(row.get("workspace_id"), "route_grant.workspace_id"),
+        instance_id=instance_id,
         allowed_project_ids=_string_list(row.get("allowed_project_ids"), "route_grant.allowed_project_ids", IDENTIFIER_RE, maximum=256),
         allowed_squad_ids=_string_list(row.get("allowed_squad_ids"), "route_grant.allowed_squad_ids", UUID_RE, maximum=128),
         allow_all_projects=row.get("allow_all_projects", False),
@@ -1014,6 +1047,7 @@ def registry_from_mapping(value: Any) -> ConnectionRegistry:
             if grant is None:
                 raise _fail("A dynamic route references an unknown operator grant.")
             if (route.connection_id != grant.connection_id or route.workspace_key != grant.workspace_key
+                    or route.instance_id != grant.instance_id
                     or route.created_by_profile != grant.profile or route.credential_route_id != grant.credential_route_id):
                 raise _fail("A dynamic route does not match its operator grant.")
             if route.project_selection == "all_workspace" and (route.dynamic_status not in {"pending", "active", "disabled", "revoked"} or not grant.allow_all_projects):

@@ -1,4 +1,4 @@
-# Развёртывание Hermes Multica Bridge 0.6.0
+# Развёртывание Hermes Multica Bridge 0.7.0
 
 Эта инструкция описывает настройку после копирования публичного пакета на целевой хост. Она не выполняет deployment автоматически.
 
@@ -256,7 +256,7 @@ sudo systemctl stop hermes-multica-bridge@<instance>.service
 
 ## Чистая установка профиля
 
-Версия продукта — 0.6.0. Статический ConnectionRegistry 0.5.0 продолжает загружаться без переписывания; внутренние версии registry/API не добавляются. Dynamic routes хранятся отдельно на профиль, не содержат credentials и отклоняют неизвестную схему до изменения store. Notify использует собственную миграцию SQLite; старый watcher state не переиспользуется. Credentials задаются через предназначенные Hermes/systemd интерфейсы и не выводятся в терминал или отчёты.
+Версия продукта — 0.7.0. Статический ConnectionRegistry 0.5.0 продолжает загружаться без переписывания; внутренние версии registry/API не добавляются. Dynamic routes хранятся отдельно на профиль, не содержат credentials и отклоняют неизвестную схему до изменения store. Runtime Router выключен по умолчанию и использует отдельную SQLite базу. Notify использует собственную миграцию SQLite; старый watcher state не переиспользуется. Credentials задаются через предназначенные Hermes/systemd интерфейсы и не выводятся в терминал или отчёты.
 
 При первом включении Route его destination фиксируется. После появления deliveries нельзя удалять ledger или переиспользовать их `route_id` для другого назначения. Включённый или использованный Route должен остаться в registry и при выводе из эксплуатации перейти в disable + tombstone: result lookup использует immutable snapshot исходной доставки.
 
@@ -320,7 +320,7 @@ Notify устанавливается в собственный venv и рабо
 
 1. Сохранить согласованные SQLite backup, TOML, SHA-256 и S3-копии действующего watcher. Не заменять custom units и credentials.
 2. Создать системного пользователя `hermes-notify`, StateDirectory/RuntimeDirectory 0700 и приватный каталог конфигурации. Конфигурацией и CLI-файлами владеет hermes-notify; административные CLI-команды выполнять от этого пользователя.
-3. Установить wheel 0.6.0 в `/opt/hermes-multica-notify/venv`. Положить unit из репозитория; добавить operator-owned drop-in с точными `LoadCredential=<имя>:<приватный-путь>` для используемых accounts/workspaces. Не создавать пустые credentials.
+3. Установить wheel 0.7.0 в `/opt/hermes-multica-notify/venv`. Положить unit из репозитория; добавить operator-owned drop-in с точными `LoadCredential=<имя>:<приватный-путь>` для используемых accounts/workspaces. Не создавать пустые credentials.
 4. Инициализировать конфигурацию через `init`, заполнить TOML и credentials. Пример содержит нерабочие плейсхолдеры. Основной CLI 0.8.2 должен поддерживать updated-since/until, сортировку и paging; doctor проверяет capabilities. Перед live отдельно проверить точный серверный бинарник.
 5. После запуска `run` сервис строит infrastructure projection. Затем добавлять подписки. Изменения workspace через CLI append-only сохраняют комментарии и требуют SIGHUP; invalid reload оставляет рабочую проекцию.
 
@@ -375,3 +375,9 @@ Completion route обязан иметь `wake_mode=completion` и `watcher_enab
 Отдельный DynamicRouteStore создаётся в приватной директории данных профиля. Не копируйте его между профилями и не редактируйте SQLite вручную. При неизвестной схеме сервис прекращает операцию без миграции или изменения файла. Новые и отозванные маршруты становятся видимыми без рестарта Gateway.
 
 В этой реализации T74 не выполняется: package install, live grants/credentials, wake subscriptions, Gateway/notify/watcher restart, canary, Multica issue, production activation и публикация требуют отдельного разрешения и backup/rollback плана.
+
+## Runtime Router 0.7.0
+
+Runtime Router имеет отдельный детерминированный worker и systemd timer. Он не устанавливается и не включается вместе с plugin автоматически. Сначала изучите [Runtime Router deployment runbook](runtime-router-0.7.0.md): там описаны общий state path для профилей, одноимённый OS UID Gateway/worker, service-owned CLI HOME, systemd units, T75 environment matrix и точные target операции, которые пока отмечены `NOT VERIFIED`.
+
+Не включайте `runtime_router.enabled`, пока не подтверждены target CLI JSON response shapes и отдельная canary политика. Не запускайте worker `tick` на профиле с production очередью как способ проверки: он может создать Multica issue. `kanban_mirror=true` отклоняется в этой версии.

@@ -1,0 +1,50 @@
+{
+  "runtime_router": {
+    "enabled": false,
+    "state_path": "/var/lib/hermes-multica-router-REPLACE_WITH_SERVICE_USER/runtime-router.sqlite3",
+    "worker_profile": "default",
+    "tick_seconds": 30,
+    "lease_seconds": 900,
+    "unbound_policy": "reject",
+    "kanban_mirror": false,
+    "cli_binary": "/usr/local/bin/multica",
+    "cli_timeout_seconds": 30,
+    "connectors": {
+      "telegram-default": {
+        "profile": "default",
+        "platform": "telegram",
+        "label": "Example Telegram connector"
+      },
+      "max-om73": {
+        "profile": "om73",
+        "platform": "max",
+        "label": "Example MAX connector"
+      }
+    },
+    "instances": {
+      "primary": {
+        "cli_profile": "router-service-profile",
+        "workspace_id": "00000000-0000-4000-8000-000000000010",
+        "base_url": "https://multica.example"
+      }
+    },
+    "agents": {
+      "canonical": {
+        "instance_id": "primary",
+        "agent_id": "00000000-0000-4000-8000-000000000020",
+        "model_by_runtime": {
+          "runtime-a": "model-a",
+          "runtime-b": "model-b"
+        },
+        "allowed_runtime_ids": ["runtime-a", "runtime-b"],
+        "allowed_principal_ids": ["00000000-0000-4000-8000-000000000030"]
+      }
+    },
+    "operators": [
+      {
+        "connector_id": "telegram-default",
+        "platform_user_id": "REPLACE_WITH_APPROVED_OPERATOR_ID"
+      }
+    ]
+  }
+}

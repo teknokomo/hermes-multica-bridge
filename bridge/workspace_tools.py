@@ -7,6 +7,7 @@ import hmac
 import json
 import os
 import re
+import sqlite3
 import stat
 import threading
 import time
@@ -935,6 +936,7 @@ class WorkspaceRuntime:
                 "workspace_key": grant.workspace_key,
                 "name": route_name,
                 "route_type": "workspace",
+                "instance_id": grant.instance_id,
                 "project_id": default_project_id,
                 "scope_kind": scope_kind,
                 "project_selection": project_selection,
@@ -973,6 +975,7 @@ class WorkspaceRuntime:
             }
             create_identity = {
                 "profile": profile, "workspace_id": workspace.workspace_id,
+                "instance_id": grant.instance_id,
                 "project_ids": route_policy["project_ids"], "project_selection": project_selection,
                 "squad_id": route_policy["squad_id"], "chat_id": source["chat_id"],
                 "thread_id": source_thread, "name": normalized_name,
@@ -1031,6 +1034,11 @@ class WorkspaceRuntime:
             })
             registry = self._registry()
             route = self._route(registry, tool_context, route_id)
+            if route.runtime_router_enabled:
+                raise BridgeError(
+                    "runtime_router_required",
+                    "This route queues work through the canonical runtime router.",
+                )
             title = args.get("title")
             description = args.get("description", "")
             status = args.get("status") or ("todo" if "todo" in route.allowed_statuses else route.allowed_statuses[0])
@@ -1187,6 +1195,33 @@ class WorkspaceRuntime:
             registry = self._registry()
             route = self._route(registry, tool_context, route_id)
             issue_id = args.get("issue_id")
+            if route.runtime_router_enabled:
+                if "assignee_id" in args or "assignee_type" in args:
+                    raise BridgeError(
+                        "runtime_router_managed_assignee",
+                        "The canonical agent assignment is managed by the runtime router.",
+                    )
+                try:
+                    from runtime_router.config import RouterConfig
+                    from runtime_router.state import RouterStore
+
+                    router_config = RouterConfig.parse(self.ctx.get_config("runtime_router", {}))
+                    if not router_config.enabled:
+                        raise BridgeError("runtime_router_disabled", "Runtime routing is disabled for this profile.")
+                    request = RouterStore(router_config.state_path).request_for_issue(issue_id)
+                except BridgeError:
+                    raise
+                except (OSError, ValueError, TypeError, sqlite3.Error, AttributeError) as exc:
+                    raise BridgeError(
+                        "runtime_router_state_unavailable",
+                        "The runtime request mapping could not be verified.",
+                    ) from exc
+                if (request is None or request.get("route_id") != route.route_id
+                        or request.get("instance_id") != route.instance_id):
+                    raise BridgeError(
+                        "runtime_router_issue_required",
+                        "Only an issue created by this runtime route can be updated here.",
+                    )
             api = self._api(registry, route)
             issue = api.get_issue(issue_id)
             self._verify_issue_scope(api, issue, registry, route)

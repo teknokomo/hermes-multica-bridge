@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
+
+# Directory plugins also expose sibling packages used by the CLI distribution.
+_plugin_root = str(Path(__file__).resolve().parent)
+if _plugin_root not in sys.path:
+    sys.path.insert(0, _plugin_root)
 
 try:
     from .bridge.tool import register as _register_tools

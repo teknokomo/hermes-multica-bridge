@@ -30,6 +30,19 @@ Use this skill when a user asks to create or manage a Multica issue through a co
 - Use `multica_workspace_get`, `multica_workspace_comment`, and `multica_workspace_update` only for issues proven to belong to the selected route.
 - If a tool returns `route_thread_denied`, `route_project_not_allowed`, `route_not_active`, `route_grant_expired`, `source_unavailable`, or an uncertain operation result, stop that operation and report the returned condition. Do not retry by changing source or route identifiers.
 
+## Runtime Router 0.7.0
+
+Use Runtime Router only when `multica_list_routes` shows `runtime_router.enabled=true` for the selected route. The route points to one canonical agent; the router selects an approved runtime and serializes work for that agent.
+
+- Create work with `multica_runtime_task_create`, using the route and project already authorized for the trusted message. Do not call `multica_workspace_send` on a router-enabled route; do not create the Multica issue through shell, CLI, direct API, or another tool.
+- The tool response is a queued request, not proof that an issue was created or work completed. Use `multica_runtime_status` for its state. Report completion only when status is terminal and the result is confirmed.
+- Do not select or switch a runtime unless the user requests it and `multica_runtime_binding_set` permits the exact allowed runtime. In `strict` mode, the binding wins; do not try exceptions or explicit runtime to bypass it. In `exceptions` mode, use only the authorized runtime IDs.
+- Bindings and exceptions belong to the trusted principal and Multica instance. Never link identities, change another principal's binding, or infer identity from a display name. An unresolved identity or binding is a stop condition.
+- The worker never runs in the plugin thread. Do not trigger repeated create calls to make it run sooner. The source-message idempotency key prevents duplicate requests, and an uncertain issue-create result is reconciled rather than blindly retried.
+- Use `multica_runtime_cancel` only for a request the current principal may cancel. Cancellation may be pending while an active Multica run stops; do not claim it is cancelled until status confirms.
+- `multica_runtime_queue_list` and cross-principal administration are operator-only. Do not attempt them as a workaround for a denied status or binding operation.
+- Do not use the optional Kanban projection in 0.7.0; configuration with `kanban_mirror=true` is rejected.
+
 ## Creating a route
 
 Use `multica_route_create` only when the user explicitly requests a new route and the current trusted message matches an operator-issued grant. The grant fixes the connection, workspace, source chat, allowed users, projects or open-workspace scope, assignees, credential anchor, and quota.

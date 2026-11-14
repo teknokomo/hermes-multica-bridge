@@ -23,7 +23,7 @@ Made with the support of the [73rd Meridian Consortium](https://om73.ru).
 
 `hermes-multica-bridge` is a Hermes plugin for Autopilot and Workspace: it sends the current pinned Kanban task, creates and manages Workspace issues from trusted MAX or Telegram messages, and lets users create routes bounded by operator grants.
 
-Version 0.6.0 retains two security modes:
+Version 0.7.0 retains the two security modes and adds Runtime Router, disabled by default:
 
 - **Standard** — the plugin sends HTTPS requests itself. Non-secret topology is stored in the profile's `ConnectionRegistry`; each Route's webhook/HMAC/PAT credentials are managed through the public Hermes plugin credential API and read at runtime only through `agent.secret_scope`.
 - **Isolated** — the plugin never receives Multica secrets. Each new Route uses a separate socket-activated systemd sender instance with root-owned configuration and systemd credentials.
@@ -48,9 +48,10 @@ The Bridge is disabled by default: `enabled=false`. The model cannot spoof the m
 - self-service Workspace routes within operator grants and exact source/thread ACLs;
 - project, squad, or workspace scope with an explicit project required on send;
 - read-only wake coverage checks for each project;
-- an eighth tool, `multica_route_create`, and a packaged Skill for safe usage;
+- the `multica_route_create` tool, and a packaged Skill for safe usage;
 - separate Isolated instances with their own socket/config/state/credentials for every new Route;
 - new result states are posted as deduplicated comments to the same Hermes Kanban task;
+- six Runtime Router tools for queueing, status, cancellation, and user runtime bindings;
 - profile state stores are created cleanly; unknown and previous internal schemas are rejected without migration.
 
 ## Architecture
@@ -230,7 +231,7 @@ Webhook URLs, PATs, HMAC secrets, and secret response bodies are not stored in t
 
 ## Configuration lifecycle
 
-The plugin is version 0.6.0. The 0.5.0 registry loads without rewrites or internal versioning; dynamic routes use a separate store and reject unknown schemas. Watcher state retains its documented one-way migration from 0.2.0.
+The plugin is version 0.7.0. The 0.5.0 registry loads without rewrites or internal versioning; dynamic routes use a separate store and reject unknown schemas. Watcher state retains its documented one-way migration from 0.2.0.
 
 Switching between Standard and Isolated does not transfer secrets automatically. A new mode is enabled only after its own readiness check. Enabling a Route locks its destination; use a new Route for another destination and disable + tombstone the previous one.
 
@@ -251,14 +252,14 @@ The main offline suite makes no live Multica requests and uses fake credentials/
 ```bash
 python3 -m pytest -q
 node --test tests/test_desktop_profile_guard.mjs tests/test_desktop_registry_ui.mjs
-python3 -m compileall -q bridge notify dashboard deploy tests
+python3 -m compileall -q bridge notify dashboard runtime_router deploy tests
 ```
 
 The release gate also includes Ruff, Bandit, package build/metadata checks, `hermes plugins validate` and `doctor` on a clean staging copy, `systemd-analyze verify`, a secret/personal-data scan, and project Thermos/Autoreview.
 
 ## Development status
 
-The product version is 0.6.0. It adds scoped routes, operator grants, route creation from trusted source context, and read-only per-project notify readiness; it introduces no internal API or registry versions. Completion wake handles only new transitions to done. Server installation, live Multica use, commit/push, and publication remain separate stages.
+The product version is 0.7.0. Runtime Router adds a SQLite queue, principal identities, strict/exceptions bindings, and a separate deterministic CLI worker for one canonical agent. It is disabled by default; server installation, target integration, and live tasks are a separate stage.
 
 ## License
 
@@ -361,7 +362,7 @@ Wake is disabled by default. Live enablement requires preapproved `test=true` pr
 
 The operator-edited registry stores `route_grants`; operators configure grants, not the model. A grant binds a profile, connection, workspace, source chat/thread/user, projects or squad, typed assignees, credential anchor, a route quota counted independently for that grant, and expiry. A disabled or expired grant blocks new operations.
 
-The eighth tool, `multica_route_create`, uses only trusted message source context. If multiple grants match, it returns `grant_required` with IDs of only the eligible grants; the route is created as `pending` unless the operator explicitly enables `auto_approve`. Approval and revocation are available only to operators through the Dashboard.
+The `multica_route_create` tool uses only trusted message source context. If multiple grants match, it returns `grant_required` with IDs of only the eligible grants; the route is created as `pending` unless the operator explicitly enables `auto_approve`. Approval and revocation are available only to operators through the Dashboard.
 
 A route can narrow a grant but cannot broaden its ACL. `allowed_thread_ids` is checked against the exact bound Hermes thread for every Workspace tool; thread IDs are never accepted as model arguments. A mismatch stops the operation before a Multica call.
 
@@ -377,4 +378,31 @@ The package includes the `hermes-multica-bridge` Skill: it directs the agent to 
 
 Dynamic routes live in a separate profile database with private permissions, transactional quotas, and audit records. Unknown schemas are rejected before the file is changed; revocation is retained as a terminal state, and new routes become visible without a Gateway restart.
 
-The product version is 0.6.0. The 0.5.0 registry continues to load without rewrites. Grant, credential-anchor, and notify-subscription setup and publication remain separate operator stages; the old watcher is not started automatically.
+The product version is 0.7.0. The new queue leaves ordinary 0.6.0 routes unchanged and has its own migratable SQLite schema. Router is disabled by default; route enablement, CLI profiles, target integration, server installation, and publication remain separate stages.
+
+## Runtime Router 0.7.0
+
+Runtime Router binds trusted Telegram/MAX identities to runtime bindings and uses one canonical Multica agent per role. A separate CLI worker takes tasks from the queue and serves each `(instance_id, agent_id)` sequentially.
+
+`multica_runtime_task_create` queues a request; `multica_runtime_status` shows its state; `multica_runtime_cancel` cancels it. Binding tools let users manage only their own binding within the configured limits.
+
+- `strict` mode uses only the default binding; `exceptions` allows rules with explicit priority and fails closed on ties.
+- Runtime switches only after the canonical agent has no active or queued runs; readback then confirms the runtime and model.
+- An uncertain issue-create result is never blindly retried. The request is reconciled by its stable marker.
+- Ordinary 0.6.0 routes and `multica_workspace_send` are unchanged; a router-enabled route accepts tasks only through the queue.
+
+### Configuration and limits
+
+All enabled Hermes profiles must use one absolute local SQLite path and the same OS UID as the worker. `${HERMES_HOME}` is rejected when the feature is enabled so profiles cannot accidentally split the queue.
+
+The CLI profile lives in a separate private `state_path.parent/cli-home`, independent of Hermes HOME. Never pass tokens in argv, env, registry, SQLite, or reports. The target Multica CLI 0.8.2 and the list of target JSON contracts are in the [Runtime Router deployment guide](deploy/runtime-router-0.7.0.md); live integration is distinguished from local fixtures.
+
+`kanban_mirror=true` is rejected: the separate worker has no supported public Hermes projection API in 0.7.0. The plugin-owned SQLite queue is the only source of queue state.
+
+Before enablement, back up state/config and verify the CLI profile, workspace, agent, runtime access, and model mapping. Creating a queued task starts the worker and can create an issue; do not use it as a read-only probe.
+
+SQLite migration is additive and transactional. Rollback stops the timer, restores the previous version, and restores a compatible snapshot; unknown schemas are not rewritten.
+
+Runtime Router is disabled by default. This branch does not perform live installation, target canary, changes to existing routes, or production task creation.
+
+Unit and timer files, configuration, the T75 environment matrix, and the exact list of unverified target operations are in [deploy/runtime-router-0.7.0.md](deploy/runtime-router-0.7.0.md).

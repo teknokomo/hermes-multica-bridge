@@ -1,0 +1,11 @@
+[Unit]
+Description=Schedule deterministic Hermes Multica runtime-router ticks for %i
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=30s
+AccuracySec=1s
+Unit=hermes-multica-router@%i.service
+
+[Install]
+WantedBy=timers.target

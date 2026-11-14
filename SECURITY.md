@@ -194,7 +194,7 @@ Profile/generation guards отбрасывают stale status/save/credential re
 
 ## Lifecycle конфигурации
 
-Версия продукта — 0.6.0. Static registry сохраняет структуру 0.5.0 без переписывания и внутренних версий API. Dynamic routes живут в отдельном профильном store с quota, idempotency, audit и терминальным revoke; неизвестная схема отвергается до изменения файла. Notify readiness IPC только читает ограниченный индекс, проверяет `SO_PEERCRED`, UID/profile allowlist и размер кадра, не открывая plugin доступ к notify DB или credentials. Completion routes используют notify и не требуют старого watcher; установка watcher не выполняется автоматически.
+Версия продукта — 0.7.0. Static registry сохраняет структуру 0.6.0; Runtime Router добавляет независимую SQLite очередь и таблицы bindings без изменения обычных routes. Router выключен по умолчанию и работает только для явно помеченных routes.
 
 Переход Standard ↔ Isolated не переносит секреты автоматически. Новый Route/режим включается только после отдельной readiness-проверки. Ledger сохраняет immutable delivery snapshot, поэтому rename/disable/tombstone текущего Route не меняет destination уже созданной delivery.
 
@@ -252,5 +252,21 @@ Wake имеет одну автоматическую попытку. `sent` п�
 Notify readiness IPC — отдельный read-only интерфейс. Каталог сокета имеет режим `0711` для traversal между service UID, а сокет — `0666`, чтобы разные профильные UID могли подключиться; это только транспортный доступ. Каждый peer проверяется через `SO_PEERCRED` по allowlist UID/profile до чтения кадра, длина кадра проверяется до JSON parsing. Интерфейс возвращает только готовность проекта и безопасный route identifier; plugin не получает соединение с notify DB и не читает credentials. Completion route не обращается к legacy watcher и отвергает сочетание `wake_mode=completion` и `watcher_enabled=true`.
 
 Repository Skill задаёт предпочтительный путь через зарегистрированные bridge tools; он не выдаёт права и не заменяет server-side grant проверки. Установка, grant configuration и включение notify подписки остаются отдельными операторскими действиями.
+
+## Runtime Router 0.7.0
+
+- `principal_identities` связывает доверенный platform user ID с одним операторски созданным principal. Автоматическое объединение по display name запрещено; запрос без identity/binding закрывается.
+- Resolver не выполняет I/O. `strict` всегда использует default binding; `exceptions` требует совпадения всех заданных selectors и при равном priority/specificity закрывается с `rule_conflict`.
+- Runtime выбирается только из явного `allowed_runtime_ids`; он дополнительно должен быть online, accessible и принадлежать тому же Multica instance. Model mapping сверяется с runtime catalog и agent readback.
+- Worker сериализуется на `(instance_id, agent_id)`, проверяет отсутствие активных/queued runs до runtime switch и повторяет проверку непосредственно перед issue POST. Agent concurrency должна быть ровно 1.
+- SQLite и профильные snapshots должны быть в одном локальном каталоге с режимом `0700`, принадлежащем одному OS UID. Hermes Gateway, plugin process и systemd worker используют этот UID и один общий `state_path`; включённый `${HERMES_HOME}` path отвергается.
+- Multica CLI запускается с фиксированными argv, без proxy environment, без shell и без token arguments. CLI HOME расположен в приватном `state_path.parent/cli-home`, отдельно от Hermes HOME. Credentials остаются в операторском CLI profile и не попадают в queue, logs или tool output.
+- Подтверждённый отказ до принятия issue может завершить запрос. Таймаут, потеря ответа или неожиданное успешное JSON тело создают uncertain/reconciliation state без слепого повторного POST. Повторный source key возвращает тот же request.
+- Вложения исходят только из текущего Hermes turn, хранятся в приватном spool и проверяются по hash, размеру, владельцу и типу файла перед CLI upload. Путь от модели не принимается.
+- Worker — systemd oneshot/timer, а не plugin thread. Не запускайте `tick` как диагностическую пробу, если очередь может содержать реальные задачи; один tick может создать issue.
+- `kanban_mirror=true` отклоняется, потому что отдельный worker в 0.7.0 не имеет поддерживаемого публичного Hermes projection API. SQLite queue остаётся единственным источником состояния.
+- Схема router SQLite мигрируется только по распознанным версиям и транзакционно. Неизвестная схема или некорректная profile snapshot не изменяется и не переиспользует прежнюю активную политику.
+
+Целевой `/usr/local/bin/multica` 0.8.2 подтверждён только по version/help и синтаксису используемых команд. Фактические JSON response shapes, service-owned profile и canary workflow не проверялись; прежде чем включать feature flag, требуется отдельная target integration приёмка по матрице в `deploy/runtime-router-0.7.0.md`.
 
 Статический credential anchor может иметь enabled=false и служить только хранилищем PAT; tombstone запрещён. При approval проекты повторно проверяются read-only API Multica до активации маршрута.
