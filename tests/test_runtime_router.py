@@ -1089,6 +1089,29 @@ class RuntimeRouterTests(unittest.TestCase):
         )
         self.assertNotIn("token prefix hidden", repr(result))
 
+    def test_cli_adapter_accepts_default_empty_agent_model_without_catalog(self):
+        agent = {
+            "id": AGENT,
+            "runtime_id": RUNTIME_A,
+            "max_concurrent_tasks": 1,
+            "model": "",
+        }
+        adapter = MulticaCliAdapter(
+            runner=lambda *_args, **_kwargs: SimpleNamespace(
+                returncode=0, stdout=json.dumps(agent).encode(), stderr=b""
+            )
+        )
+        instance = self.config.instance(INSTANCE)
+        self.assertEqual(adapter.agent_get(instance, AGENT)["model"], "")
+        with patch.object(adapter, "runtime_list", return_value=[{
+            "id": RUNTIME_A, "status": "online", "accessible": True
+        }]):
+            self.assertEqual(
+                adapter.verify_agent_runtime(instance, AGENT, RUNTIME_A, None), agent
+            )
+            with self.assertRaisesRegex(MulticaCliError, "runtime_switch_failed"):
+                adapter.verify_agent_runtime(instance, AGENT, RUNTIME_A, "explicit-model")
+
     def test_cli_adapter_marks_invalid_utf8_create_output_uncertain(self):
         calls = 0
 

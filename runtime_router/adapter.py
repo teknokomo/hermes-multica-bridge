@@ -482,7 +482,7 @@ class MulticaCliAdapter:
             or not isinstance(agent.get("runtime_id"), str)
             or "model" in agent
             and agent["model"] is not None
-            and (not isinstance(agent["model"], str) or not agent["model"])
+            and not isinstance(agent["model"], str)
         ):
             raise MulticaCliError("multica_cli_invalid_response")
         return agent
@@ -504,7 +504,7 @@ class MulticaCliAdapter:
         if agent.get("runtime_id") != runtime_id:
             raise MulticaCliError("runtime_switch_failed", uncertain=True)
         agent_model = agent.get("model")
-        if not isinstance(agent_model, str) or not agent_model:
+        if not isinstance(agent_model, str):
             raise MulticaCliError("runtime_default_model_unverified", uncertain=True)
         models = target.get("models")
         if model is not None:
@@ -512,7 +512,7 @@ class MulticaCliAdapter:
                 raise MulticaCliError("runtime_switch_failed", uncertain=True)
             if isinstance(models, list) and model not in models:
                 raise MulticaCliError("model_unsupported")
-        elif isinstance(models, list) and agent_model not in models:
+        elif agent_model and isinstance(models, list) and agent_model not in models:
             raise MulticaCliError("runtime_default_model_unverified", uncertain=True)
         return agent
 
