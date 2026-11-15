@@ -583,7 +583,11 @@ class MulticaCliAdapter:
         if model is not None and isinstance(models, list) and model not in models:
             raise MulticaCliError("model_unsupported")
         current_agent = self.agent_get(instance, agent_id)
-        if model is None and current_agent.get("runtime_id") != runtime_id:
+        if (
+            model is None
+            and current_agent.get("runtime_id") != runtime_id
+            and current_agent.get("model") != ""
+        ):
             raise MulticaCliError("runtime_default_model_unverified")
         args = ["agent", "update", agent_id, "--runtime-id", runtime_id]
         if model is not None:

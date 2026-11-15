@@ -1112,6 +1112,38 @@ class RuntimeRouterTests(unittest.TestCase):
             with self.assertRaisesRegex(MulticaCliError, "runtime_switch_failed"):
                 adapter.verify_agent_runtime(instance, AGENT, RUNTIME_A, "explicit-model")
 
+    def test_cli_adapter_switches_runtime_with_default_but_not_inherited_model(self):
+        agent = {
+            "id": AGENT, "runtime_id": RUNTIME_A,
+            "max_concurrent_tasks": 1, "model": "",
+        }
+        updates = []
+
+        def runner(argv, **_kwargs):
+            command = argv[7:]
+            if command[:2] == ["agent", "update"]:
+                updates.append(command)
+                agent["runtime_id"] = command[command.index("--runtime-id") + 1]
+            else:
+                self.assertEqual(command[:2], ["agent", "get"])
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps(agent).encode(), stderr=b""
+            )
+
+        adapter = MulticaCliAdapter(runner=runner)
+        with patch.object(adapter, "runtime_list", return_value=[{
+            "id": RUNTIME_B, "status": "online", "accessible": True
+        }]):
+            result = adapter.switch_runtime(self.config.instance(INSTANCE), AGENT, RUNTIME_B, None)
+            self.assertEqual(result["runtime_id"], RUNTIME_B)
+            self.assertEqual(result["model"], "")
+            self.assertEqual(len(updates), 1)
+            self.assertNotIn("--model", updates[0])
+            agent.update(runtime_id=RUNTIME_A, model="inherited-model")
+            with self.assertRaisesRegex(MulticaCliError, "runtime_default_model_unverified"):
+                adapter.switch_runtime(self.config.instance(INSTANCE), AGENT, RUNTIME_B, None)
+            self.assertEqual(len(updates), 1)
+
     def test_cli_adapter_marks_invalid_utf8_create_output_uncertain(self):
         calls = 0
 
