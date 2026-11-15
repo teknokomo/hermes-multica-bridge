@@ -86,6 +86,9 @@ class ToolTests(unittest.TestCase):
                     "multica_list_routes", "multica_send_task", "multica_check_task_result",
                     "multica_workspace_send", "multica_workspace_get",
                     "multica_workspace_comment", "multica_workspace_update", "multica_route_create",
+                    "multica_runtime_task_create", "multica_runtime_cancel",
+                    "multica_runtime_status", "multica_runtime_bindings_list",
+                    "multica_runtime_binding_set", "multica_runtime_queue_list",
                 },
             )
             self.assertNotIn("pass_context", ctx.tools["multica_list_routes"])
@@ -376,6 +379,9 @@ class ToolTests(unittest.TestCase):
                 "multica_list_routes", "multica_send_task", "multica_check_task_result",
                 "multica_workspace_send", "multica_workspace_get",
                 "multica_workspace_comment", "multica_workspace_update", "multica_route_create",
+                    "multica_runtime_task_create", "multica_runtime_cancel",
+                    "multica_runtime_status", "multica_runtime_bindings_list",
+                    "multica_runtime_binding_set", "multica_runtime_queue_list",
             },
         )
         self.assertTrue(callable(ctx.tools["multica_send_task"]["handler"]))

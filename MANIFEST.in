@@ -5,8 +5,9 @@ include uv.lock
 include MANIFEST.sha256
 recursive-include bridge *.py
 recursive-include notify *.py
+recursive-include runtime_router *.py
 recursive-include config *.toml *.json
-recursive-include deploy *.py *.md *.service *.socket
+recursive-include deploy *.py *.md *.service *.socket *.timer
 include dashboard/manifest.json dashboard/plugin_api.py
 include dashboard/dist/index.js dashboard/dist/style.css
 recursive-include desktop *.js *.mjs

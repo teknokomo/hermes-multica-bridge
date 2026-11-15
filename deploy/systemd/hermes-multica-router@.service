@@ -1,0 +1,32 @@
+[Unit]
+Description=Deterministic Hermes Multica runtime-router tick for %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=%i
+StateDirectory=hermes-multica-router-%i
+StateDirectoryMode=0700
+UMask=0077
+WorkingDirectory=/var/lib/hermes-multica-router-%i
+Environment=HOME=/var/lib/hermes-multica-router-%i/cli-home
+Environment=XDG_CONFIG_HOME=/var/lib/hermes-multica-router-%i/cli-home/.config
+ExecStart=/opt/hermes-multica-bridge/router-venv/bin/hermes-multica-router --config /etc/hermes-multica-router/%i.json tick
+TimeoutStartSec=180
+TimeoutStopSec=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/hermes-multica-router-%i
+
+[Install]
+WantedBy=multi-user.target

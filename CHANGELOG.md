@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.0
+
+- Добавлен отключённый по умолчанию Runtime Router с одним canonical agent на роль, trusted principal/identity mapping, per-instance bindings и режимами `strict`/`exceptions`.
+- Добавлены отдельная SQLite очередь, idempotency, agent lock `(instance_id, agent_id)`, fenced leases и детерминированный worker CLI/timer; обычные Workspace routes 0.6.0 сохраняют прежний путь.
+- Добавлены шесть runtime tools, operator CLI, service-owned Multica profile HOME, runtime/model readback, issue reconciliation и bounded attachment spool.
+- Отклоняются недоступные runtime, неизвестная schema, невалидные profile snapshots, непроверенный issue-create ответ и `kanban_mirror=true`; автоматический blind retry неопределённого POST не выполняется.
+- Целевой CLI 0.8.2 подтверждён через version/help; реальные target JSON response shapes, service profile и canary не проверялись. Публикация и live deployment выполняются отдельно.
+
 ## 0.6.0
 
 - Добавлены project/squad/workspace scopes, точные thread ACL и динамические Workspace-маршруты в пределах операторских route grants.

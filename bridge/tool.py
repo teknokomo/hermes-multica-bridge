@@ -6,6 +6,10 @@ import json
 from pathlib import Path
 from typing import Any
 
+from runtime_router.adapter import MulticaCliAdapter, MulticaCliError
+from runtime_router.config import RouterConfig, RouterConfigError, service_cli_home
+from runtime_router.tools import register_tools as register_runtime_router_tools
+
 from .errors import BridgeError
 from .hermes import add_current_task_comment, read_current_task_with_context
 from .protocol import BridgeIpcClient
@@ -404,6 +408,7 @@ class PluginRuntime:
             registry = self._registry()
             workspace_runtime = WorkspaceRuntime(self.ctx)
             rows = []
+            router_readbacks: dict[tuple[str, str], tuple[str | None, str]] = {}
             try:
                 source = trusted_source(tool_context)
             except BridgeError:
@@ -477,6 +482,83 @@ class PluginRuntime:
                         "warnings": list(route.config_warnings),
                         "security_mode": connection.security_mode,
                     }
+                    if route.runtime_router_enabled:
+                        capability: dict[str, Any] = {
+                            "enabled": False,
+                            "route_enabled": True,
+                            "agent_ref": route.runtime_router_agent_ref,
+                            "agent_id": None,
+                            "instance_id": route.instance_id,
+                            "queue_mode": "serialized",
+                            "current_runtime_id": None,
+                            "current_runtime_status": "unavailable",
+                        }
+                        try:
+                            router_config = RouterConfig.parse(
+                                self.ctx.get_config("runtime_router", {})
+                            )
+                            agent_config = router_config.agent(
+                                route.runtime_router_agent_ref
+                            )
+                            if agent_config.instance_id != route.instance_id:
+                                raise RouterConfigError("route_instance_mismatch")
+                            capability["agent_id"] = agent_config.agent_id
+                            capability["enabled"] = router_config.enabled
+                            if router_config.enabled:
+                                key = (agent_config.instance_id, agent_config.agent_id)
+                                if key not in router_readbacks:
+                                    instance = router_config.instance(
+                                        agent_config.instance_id
+                                    )
+                                    adapter = MulticaCliAdapter(
+                                        binary=router_config.cli_binary,
+                                        home=str(service_cli_home(router_config)),
+                                        timeout=router_config.cli_timeout_seconds,
+                                    )
+                                    record = adapter.agent_get(
+                                        instance, agent_config.agent_id
+                                    )
+                                    if (
+                                        record["runtime_id"]
+                                        not in agent_config.allowed_runtime_ids
+                                        or record["max_concurrent_tasks"] != 1
+                                    ):
+                                        raise RouterConfigError(
+                                            "runtime_agent_not_ready"
+                                        )
+                                    runtime_rows = adapter.runtime_list(instance)
+                                    current = next(
+                                        (
+                                            item
+                                            for item in runtime_rows
+                                            if item["id"] == record["runtime_id"]
+                                        ),
+                                        None,
+                                    )
+                                    if (
+                                        current is None
+                                        or current["status"] != "online"
+                                        or current["accessible"] is not True
+                                    ):
+                                        raise RouterConfigError("runtime_not_ready")
+                                    router_readbacks[key] = (
+                                        record["runtime_id"],
+                                        "available",
+                                    )
+                                (
+                                    capability["current_runtime_id"],
+                                    capability["current_runtime_status"],
+                                ) = router_readbacks[key]
+                            else:
+                                row["warnings"].append("runtime_router_disabled")
+                        except (
+                            RouterConfigError,
+                            MulticaCliError,
+                            KeyError,
+                            TypeError,
+                        ):
+                            row["warnings"].append("runtime_status_unavailable")
+                        row["runtime_router"] = capability
                     if route.wake_mode == "completion":
                         project_ids = workspace_runtime._project_ids_for_route(route)
                         readiness = workspace_runtime._wake_readiness(registry, route, project_ids)
@@ -556,3 +638,4 @@ def register(ctx: Any) -> None:
         handler=runtime.handle_check_result,
     )
     register_workspace_tools(ctx)
+    register_runtime_router_tools(ctx)

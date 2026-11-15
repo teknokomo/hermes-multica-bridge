@@ -1,8 +1,8 @@
 name: hermes-multica-bridge
-version: "0.6.0"
+version: "0.7.0"
 manifest_version: 2
 requires_hermes: ">=0.22.4"
-description: "Bridge between Hermes and Multica with scoped Workspace routes, operator grants, and completion-only wake readiness."
+description: "Bridge between Hermes and Multica with scoped Workspace routes, operator grants, completion wake, and an opt-in canonical-agent Runtime Router."
 author: Universo
 license: "LicenseRef-Omsk-Open-License-Basic-Attribution"
 kind: standalone
@@ -17,6 +17,12 @@ provides_tools:
   - multica_workspace_comment
   - multica_workspace_update
   - multica_route_create
+  - multica_runtime_task_create
+  - multica_runtime_cancel
+  - multica_runtime_status
+  - multica_runtime_bindings_list
+  - multica_runtime_binding_set
+  - multica_runtime_queue_list
 tags:
   - multica
   - kanban
@@ -32,3 +38,19 @@ config_schema:
       routes: []
       operator_grants: []
       route_grants: []
+  runtime_router:
+    type: dict
+    label: "Runtime Router"
+    description: "Операторская политика переключения runtime canonical agent. По умолчанию выключена."
+    default:
+      enabled: false
+      state_path: "${HERMES_HOME}/plugin-data/hermes-multica-bridge/runtime-router.sqlite3"
+      worker_profile: "default"
+      tick_seconds: 30
+      lease_seconds: 900
+      unbound_policy: "reject"
+      kanban_mirror: false
+      connectors: {}
+      instances: {}
+      agents: {}
+      operators: []
