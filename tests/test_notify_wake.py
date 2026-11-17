@@ -19,7 +19,16 @@ import pytest
 from notify.cli import execute, execute_wake
 from notify.config import NotifyError, parse_config
 from notify.service import Service
-from notify.state import INDEXES_V1, SCHEMA, State
+from notify.state import (
+    APPROVAL_INDEXES_V4,
+    APPROVAL_SCHEMA_V4,
+    INDEXES_V1,
+    SCHEMA,
+    WAKE_INDEXES,
+    WAKE_SCHEMA,
+    WAKE_SCHEMA_V2,
+    State,
+)
 from notify.wake import (
     MAX_BODY_BYTES,
     MAX_SNAPSHOT_BYTES,
@@ -165,6 +174,62 @@ def test_new_done_transition_creates_one_wake_and_suppresses_all_regular_notices
     assert not ctx.state.rows("SELECT * FROM notifications")
 
 
+def _configure_completion_filter(ctx, *, mode, explicit_issue_ids=()):
+    ctx.config = parse_config(
+        ctx.raw
+        | {
+            "wake": {
+                "enabled": True,
+                "base_url": "http://127.0.0.1:8644",
+                "secret_credential": "fake-wake",
+                "routes": {
+                    "default-test": {
+                        "profile": "default",
+                        "route": "default-test",
+                        "completion_filter": mode,
+                        "explicit_issue_ids": list(explicit_issue_ids),
+                    }
+                },
+            }
+        }
+    )
+    sid = add(ctx, chat_type="thread", thread_id="999", project_id=PROJECT)
+    ctx.state.add_wake_subscription(
+        sid, ctx.config.wake["routes"]["default-test"], enabled=True, now=ctx.now
+    )
+    return sid
+
+
+def test_root_only_completion_filter_suppresses_children_and_fails_closed_if_parent_missing(ctx):
+    _configure_completion_filter(ctx, mode="root_only")
+    run(ctx, issue(ctx, "todo", at=ctx.now, parent_issue_id="parent-1"))
+    run(ctx, issue(ctx, "done", 2, at=ctx.now + 1, parent_issue_id="parent-1"))
+    assert ctx.state.rows("SELECT * FROM wake_jobs") == []
+    assert ctx.state.rows("SELECT value FROM metadata WHERE key='metric:wake_filtered_child'")[0]["value"] == "1"
+
+    run(ctx, issue(ctx, "todo", 3, at=ctx.now + 2, parent_issue_id=None, title="Root issue"))
+    run(ctx, issue(ctx, "done", 4, at=ctx.now + 3, parent_issue_id=None, title="Root issue"))
+    assert len(ctx.state.rows("SELECT * FROM wake_jobs")) == 1
+
+    run(ctx, issue(ctx, "todo", 1, at=ctx.now + 4, id="missing-parent"))
+    run(ctx, issue(ctx, "done", 2, at=ctx.now + 5, id="missing-parent"))
+    assert len(ctx.state.rows("SELECT * FROM wake_jobs")) == 1
+    assert ctx.state.rows("SELECT value FROM metadata WHERE key='metric:wake_filter_context_missing'")[0]["value"] == "1"
+
+
+def test_explicit_issue_completion_filter_admits_only_configured_issue_id(ctx):
+    selected, other = (
+        "00000000-0000-4000-8000-000000000101",
+        "00000000-0000-4000-8000-000000000102",
+    )
+    _configure_completion_filter(ctx, mode="explicit_issues", explicit_issue_ids=[selected])
+    for issue_id in (other, selected):
+        run(ctx, issue(ctx, "todo", 1, at=ctx.now, id=issue_id))
+        run(ctx, issue(ctx, "done", 2, at=ctx.now + 1, id=issue_id))
+    jobs = ctx.state.rows("SELECT issue_id FROM wake_jobs")
+    assert jobs == [{"issue_id": selected}]
+
+
 def test_baseline_and_enabled_since_suppress_historical_done(ctx):
     configure_wake(ctx)
     run(ctx, issue(ctx, "done", at=ctx.now))
@@ -203,6 +268,58 @@ def test_wake_requires_exact_project_and_supported_destination(ctx):
     sid2 = add(ctx, chat_type="group", thread_id="", project_id=PROJECT)
     with pytest.raises(NotifyError):
         ctx.state.add_wake_subscription(sid2, route)
+
+
+def test_max_dm_wake_pins_user_id_without_group_or_thread_fallback(ctx):
+    policy_path = ctx.root / "webhook-policy.json"
+    row = exported_route(
+        deliver="max", deliver_extra={"user_id": "10001", "thread_id": ""}
+    )
+    policy_path.write_text(json.dumps({"routes": [row]}))
+    policy_path.chmod(0o600)
+    policy = load_webhook_policy(policy_path)
+    verify_webhook_policy(
+        policy, "default", "default-test",
+        {"platform": "max", "chat_id": "10001", "thread_id": "", "chat_type": "dm"},
+    )
+    for source in (
+        {"platform": "telegram", "chat_id": "10001", "thread_id": "", "chat_type": "dm"},
+        {"platform": "max", "chat_id": "10002", "thread_id": "", "chat_type": "dm"},
+        {"platform": "max", "chat_id": "10001", "thread_id": "topic", "chat_type": "dm"},
+        {"platform": "max", "chat_id": "10001", "thread_id": "", "chat_type": "group"},
+    ):
+        with pytest.raises(NotifyError, match="wake_route_policy_mismatch"):
+            verify_webhook_policy(policy, "default", "default-test", source)
+
+    subscription = {
+        "platform": "max", "account": "max", "chat_id": "10001",
+        "thread_id": "", "chat_type": "dm", "workspace_id": "test",
+        "project_id": PROJECT, "since": time.time(),
+    }
+    from notify.state import subscription as normalize_subscription
+
+    sid = ctx.state.add_subscription(normalize_subscription(subscription, ctx.config, time.time()))
+    route = {"profile": "default", "route": "default-test"}
+    ctx.state.add_wake_subscription(sid, route)
+    assert ctx.state.wake_binding(sid)["chat_type"] == "dm"
+
+
+def test_max_dm_payload_identifies_user_not_group(ctx):
+    sub = {"platform": "max", "chat_id": "10001", "thread_id": "", "chat_type": "dm"}
+    raw = build_payload(
+        wake_id="6b2d7c11-90bd-4e2d-a9ce-48079b92ff53",
+        profile="default",
+        subscription=sub,
+        issue={"id": "issue-a", "identifier": "TEST-1", "title": "Done", "status": "done",
+                "description": "", "project_id": PROJECT},
+        comments=[],
+        issue_url="https://multica.example.invalid/test/issues/TEST-1",
+        workspace_id="workspace-test",
+        transition_seq=1,
+    )
+    assert json.loads(raw)["origin"] == {
+        "platform": "max", "user_id": "10001", "thread_id": "", "chat_type": "dm"
+    }
 
 
 @pytest.mark.parametrize(
@@ -487,10 +604,76 @@ def test_schema_v1_migration_preserves_rows_and_unknown_schema_is_untouched(ctx)
     db.close()
     legacy.chmod(0o600)
     migrated = State(legacy)
-    assert migrated.db.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert migrated.db.execute("PRAGMA user_version").fetchone()[0] == 5
     assert migrated.rows("SELECT value FROM metadata WHERE key='sentinel'")[0]["value"] == "retained"
     assert {r["name"] for r in migrated.db.execute("SELECT name FROM sqlite_master WHERE type='table'")} >= {"wake_jobs", "wake_subscriptions"}
+    assert migrated.db.execute("SELECT completion_filter FROM wake_subscriptions").fetchall() == []
     migrated.db.close()
+
+
+def test_schema_v2_migration_adds_completion_filter_without_changing_wake_rows(ctx):
+    legacy = ctx.root / "legacy-v2.db"
+    db = sqlite3.connect(legacy)
+    for table, columns in (SCHEMA | WAKE_SCHEMA_V2).items():
+        db.execute(f"CREATE TABLE {table} ({columns})")
+    for statement in (INDEXES_V1 | WAKE_INDEXES).values():
+        db.execute(statement)
+    db.execute("INSERT INTO accounts VALUES('tg','telegram','{}',1)")
+    db.execute("INSERT INTO workspaces VALUES('test','https://multica.example.invalid',?,?,1,1)", ("test-workspace", "{}"))
+    db.execute(
+        "INSERT INTO subscriptions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("sub-v2", "telegram", "tg", "100", "999", "thread", None, "test", PROJECT, "", "[]", '["done"]', "quiet", "test", "ru", 0, 1, 0, 1, ""),
+    )
+    db.execute(
+        "INSERT INTO wake_subscriptions VALUES(?,?,?,?,?,?,?,?,?)",
+        ("sub-v2", "default", "default-test", '["done"]', 1, 1, "", 1, 1),
+    )
+    db.execute("PRAGMA user_version=2")
+    db.commit()
+    db.close()
+    legacy.chmod(0o600)
+    migrated = State(legacy)
+    row = migrated.rows("SELECT completion_filter,route FROM wake_subscriptions")[0]
+    assert row == {"completion_filter": "any", "route": "default-test"}
+    assert migrated.db.execute("PRAGMA user_version").fetchone()[0] == 5
+    migrated.db.close()
+
+
+def test_schema_v4_migration_blocks_unverifiable_approval_mappings(ctx):
+    legacy = ctx.root / "legacy-v4.db"
+    db = sqlite3.connect(legacy)
+    for table, columns in (SCHEMA | WAKE_SCHEMA | APPROVAL_SCHEMA_V4).items():
+        db.execute(f"CREATE TABLE {table} ({columns})")
+    for statement in (INDEXES_V1 | WAKE_INDEXES | APPROVAL_INDEXES_V4).values():
+        db.execute(statement)
+    now = time.time()
+    db.execute(
+        """INSERT INTO approval_mappings(
+            mapping_id,connection_id,workspace_id,workspace_key,source_profile,parent_issue_id,
+            wakeup_id,route_id,subscription_id,instruction,child_ids_json,tree_fingerprint,
+            status,created_at,updated_at)
+            VALUES('mapping','connection','workspace','workspace-key','default','parent','wakeup',
+            'route','subscription','instruction','[]','fingerprint','pending',?,?)""",
+        (now, now),
+    )
+    db.execute("PRAGMA user_version=4")
+    db.commit()
+    db.close()
+    legacy.chmod(0o600)
+
+    migrated = State(legacy)
+    row = migrated.rows("SELECT status,detail,agent_id,project_id FROM approval_mappings")[0]
+    assert row == {
+        "status": "blocked",
+        "detail": "approval_mapping_legacy_unverified",
+        "agent_id": "",
+        "project_id": "",
+    }
+    assert migrated.db.execute("PRAGMA user_version").fetchone()[0] == 5
+    migrated.db.close()
+
+    reopened = State(legacy)
+    reopened.db.close()
 
     broken = ctx.root / "broken.db"
     db = sqlite3.connect(broken)

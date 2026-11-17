@@ -16,7 +16,7 @@ from typing import Any
 
 from .config import RouterConfigError
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 ACTIVE_STATES = ("switching", "creating", "waiting", "reconciling", "cancelling")
 TERMINAL_STATES = {"done", "failed", "cancelled"}
 _PRINCIPAL_ID = re.compile(
@@ -147,6 +147,15 @@ _V4_COLUMNS = {
     "router_worker_state": (
         *_V3_COLUMNS["router_worker_state"],
         "terminal_sweep_cursor",
+    ),
+}
+_V5_COLUMNS = {
+    **_V4_COLUMNS,
+    "router_requests": (
+        *_V4_COLUMNS["router_requests"],
+        "target_model_rule_id",
+        "target_model_source",
+        "target_model_reason",
     ),
 }
 _TRANSITIONS = {
@@ -355,9 +364,27 @@ class RouterStore:
                     raise RouterConfigError("router_database_migration_failed") from exc
                 names = self._table_names(db)
                 version = db.execute("PRAGMA user_version").fetchone()[0]
+            if names == _TABLES and version == 4:
+                if not RouterStore._schema_matches(db, _V4_COLUMNS):
+                    raise RouterConfigError("router_database_schema_unsupported")
+                try:
+                    db.executescript("""
+                        BEGIN IMMEDIATE;
+                        ALTER TABLE router_requests ADD COLUMN target_model_rule_id TEXT;
+                        ALTER TABLE router_requests ADD COLUMN target_model_source TEXT;
+                        ALTER TABLE router_requests ADD COLUMN target_model_reason TEXT;
+                        PRAGMA user_version=5;
+                        COMMIT;
+                    """)
+                except sqlite3.Error as exc:
+                    if db.in_transaction:
+                        db.rollback()
+                    raise RouterConfigError("router_database_migration_failed") from exc
+                names = self._table_names(db)
+                version = db.execute("PRAGMA user_version").fetchone()[0]
             if names and (
                 version != SCHEMA_VERSION
-                or not RouterStore._schema_matches(db, _V4_COLUMNS)
+                or not RouterStore._schema_matches(db, _V5_COLUMNS)
             ):
                 raise RouterConfigError("router_database_schema_unsupported")
             if names:
@@ -445,7 +472,10 @@ class RouterStore:
                     cancel_source_state TEXT CHECK(cancel_source_state IS NULL OR cancel_source_state IN
                         ('switching','creating','waiting','reconciling','cancelling')),
                     reconcile_source_state TEXT CHECK(reconcile_source_state IS NULL OR reconcile_source_state IN
-                        ('switching','creating','waiting','reconciling','cancelling')));
+                        ('switching','creating','waiting','reconciling','cancelling')),
+                    target_model_rule_id TEXT,
+                    target_model_source TEXT,
+                    target_model_reason TEXT);
                 CREATE UNIQUE INDEX one_active_per_agent
                     ON router_requests(instance_id,agent_id)
                     WHERE state IN ('switching','creating','waiting','reconciling','cancelling');
@@ -471,7 +501,7 @@ class RouterStore:
                     last_tick_at INTEGER NOT NULL,
                     last_error_code TEXT,
                     terminal_sweep_cursor TEXT);
-                PRAGMA user_version=4;
+                PRAGMA user_version=5;
                 COMMIT;
             """)
         except sqlite3.Error as exc:
@@ -847,7 +877,7 @@ class RouterStore:
             integrity = db.execute("PRAGMA integrity_check").fetchone()[0]
             version = db.execute("PRAGMA user_version").fetchone()[0]
             journal_mode = db.execute("PRAGMA journal_mode").fetchone()[0]
-            schema_matches = RouterStore._schema_matches(db, _V4_COLUMNS)
+            schema_matches = RouterStore._schema_matches(db, _V5_COLUMNS)
         finally:
             db.close()
         if (
@@ -936,6 +966,9 @@ class RouterStore:
         priority: int = 0,
         runtime_id: str | None = None,
         model: str | None = None,
+        model_rule_id: str | None = None,
+        model_source: str | None = None,
+        model_reason: str | None = None,
         resolution: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         body = _encode(payload)
@@ -966,8 +999,9 @@ class RouterStore:
                 db.execute(
                     "INSERT INTO router_requests(request_id,idempotency_key,payload_hash,principal_id,connector_id,"
                     "instance_id,agent_id,agent_ref,route_id,target_runtime_id,target_model,project_id,payload_json,"
-                    "state,priority,resolved_rule_id,resolution_json,created_at,updated_at) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'queued',?,?,?,?,?)",
+                    "target_model_rule_id,target_model_source,target_model_reason,state,priority,resolved_rule_id,"
+                    "resolution_json,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'queued',?,?,?,?,?)",
                     (
                         request_id,
                         key,
@@ -982,6 +1016,9 @@ class RouterStore:
                         model,
                         project_id,
                         body,
+                        model_rule_id,
+                        model_source,
+                        model_reason,
                         priority,
                         (resolution or {}).get("rule_id"),
                         _encode(resolution) if resolution else None,
@@ -1194,6 +1231,9 @@ class RouterStore:
             db.execute(
                 "UPDATE router_requests SET state=?,target_runtime_id=COALESCE(?,target_runtime_id),"
                 "target_model=COALESCE(?,target_model),issue_id=COALESCE(?,issue_id),"
+                "target_model_rule_id=COALESCE(?,target_model_rule_id),"
+                "target_model_source=COALESCE(?,target_model_source),"
+                "target_model_reason=COALESCE(?,target_model_reason),"
                 "issue_url=COALESCE(?,issue_url),resolution_json=COALESCE(?,resolution_json),"
                 "last_error_code=?,lease_owner=?,lease_token=?,lease_expires_at=?,heartbeat_at=?,"
                 "cancel_source_state=CASE WHEN ? IN ('queued','done','failed','cancelled') "
@@ -1208,6 +1248,9 @@ class RouterStore:
                     runtime_id,
                     model,
                     issue_id,
+                    (resolution or {}).get("model_rule_id"),
+                    (resolution or {}).get("model_source"),
+                    (resolution or {}).get("model_reason"),
                     issue_url,
                     _encode(resolution) if resolution else None,
                     error,

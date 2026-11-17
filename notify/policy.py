@@ -126,6 +126,7 @@ def reconcile(
             "status",
             "workspace_id",
             "project_id",
+            "parent_issue_id",
             "revision",
             "updated_at",
             "created_at",
@@ -360,6 +361,20 @@ def reconcile(
                     or issue["_transition_at"] < wake_sub["enabled_since"]
                     or not matches(dict(wake_sub), issue)
                 ):
+                    continue
+                completion_filter = route.get("completion_filter", "any")
+                if completion_filter == "root_only":
+                    if "parent_issue_id" not in issue:
+                        state._wake_metric(db, "wake_filter_context_missing")
+                        continue
+                    if issue.get("parent_issue_id") not in (None, ""):
+                        state._wake_metric(db, "wake_filtered_child")
+                        continue
+                elif (
+                    completion_filter == "explicit_issues"
+                    and issue["id"] not in route.get("explicit_issue_ids", ())
+                ):
+                    state._wake_metric(db, "wake_filtered_not_listed")
                     continue
                 wake_id = str(uuid.uuid4())
                 status, payload_raw, error_code = "pending", None, ""

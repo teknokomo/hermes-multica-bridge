@@ -54,3 +54,10 @@ config_schema:
       instances: {}
       agents: {}
       operators: []
+  condition_wake:
+    type: dict
+    label: "Approval-ready condition wake"
+    description: "По умолчанию выключено. Включать только после проверки на целевой сборке, что native wake/run не доставляется в чат напрямую; финальное сообщение отправляет notify."
+    default:
+      enabled: false
+      native_delivery_suppressed: false

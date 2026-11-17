@@ -13,6 +13,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from typing import Any
 
 from .configuration import normalize_multica_origin
@@ -302,6 +303,153 @@ class WorkspaceApiClient:
         if any(not isinstance(row, dict) or not isinstance(row.get("id"), str) for row in value):
             raise BridgeError("invalid_api_response", "Multica returned invalid comment records.")
         return value
+
+    @staticmethod
+    def _strict_array(raw: bytes, *, field: str | None, maximum: int, kind: str) -> list[dict[str, Any]]:
+        try:
+            value = strict_json_loads(raw)
+        except (ValueError, UnicodeError, RecursionError):
+            raise WorkspaceApiFailure("invalid_api_response", f"Multica returned invalid {kind} data.", outcome="unknown") from None
+        if field is not None:
+            value = value.get(field) if isinstance(value, dict) else None
+        if (not isinstance(value, list) or len(value) > maximum
+                or any(not isinstance(row, dict) for row in value)):
+            raise WorkspaceApiFailure("invalid_api_response", f"Multica returned invalid {kind} data.", outcome="unknown")
+        return value
+
+    def list_issue_children(self, issue_id: str) -> list[dict[str, Any]]:
+        """Read direct children from the pinned issue children API."""
+        issue_id = _identifier(issue_id, "issue_id")
+        raw = self._request(
+            "GET", f"/api/issues/{urllib.parse.quote(issue_id, safe='')}/children"
+        )
+        if not isinstance(raw, bytes):
+            raise BridgeError("invalid_api_response", "Multica returned invalid child issue data.")
+        rows = self._strict_array(raw, field="issues", maximum=500, kind="child issue")
+        required = ("id", "workspace_id", "project_id", "parent_issue_id", "status")
+        if any(
+            any(not isinstance(row.get(key), str) or not row[key] for key in required)
+            or (row.get("stage") is not None and type(row["stage"]) is not int)
+            for row in rows
+        ):
+            raise WorkspaceApiFailure("invalid_api_response", "Multica returned incomplete child issue records.", outcome="unknown")
+        return rows
+
+    def list_issue_wakeups(self, issue_id: str) -> list[dict[str, Any]]:
+        """Read wakeups attached to one parent issue; this method never mutates them."""
+        issue_id = _identifier(issue_id, "issue_id")
+        raw = self._request(
+            "GET", f"/api/issues/{urllib.parse.quote(issue_id, safe='')}/wakeups"
+        )
+        if not isinstance(raw, bytes):
+            raise BridgeError("invalid_api_response", "Multica returned invalid wakeup data.")
+        rows = self._strict_array(raw, field=None, maximum=100, kind="wakeup")
+        if any(
+            not isinstance(row.get("id"), str) or not _ID_RE.fullmatch(row["id"])
+            or row.get("issue_id") != issue_id
+            or not isinstance(row.get("agent_id"), str) or not _ID_RE.fullmatch(row["agent_id"])
+            or row.get("kind") not in {"event", "at", "every", "cron"}
+            or (row.get("condition") is not None and not isinstance(row.get("condition"), dict))
+            or not isinstance(row.get("instruction"), str)
+            or row.get("mode") not in {"once", "continuous"}
+            or type(row.get("enabled")) is not bool
+            or "last_task_id" not in row
+            or (row["last_task_id"] is not None
+                and (not isinstance(row["last_task_id"], str) or not _ID_RE.fullmatch(row["last_task_id"])))
+            or (row.get("last_task_status") is not None and not isinstance(row.get("last_task_status"), str))
+            or (row.get("expires_at") is not None and not isinstance(row.get("expires_at"), str))
+            or (row.get("timed_out_at") is not None and not isinstance(row.get("timed_out_at"), str))
+            for row in rows
+        ):
+            raise WorkspaceApiFailure("invalid_api_response", "Multica returned incomplete wakeup records.", outcome="unknown")
+        return rows
+
+    def list_issue_wakeup_runs(self, issue_id: str, wakeup_id: str) -> list[dict[str, Any]]:
+        issue_id = _identifier(issue_id, "issue_id")
+        wakeup_id = _identifier(wakeup_id, "wakeup_id")
+        raw = self._request(
+            "GET",
+            f"/api/issues/{urllib.parse.quote(issue_id, safe='')}/wakeups/{urllib.parse.quote(wakeup_id, safe='')}/runs",
+        )
+        if not isinstance(raw, bytes):
+            raise BridgeError("invalid_api_response", "Multica returned invalid wakeup run data.")
+        rows = self._strict_array(raw, field=None, maximum=100, kind="wakeup run")
+        if any(
+            not isinstance(row.get("id"), str) or not _ID_RE.fullmatch(row["id"])
+            or not isinstance(row.get("status"), str) or not row["status"]
+            or not isinstance(row.get("created_at"), str) or not row["created_at"]
+            or not isinstance(row.get("triggers"), list)
+            or any(not isinstance(trigger, str) or not trigger for trigger in row["triggers"])
+            or not isinstance(row.get("checkin_note"), str)
+            or type(row.get("commented")) is not bool
+            or any(row.get(key) is not None and not isinstance(row.get(key), str)
+                   for key in ("started_at", "completed_at"))
+            for row in rows
+        ):
+            raise WorkspaceApiFailure("invalid_api_response", "Multica returned incomplete wakeup run records.", outcome="unknown")
+        run_ids = [row["id"] for row in rows]
+        if len(set(run_ids)) != len(run_ids):
+            raise WorkspaceApiFailure("invalid_api_response", "Multica returned duplicate wakeup run records.", outcome="unknown")
+        return rows
+
+    def create_issue_wakeup(self, issue_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Create one native wakeup. The caller must persist a registration claim first."""
+        issue_id = _identifier(issue_id, "issue_id")
+        allowed = {
+            "agent_id", "kind", "instruction", "condition", "mode", "on_timeout",
+            "expires_in_seconds", "expires_at",
+        }
+        required = allowed - {"expires_in_seconds", "expires_at"}
+        fields = set(payload) if isinstance(payload, dict) else set()
+        if (
+            not isinstance(payload, dict)
+            or fields - allowed
+            or not required <= fields
+            or (("expires_at" in fields) == ("expires_in_seconds" in fields))
+        ):
+            raise BridgeError("invalid_arguments", "The condition wakeup payload is invalid.")
+        agent_id = payload.get("agent_id")
+        try:
+            canonical_agent_id = str(uuid.UUID(agent_id)) if isinstance(agent_id, str) else ""
+        except (ValueError, AttributeError):
+            canonical_agent_id = ""
+        if (canonical_agent_id != agent_id or payload.get("kind") != "event"
+                or payload.get("mode") != "once"
+                or not isinstance(payload.get("instruction"), str) or not payload["instruction"].strip()
+                or not isinstance(payload.get("condition"), dict)
+                or payload["condition"].get("type") != "children_done"
+                or set(payload["condition"]) - {"type", "stage"}
+                or ("stage" in payload["condition"]
+                    and (type(payload["condition"]["stage"]) is not int or payload["condition"]["stage"] < 1))
+                or payload.get("on_timeout") not in {"end", "wake"}
+                or ("expires_at" in payload) == ("expires_in_seconds" in payload)
+                or ("expires_in_seconds" in payload
+                    and (type(payload["expires_in_seconds"]) is not int
+                         or not 60 <= payload["expires_in_seconds"] <= 90 * 86400))
+                or ("expires_at" in payload and not isinstance(payload["expires_at"], str))):
+            raise BridgeError("invalid_arguments", "The condition wakeup payload is invalid.")
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        raw = self._request(
+            "POST", f"/api/issues/{urllib.parse.quote(issue_id, safe='')}/wakeups",
+            body=body, write=True,
+        )
+        if not isinstance(raw, bytes):
+            raise WorkspaceApiFailure("operation_unknown", "Multica may have accepted the wakeup; inspect it before retrying.", outcome="unknown")
+        try:
+            result = strict_json_loads(raw)
+        except (ValueError, UnicodeError, RecursionError):
+            raise WorkspaceApiFailure("operation_unknown", "Multica may have accepted the wakeup; inspect it before retrying.", outcome="unknown") from None
+        if (not isinstance(result, dict) or result.get("issue_id") != issue_id
+                or not isinstance(result.get("id"), str) or not _ID_RE.fullmatch(result["id"])
+                or result.get("agent_id") != agent_id
+                or result.get("kind") != "event"
+                or result.get("mode") != "once"
+                or result.get("instruction") != payload["instruction"]
+                or result.get("condition") != payload["condition"]
+                or result.get("enabled") is not True
+                or result.get("last_task_id") is not None):
+            raise WorkspaceApiFailure("operation_unknown", "Multica may have accepted the wakeup; inspect it before retrying.", outcome="unknown")
+        return result
 
     def update_issue(self, issue_id: str, updates: dict[str, Any]) -> dict[str, Any]:
         issue_id = _identifier(issue_id, "issue_id")

@@ -163,7 +163,7 @@ class Multica:
                 "--direction",
                 "asc",
                 "--fields",
-                "id,identifier,workspace_id,project_id,status,updated_at,revision,assignee_type,assignee_id,labels",
+                "id,identifier,workspace_id,project_id,parent_issue_id,status,updated_at,revision,assignee_type,assignee_id,labels",
             ]
             if project:
                 argv += ["--project", project]
@@ -223,6 +223,7 @@ class Multica:
             "status_entered_at",
             "history_id",
             "project_id",
+            "parent_issue_id",
             "assignee_type",
             "assignee_id",
             "labels",

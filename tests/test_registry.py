@@ -448,6 +448,44 @@ class RegistryTests(unittest.TestCase):
         group_registry = registry_from_mapping(workspace_registry_payload(allow_groups=True))
         self.assertEqual(len(group_registry.authorized_workspace_routes({**source, "chat_type": "thread"})), 1)
 
+    def test_workspace_chat_type_allowlist_is_exact_and_legacy_dm_is_preserved(self) -> None:
+        payload = workspace_registry_payload()
+        registry = registry_from_mapping(payload)
+        source = {
+            "platform": "telegram", "user_id": "user-1", "chat_id": "chat-1",
+            "thread_id": "", "chat_type": "dm",
+        }
+        self.assertEqual(len(registry.authorized_workspace_routes(source)), 1)
+        payload["routes"][0]["allowed_chat_types"] = ["group"]
+        payload["routes"][0]["allow_groups"] = True
+        grouped = registry_from_mapping(payload)
+        self.assertEqual(grouped.authorized_workspace_routes(source), ())
+        self.assertEqual(
+            len(grouped.authorized_workspace_routes({**source, "chat_type": "group"})), 1
+        )
+        self.assertEqual(
+            grouped.authorized_workspace_routes({**source, "chat_type": "thread", "thread_id": "t-1"}),
+            (),
+        )
+
+    def test_workspace_fingerprint_includes_chat_type_without_changing_autopilot(self) -> None:
+        workspace_payload = workspace_registry_payload()
+        before_registry = registry_from_mapping(workspace_payload)
+        before = route_policy_fingerprint(before_registry, before_registry.routes[0])
+        workspace_payload["routes"][0]["allowed_chat_types"] = ["group"]
+        after_registry = registry_from_mapping(workspace_payload)
+        self.assertNotEqual(before, route_policy_fingerprint(after_registry, after_registry.routes[0]))
+
+        autopilot_payload = registry_payload(route_count=1)
+        autopilot = registry_from_mapping(autopilot_payload)
+        before_autopilot = route_policy_fingerprint(autopilot, autopilot.routes[0])
+        autopilot_payload["routes"][0]["allowed_chat_types"] = ["dm"]
+        changed_autopilot = registry_from_mapping(autopilot_payload)
+        self.assertEqual(
+            before_autopilot,
+            route_policy_fingerprint(changed_autopilot, changed_autopilot.routes[0]),
+        )
+
     def test_workspace_policy_fingerprint_covers_project_source_and_attachment_policy(self) -> None:
         payload = workspace_registry_payload()
         registry = registry_from_mapping(payload)

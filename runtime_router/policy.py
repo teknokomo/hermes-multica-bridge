@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from .config import ModelPolicy
+
 
 class ResolutionError(ValueError):
     def __init__(self, code: str, detail: str = "") -> None:
@@ -39,6 +41,146 @@ class Resolution:
     rule_id: str | None
     reason: str
     source: str
+    model_rule_id: str | None = None
+    model_source: str = "runtime_default"
+    model_reason: str = "runtime_default"
+    capability_source: str = "none"
+
+
+@dataclass(frozen=True)
+class ModelResolution:
+    model: str | None
+    rule_id: str | None
+    source: str
+    reason: str
+    capability_source: str
+
+
+def resolve_model(
+    *,
+    runtime_id: str,
+    runtime: Mapping[str, Any],
+    context: Mapping[str, Any],
+    model_by_runtime: Mapping[str, str],
+    allowed_models_by_runtime: Mapping[str, tuple[str, ...]],
+    policy: ModelPolicy,
+    explicit_model: str | None = None,
+    now: datetime | None = None,
+) -> ModelResolution:
+    """Resolve a model after runtime selection without changing the runtime."""
+    if explicit_model is not None and (
+        not isinstance(explicit_model, str)
+        or not explicit_model
+        or explicit_model != explicit_model.strip()
+        or len(explicit_model) > 128
+    ):
+        raise ResolutionError("model_policy_invalid")
+    if not policy.enabled:
+        if explicit_model is not None:
+            raise ResolutionError("model_not_allowed")
+        model = model_by_runtime.get(runtime_id)
+        models = runtime.get("models")
+        if model and isinstance(models, (list, tuple)) and model not in models:
+            raise ResolutionError("model_unsupported")
+        return ModelResolution(
+            model,
+            None,
+            "agent_map" if model else "runtime_default",
+            "model_by_runtime" if model else "empty_agent_model_default",
+            "none",
+        )
+
+    selected_rule = None
+    if explicit_model is not None:
+        if not policy.allow_explicit_model:
+            raise ResolutionError("model_not_allowed")
+        model, source, reason = explicit_model, "explicit", "explicit_model"
+    else:
+        matches = []
+        for rule in policy.rules:
+            if rule.runtime_ids and runtime_id not in rule.runtime_ids:
+                continue
+            if all(
+                context.get(key) in values
+                for key, values in rule.match.items()
+            ):
+                matches.append(rule)
+        if matches:
+            priority = max(rule.priority for rule in matches)
+            best = [rule for rule in matches if rule.priority == priority]
+            if len(best) != 1:
+                raise ResolutionError("model_policy_conflict")
+            selected_rule = best[0]
+            model, source, reason = selected_rule.model, "policy", "model_rule_match"
+        else:
+            model = model_by_runtime.get(runtime_id)
+            source = "agent_map" if model else "runtime_default"
+            reason = "model_by_runtime" if model else "empty_agent_model_default"
+
+    allowlist = allowed_models_by_runtime.get(runtime_id, ())
+    if model is not None and model not in allowlist:
+        raise ResolutionError("model_not_allowed")
+
+    capability_source = policy.capability_source
+    models = runtime.get("models")
+    if capability_source == "multica_catalog":
+        if model is not None and (not isinstance(models, (list, tuple)) or any(
+            not isinstance(item, str) or not item for item in models
+        )):
+            raise ResolutionError("model_capability_unknown")
+        if model is not None and model not in models:
+            fallback = next(
+                (
+                    candidate
+                    for candidate in (selected_rule.fallback_models if selected_rule else ())
+                    if candidate in allowlist and candidate in models
+                ),
+                None,
+            )
+            if fallback is None:
+                raise ResolutionError("model_unsupported")
+            model, source, reason = fallback, "policy", "catalog_confirmed_unsupported"
+    elif capability_source == "operator_catalog":
+        checked_at = policy.catalog_checked_at
+        ttl = policy.catalog_ttl_seconds
+        entries = policy.catalog_entries or {}
+        current = now or datetime.now(UTC)
+        if (
+            checked_at is None
+            or ttl is None
+            or current.tzinfo is None
+            or current.timestamp() >= checked_at.timestamp() + ttl
+        ):
+            raise ResolutionError("model_catalog_stale")
+        if model is not None:
+            status = entries.get((runtime_id, model))
+            if status is None:
+                raise ResolutionError("model_capability_unknown")
+            if status == "unsupported":
+                fallback = next(
+                    (
+                        candidate
+                        for candidate in (selected_rule.fallback_models if selected_rule else ())
+                        if candidate in allowlist
+                        and entries.get((runtime_id, candidate)) == "supported"
+                    ),
+                    None,
+                )
+                if fallback is None:
+                    raise ResolutionError("model_unsupported")
+                model, source, reason = fallback, "policy", "catalog_confirmed_unsupported"
+    elif capability_source != "none":
+        # Config parsing rejects unsupported catalog implementations. Keep this
+        # guard for callers that construct ModelPolicy directly in tests/plugins.
+        raise ResolutionError("model_capability_unknown")
+
+    return ModelResolution(
+        model,
+        selected_rule.rule_id if selected_rule else None,
+        source,
+        reason,
+        capability_source,
+    )
 
 
 def resolve_runtime(
@@ -50,6 +192,9 @@ def resolve_runtime(
     allowed_runtime_ids: set[str],
     runtime_catalog: Mapping[str, Mapping[str, Any]],
     model_by_runtime: Mapping[str, str],
+    model_policy: ModelPolicy | None = None,
+    allowed_models_by_runtime: Mapping[str, tuple[str, ...]] | None = None,
+    explicit_model: str | None = None,
     explicit_runtime_id: str | None = None,
     now: datetime | None = None,
 ) -> Resolution:
@@ -178,18 +323,28 @@ def resolve_runtime(
         )
     if runtime.get("accessible") is not True:
         raise ResolutionError("runtime_not_allowed")
-    model = model_by_runtime.get(selected)
-    models = runtime.get("models")
-    if model and isinstance(models, (list, tuple)) and model not in models:
-        raise ResolutionError("model_unsupported")
+    model_resolution = resolve_model(
+        runtime_id=selected,
+        runtime=runtime,
+        context=context,
+        model_by_runtime=model_by_runtime,
+        allowed_models_by_runtime=allowed_models_by_runtime or {},
+        policy=model_policy or ModelPolicy(),
+        explicit_model=explicit_model,
+        now=current_time,
+    )
     if strict_expired and reason == "binding_default":
         reason, source = "strict_expired_fallback", "strict_expired_fallback"
     return Resolution(
         str(identity["principal_id"]),
         instance_id,
         selected,
-        model,
+        model_resolution.model,
         rule_id,
         reason,
         source,
+        model_resolution.rule_id,
+        model_resolution.source,
+        model_resolution.reason,
+        model_resolution.capability_source,
     )

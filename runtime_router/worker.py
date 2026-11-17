@@ -297,15 +297,25 @@ class RouterWorker:
                 "project_id": project_id,
                 "instance_id": agent.instance_id,
                 "squad_id": route.squad_id,
+                "task_class": payload.get("task_class"),
             },
             allowed_runtime_ids=set(agent.allowed_runtime_ids),
             runtime_catalog=catalog,
             model_by_runtime=agent.model_by_runtime,
+            model_policy=config.model_policy,
+            allowed_models_by_runtime=agent.allowed_models_by_runtime,
+            explicit_model=payload.get("explicit_model"),
             explicit_runtime_id=payload.get("explicit_runtime_id"),
         )
         if (
             resolution.runtime_id != request["target_runtime_id"]
             or resolution.model != request["target_model"]
+            or request.get("target_model_rule_id") is not None
+            and resolution.model_rule_id != request.get("target_model_rule_id")
+            or request.get("target_model_source") is not None
+            and resolution.model_source != request.get("target_model_source")
+            or request.get("target_model_reason") is not None
+            and resolution.model_reason != request.get("target_model_reason")
         ):
             raise RouterConfigError("request_resolution_changed")
         return resolution
@@ -784,6 +794,10 @@ class RouterWorker:
                     "rule_id": resolution.rule_id,
                     "reason": resolution.reason,
                     "source": resolution.source,
+                    "model_rule_id": resolution.model_rule_id,
+                    "model_source": resolution.model_source,
+                    "model_reason": resolution.model_reason,
+                    "capability_source": resolution.capability_source,
                 },
                 lease_seconds=latest_config.lease_seconds,
             ):

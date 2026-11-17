@@ -2,6 +2,9 @@
 
 ## 0.7.0
 
+- Добавлены MAX direct-message completion routes, фильтры `any`/`root_only`/`explicit_issues` и опциональный двухфазный `condition_wake` с проверкой всех дочерних этапов.
+- Добавлены scoped approval mappings и notify-only `task.ready_for_approval`; включение fail closed до подтверждения подавления native-доставки на целевой сборке.
+- Добавлена детерминированная model policy с отдельным операторским allowlist и поддержкой пустой модели как runtime default.
 - Добавлен отключённый по умолчанию Runtime Router с одним canonical agent на роль, trusted principal/identity mapping, per-instance bindings и режимами `strict`/`exceptions`.
 - Добавлены отдельная SQLite очередь, idempotency, agent lock `(instance_id, agent_id)`, fenced leases и детерминированный worker CLI/timer; обычные Workspace routes 0.6.0 сохраняют прежний путь.
 - Добавлены шесть runtime tools, operator CLI, service-owned Multica profile HOME, runtime/model readback, issue reconciliation и bounded attachment spool.
