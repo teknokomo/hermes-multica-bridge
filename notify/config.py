@@ -17,7 +17,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from bridge.notify_contract import READINESS_PROFILES, READINESS_SOCKET_PATH
+from bridge.notify_contract import (
+    APPROVAL_SOCKET_PATH,
+    READINESS_PROFILES,
+    READINESS_SOCKET_PATH,
+)
 
 PROFILE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 
@@ -127,6 +131,7 @@ class Config:
     workspace_errors: dict[str, str] = field(default_factory=dict)
     wake: dict[str, Any] = field(default_factory=dict)
     readiness_ipc: dict[str, Any] = field(default_factory=dict)
+    approval_ipc: dict[str, Any] = field(default_factory=dict)
 
 
 DEFAULTS = {
@@ -166,12 +171,20 @@ READINESS_IPC_DEFAULTS = {
     "socket_path": READINESS_SOCKET_PATH,
     "peers": [],
 }
+APPROVAL_IPC_DEFAULTS = {
+    "enabled": False,
+    "socket_path": APPROVAL_SOCKET_PATH,
+    "native_delivery_suppressed": False,
+    "peers": [],
+}
 
 
 def parse_config(raw: Any) -> Config:
     require(
         isinstance(raw, dict)
-        and not set(raw) - {"service", "policy", "accounts", "workspaces", "wake", "readiness_ipc"}
+        and not set(raw) - {
+            "service", "policy", "accounts", "workspaces", "wake", "readiness_ipc", "approval_ipc",
+        }
     )
     service_raw, policy_raw = raw.get("service", {}), raw.get("policy", {})
     require(isinstance(service_raw, dict) and not set(service_raw) - set(DEFAULTS))
@@ -254,7 +267,7 @@ def parse_config(raw: Any) -> Config:
         )
         require(
             isinstance(route_row, dict)
-            and not set(route_row) - {"profile", "route", "test"}
+            and not set(route_row) - {"profile", "route", "test", "completion_filter", "explicit_issue_ids"}
             and {"profile", "route"} <= set(route_row),
             "wake_config_invalid",
         )
@@ -270,11 +283,33 @@ def parse_config(raw: Any) -> Config:
         )
         require(route not in seen_routes, "wake_config_invalid")
         require(type(route_row.get("test", False)) is bool, "wake_config_invalid")
+        completion_filter = route_row.get("completion_filter", "any")
+        require(
+            isinstance(completion_filter, str)
+            and completion_filter in {"any", "root_only", "explicit_issues"},
+            "wake_config_invalid",
+        )
+        raw_issue_ids = route_row.get("explicit_issue_ids", [])
+        require(
+            isinstance(raw_issue_ids, list)
+            and len(raw_issue_ids) <= 256
+            and all(isinstance(value, str) for value in raw_issue_ids),
+            "wake_config_invalid",
+        )
+        issue_ids = [identifier(value) for value in raw_issue_ids]
+        require(len(issue_ids) == len(set(issue_ids)), "wake_config_invalid")
+        require(
+            (completion_filter == "explicit_issues" and bool(issue_ids))
+            or (completion_filter != "explicit_issues" and not issue_ids),
+            "wake_config_invalid",
+        )
         seen_routes.add(route)
         routes[route_key] = {
             "profile": profile,
             "route": route,
             "test": route_row.get("test", False),
+            "completion_filter": completion_filter,
+            "explicit_issue_ids": tuple(issue_ids),
         }
     require(not wake["enabled"] or bool(routes), "wake_config_invalid")
     wake["routes"] = routes
@@ -313,6 +348,41 @@ def parse_config(raw: Any) -> Config:
     readiness_ipc["peers"] = tuple(normalized_peers)
     require(not readiness_ipc["enabled"] or bool(normalized_peers), "notify_config_invalid")
     require(not readiness_ipc["enabled"] or wake["enabled"], "notify_config_invalid")
+    approval_raw = raw.get("approval_ipc", {})
+    require(
+        isinstance(approval_raw, dict)
+        and not set(approval_raw) - set(APPROVAL_IPC_DEFAULTS),
+        "notify_config_invalid",
+    )
+    approval_ipc = APPROVAL_IPC_DEFAULTS | approval_raw
+    require(
+        type(approval_ipc["enabled"]) is bool
+        and type(approval_ipc["native_delivery_suppressed"]) is bool
+        and approval_ipc["socket_path"] == APPROVAL_SOCKET_PATH,
+        "notify_config_invalid",
+    )
+    approval_peers = approval_ipc["peers"]
+    require(isinstance(approval_peers, list) and len(approval_peers) <= 64, "notify_config_invalid")
+    normalized_approval_peers = []
+    seen_approval_uids = set()
+    for peer in approval_peers:
+        require(
+            isinstance(peer, dict)
+            and set(peer) == {"uid", "profiles"}
+            and type(peer["uid"]) is int
+            and 1 <= peer["uid"] <= 2**31 - 1
+            and peer["uid"] not in seen_approval_uids
+            and isinstance(peer["profiles"], list)
+            and 1 <= len(peer["profiles"]) <= 8
+            and all(isinstance(profile, str) and profile in READINESS_PROFILES for profile in peer["profiles"])
+            and len(set(peer["profiles"])) == len(peer["profiles"]),
+            "notify_config_invalid",
+        )
+        seen_approval_uids.add(peer["uid"])
+        normalized_approval_peers.append({"uid": peer["uid"], "profiles": tuple(peer["profiles"])})
+    approval_ipc["peers"] = tuple(normalized_approval_peers)
+    require(not approval_ipc["enabled"] or bool(normalized_approval_peers), "notify_config_invalid")
+    require(not approval_ipc["enabled"] or wake["enabled"], "notify_config_invalid")
     require(
         type(policy["lookback_minutes"]) is int
         and 0 <= policy["lookback_minutes"] <= 1440
@@ -339,7 +409,7 @@ def parse_config(raw: Any) -> Config:
             require(
                 isinstance(row, dict)
                 and not set(row)
-                - {"origin", "workspace_id", "cli_profile", "pat_credential", "enabled"}
+                - {"origin", "workspace_id", "cli_profile", "pat_credential", "enabled", "connection_id"}
             )
             require(
                 {"origin", "workspace_id", "cli_profile", "pat_credential"} <= set(row)
@@ -369,6 +439,8 @@ def parse_config(raw: Any) -> Config:
                 + (":" + str(parsed.port) if parsed.port not in (None, 443) else "")
             )
             identifier(row["workspace_id"])
+            if "connection_id" in row:
+                identifier(row["connection_id"])
             name(row["cli_profile"])
             name(row["pat_credential"])
             require(type(row.get("enabled", True)) is bool)
@@ -386,7 +458,7 @@ def parse_config(raw: Any) -> Config:
         require(pair not in pairs)
         pairs.add(pair)
         valid_workspaces[key] = dict(row, origin=origin)
-    return Config(service, policy, accounts, valid_workspaces, errors, wake, readiness_ipc)
+    return Config(service, policy, accounts, valid_workspaces, errors, wake, readiness_ipc, approval_ipc)
 
 
 def load_config(path: Path) -> Config:

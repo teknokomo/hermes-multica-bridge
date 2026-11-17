@@ -9,6 +9,12 @@
     "kanban_mirror": false,
     "cli_binary": "/usr/local/bin/multica",
     "cli_timeout_seconds": 30,
+    "model_policy": {
+      "enabled": false,
+      "allow_explicit_model": false,
+      "capability_source": "none",
+      "rules": []
+    },
     "connectors": {
       "telegram-default": {
         "profile": "default",
@@ -35,6 +41,10 @@
         "model_by_runtime": {
           "runtime-a": "model-a",
           "runtime-b": "model-b"
+        },
+        "allowed_models_by_runtime": {
+          "runtime-a": ["model-a"],
+          "runtime-b": ["model-b"]
         },
         "allowed_runtime_ids": ["runtime-a", "runtime-b"],
         "allowed_principal_ids": ["00000000-0000-4000-8000-000000000030"]

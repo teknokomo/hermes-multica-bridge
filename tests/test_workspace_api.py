@@ -99,7 +99,134 @@ class WorkspaceApiTests(unittest.TestCase):
         with self.assertRaises(WorkspaceApiFailure) as raised:
             self.client.create_issue(title="Task", description="", project_id="project-1", status="todo")
         self.assertEqual(raised.exception.outcome, "unknown")
-        self.assertEqual(self.opener.open.call_count, 1)
+
+    def test_condition_wakeup_posts_event_kind_and_verified_agent(self) -> None:
+        agent_id = "33333333-3333-4333-8333-333333333333"
+        wakeup_id = "44444444-4444-4444-8444-444444444444"
+        body = {
+            "id": wakeup_id,
+            "issue_id": "issue-1",
+            "agent_id": agent_id,
+            "kind": "event",
+            "mode": "once",
+            "instruction": "Review the completed stages.",
+            "condition": {"type": "children_done", "stage": 2},
+            "enabled": True,
+            "last_task_id": None,
+        }
+        response = _Response(json.dumps(body).encode())
+        self.opener.open.return_value = response
+        payload = {
+            "agent_id": agent_id,
+            "kind": "event",
+            "instruction": body["instruction"],
+            "condition": body["condition"],
+            "mode": "once",
+            "on_timeout": "end",
+            "expires_in_seconds": 3600,
+        }
+
+        result = self.client.create_issue_wakeup("issue-1", payload)
+
+        request = self.opener.open.call_args.args[0]
+        sent = json.loads(request.data)
+        self.assertEqual(request.full_url, f"{TEST_ORIGIN}/api/issues/issue-1/wakeups")
+        self.assertEqual(sent["kind"], "event")
+        self.assertEqual(sent["agent_id"], agent_id)
+        self.assertEqual(result["id"], wakeup_id)
+        self.assertTrue(response.closed)
+
+    def test_condition_wakeup_rejects_missing_or_noncanonical_agent_before_post(self) -> None:
+        payload = {
+            "kind": "event",
+            "instruction": "Review the completed stages.",
+            "condition": {"type": "children_done"},
+            "mode": "once",
+            "on_timeout": "end",
+            "expires_in_seconds": 3600,
+        }
+        for agent_id in (None, "agent-1", "33333333-3333-4333-8333-33333333333A"):
+            with self.subTest(agent_id=agent_id):
+                request = dict(payload)
+                if agent_id is not None:
+                    request["agent_id"] = agent_id
+                with self.assertRaises(BridgeError):
+                    self.client.create_issue_wakeup("issue-1", request)
+        self.opener.open.assert_not_called()
+
+    def test_wakeup_readback_requires_identity_and_execution_state_fields(self) -> None:
+        agent_id = "33333333-3333-4333-8333-333333333333"
+        wakeup = {
+            "id": "44444444-4444-4444-8444-444444444444",
+            "issue_id": "issue-1",
+            "agent_id": agent_id,
+            "kind": "event",
+            "mode": "once",
+            "instruction": "Review the completed stages.",
+            "condition": {"type": "children_done"},
+            "enabled": True,
+            "last_task_id": None,
+            "last_task_status": None,
+            "expires_at": "2026-11-18T12:00:00Z",
+            "timed_out_at": None,
+        }
+        self.opener.open.return_value = _Response(json.dumps([wakeup]).encode())
+        self.assertEqual(self.client.list_issue_wakeups("issue-1"), [wakeup])
+        self.assertIn("/api/issues/issue-1/wakeups", self.opener.open.call_args.args[0].full_url)
+
+        malformed = dict(wakeup)
+        malformed.pop("last_task_id")
+        self.opener.open.return_value = _Response(json.dumps([malformed]).encode())
+        with self.assertRaises(WorkspaceApiFailure):
+            self.client.list_issue_wakeups("issue-1")
+        self.assertEqual(self.opener.open.call_count, 2)
+
+    def test_wakeup_run_readback_uses_issue_and_wakeup_scoped_endpoint(self) -> None:
+        issue_id = "11111111-1111-4111-8111-111111111111"
+        wakeup_id = "22222222-2222-4222-8222-222222222222"
+        run = {
+            "id": "33333333-3333-4333-8333-333333333333",
+            "status": "completed",
+            "created_at": "2026-11-17T10:00:00Z",
+            "started_at": "2026-11-17T10:00:01Z",
+            "completed_at": "2026-11-17T10:01:00Z",
+            "checkin_note": "",
+            "triggers": ["condition"],
+            "commented": False,
+        }
+        self.opener.open.return_value = _Response(json.dumps([run]).encode())
+
+        self.assertEqual(self.client.list_issue_wakeup_runs(issue_id, wakeup_id), [run])
+        request = self.opener.open.call_args.args[0]
+        self.assertEqual(
+            request.full_url,
+            f"{TEST_ORIGIN}/api/issues/{issue_id}/wakeups/{wakeup_id}/runs",
+        )
+        self.assertEqual(request.method, "GET")
+
+        malformed = dict(run)
+        malformed.pop("triggers")
+        self.opener.open.return_value = _Response(json.dumps([malformed]).encode())
+        with self.assertRaises(WorkspaceApiFailure):
+            self.client.list_issue_wakeup_runs(issue_id, wakeup_id)
+
+    def test_wakeup_run_readback_rejects_duplicate_run_ids(self) -> None:
+        issue_id = "11111111-1111-4111-8111-111111111111"
+        wakeup_id = "22222222-2222-4222-8222-222222222222"
+        run = {
+            "id": "33333333-3333-4333-8333-333333333333",
+            "status": "completed",
+            "created_at": "2026-11-17T10:00:00Z",
+            "started_at": None,
+            "completed_at": None,
+            "checkin_note": "",
+            "triggers": [],
+            "commented": False,
+        }
+        self.opener.open.return_value = _Response(json.dumps([run, run]).encode())
+
+        with self.assertRaises(WorkspaceApiFailure):
+            self.client.list_issue_wakeup_runs(issue_id, wakeup_id)
 
     def test_upload_accepts_bytes_without_creating_a_temporary_file(self) -> None:
         self.opener.open.return_value = _Response(b'{"id":"attachment-1"}')

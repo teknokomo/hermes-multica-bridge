@@ -23,7 +23,7 @@ Made with the support of the [73rd Meridian Consortium](https://om73.ru).
 
 `hermes-multica-bridge` is a Hermes plugin for Autopilot and Workspace: it sends the current pinned Kanban task, creates and manages Workspace issues from trusted MAX or Telegram messages, and lets users create routes bounded by operator grants.
 
-Version 0.7.0 retains the two security modes and adds Runtime Router, disabled by default:
+Version 0.7.0 retains the two security modes and adds Runtime Router and opt-in conditional approval wake:
 
 - **Standard** — the plugin sends HTTPS requests itself. Non-secret topology is stored in the profile's `ConnectionRegistry`; each Route's webhook/HMAC/PAT credentials are managed through the public Hermes plugin credential API and read at runtime only through `agent.secret_scope`.
 - **Isolated** — the plugin never receives Multica secrets. Each new Route uses a separate socket-activated systemd sender instance with root-owned configuration and systemd credentials.
@@ -38,7 +38,7 @@ The Bridge is disabled by default: `enabled=false`. The model cannot spoof the m
   - `multica_check_task_result` — reads results only for a previously stored delivery and accepts only an optional `route_id`;
 - Workspace routes with `multica_workspace_send`, `multica_workspace_get`, `multica_workspace_comment`, and `multica_workspace_update`;
 - automatic issue creation in configured Workspaces/projects and attachment of available files from the current Hermes message;
-- a restricted legacy watcher for source chats and completion wake through the central notify service for new routes;
+- a restricted legacy watcher for source chats; completion wake supports MAX direct messages, issue filters, and opt-in notify-only approval handoff;
 - HMAC-SHA256 in the `X-Hub-Signature-256` header, computed over the exact bytes sent;
 - a stable `Idempotency-Key` for each logical card version;
 - bounded retries and a local SQLite ledger;
@@ -347,6 +347,9 @@ Regular notify messages are suppressed for every registered wake subscription. T
 
 Timeouts, lost responses, and expired sends become `delivery_unknown` with no automatic retry. A confirmed `duplicate` counts as admitted; `ignored` is an error. Manual replay keeps the wake ID and can duplicate a response if Hermes already handled the request.
 
+MAX direct-message wake is supported only when the exact destination is a MAX `user_id` with an empty thread; it never falls back to a group or parent chat. Telegram direct messages remain unsupported.
+The completion filter is `any` by default. `root_only` suppresses child issues before a wake job is created and fails closed when `parent_issue_id` is missing; `explicit_issues` accepts only IDs in protected notify configuration.
+
 Before enable, the CLI and doctor compare profile, event, HMAC presence, target, thread, absence of route scripts/skills/coalescing, and safe toolset against the protected operator export `webhook-policy.json`. Notify does not read Hermes home; the export contains private chat/thread IDs but no secrets and must be readable only by the administrator and service.
 
 ```bash
@@ -380,6 +383,15 @@ Dynamic routes live in a separate profile database with private permissions, tra
 
 The product version is 0.7.0. The new queue leaves ordinary 0.6.0 routes unchanged and has its own migratable SQLite schema. Router is disabled by default; route enablement, CLI profiles, target integration, server installation, and publication remain separate stages.
 
+## Conditional completion and approval 0.7.0
+
+`condition_wake` is opt-in and supports only `children_done`. A new parent issue stores a local intent first; `multica_workspace_update` later validates the full child plan before registering one native wakeup.
+The stage fields are optional only as a pair: staged plans require positive `stage` and `expected_stage_count`; the latter counts distinct child stage groups, while `stage` is their maximum ordinal (for example, groups 1 and 3 use count 2 and maximum 3). Unstaged plans omit both, and partial or mixed plans are rejected.
+The group count and maximum ordinal are each capped at 500, with `expected_stage_count <= stage`; child ordinals must be positive and no greater than `stage`, and the tree must contain exactly the declared number of distinct groups. Gaps between ordinals are allowed.
+Native wake, run, and comments are internal triggers only. Notify uses a separate read-only adapter to correlate the parent, wakeup, run, and saved children; every expected child must be exactly `done`.
+Only notify sends `task.ready_for_approval` to the configured completion destination. It does not close the parent or approve the human review. A closed, cancelled, failed, unknown, or missing child never means success.
+The native Hermes message must be demonstrably suppressed on the exact target build before enabling the feature. Both defaults remain disabled here; target delivery suppression is NOT VERIFIED, and no native-delivery fallback is provided.
+
 ## Runtime Router 0.7.0
 
 Runtime Router binds trusted Telegram/MAX identities to runtime bindings and uses one canonical Multica agent per role. A separate CLI worker takes tasks from the queue and serves each `(instance_id, agent_id)` sequentially.
@@ -388,6 +400,8 @@ Runtime Router binds trusted Telegram/MAX identities to runtime bindings and use
 
 - `strict` mode uses only the default binding; `exceptions` allows rules with explicit priority and fails closed on ties.
 - Runtime switches only after the canonical agent has no active or queued runs; readback confirms the runtime and model. The 0.8.2 CLI does not return a runtime model catalog, so an explicit `model_by_runtime` is checked against agent readback; execution still requires a target canary.
+- When `model_policy.enabled`, selection uses an allowed explicit model, one highest-priority matching rule, `model_by_runtime`, then the agent/runtime default (`model=""`); when disabled, the prior mapping/default behavior remains. Equal-priority matches fail closed.
+- `allowed_models_by_runtime` is a separate operator allowlist applied when model policy is enabled; it is never inferred from policy rules. `capability_source=none` is the default; without a verified catalog fallback models are rejected, and unknown capability is not treated as unsupported.
 - An uncertain issue-create result is never blindly retried. The request is reconciled by its stable marker.
 - Ordinary 0.6.0 routes and `multica_workspace_send` are unchanged; a router-enabled route accepts tasks only through the queue.
 

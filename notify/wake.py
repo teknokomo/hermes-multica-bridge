@@ -82,12 +82,19 @@ def load_webhook_policy(path: Path) -> dict[tuple[str, str], dict]:
             and isinstance(row["deliver"], str)
             and row["deliver"] in {"telegram", "max"}
             and isinstance(row["deliver_extra"], dict)
-            and set(row["deliver_extra"]) == {"chat_id", "thread_id"}
-            and all(
-                isinstance(row["deliver_extra"][key], str)
-                and 0 < len(row["deliver_extra"][key]) <= 128
-                for key in ("chat_id",)
+            and (
+                set(row["deliver_extra"]) == {"chat_id", "thread_id"}
+                or set(row["deliver_extra"]) == {"user_id", "thread_id"}
             )
+            and (
+                "chat_id" in row["deliver_extra"]
+                or (row["deliver"] == "max" and "user_id" in row["deliver_extra"])
+            )
+            and isinstance(
+                row["deliver_extra"].get("chat_id", row["deliver_extra"].get("user_id")),
+                str,
+            )
+            and 0 < len(row["deliver_extra"].get("chat_id", row["deliver_extra"].get("user_id"))) <= 128
             and isinstance(row["deliver_extra"]["thread_id"], str)
             and len(row["deliver_extra"]["thread_id"]) <= 128
             and row["deliver_only"] is False
@@ -139,8 +146,17 @@ def verify_webhook_policy(
             raise NotifyError("wake_route_profile_mismatch")
         raise NotifyError("wake_route_unavailable")
     extra = row["deliver_extra"]
-    matches = (
-        row["deliver"] == source.get("platform")
+    chat_type = source.get("chat_type")
+    destination_matches = (
+        row["deliver"] == "max"
+        and source.get("platform") == "max"
+        and chat_type == "dm"
+        and "user_id" in extra
+        and extra.get("user_id") == source.get("chat_id")
+        and source.get("thread_id") == ""
+        and extra.get("thread_id") == ""
+    ) if chat_type == "dm" else (
+        "chat_id" in extra
         and extra.get("chat_id") == source.get("chat_id")
         and extra.get("thread_id") == source.get("thread_id")
         and (
@@ -150,9 +166,12 @@ def verify_webhook_policy(
             or source.get("platform") == "max"
             and source.get("chat_type") == "group"
             and source.get("thread_id") == ""
+            or source.get("platform") == "max"
+            and source.get("chat_type") == "dm"
+            and source.get("thread_id") == ""
         )
     )
-    require(matches, "wake_route_policy_mismatch")
+    require(row["deliver"] == source.get("platform") and destination_matches, "wake_route_policy_mismatch")
 
 
 def encode(value: object) -> bytes:
@@ -208,6 +227,19 @@ def build_payload(
         ),
         "wake_snapshot_insufficient",
     )
+    parent_issue_id = issue.get("parent_issue_id")
+    require(
+        "parent_issue_id" in issue
+        and (
+            parent_issue_id is None
+            or (
+                isinstance(parent_issue_id, str)
+                and bool(parent_issue_id)
+                and len(parent_issue_id) <= 128
+            )
+        ),
+        "notify_event_invalid",
+    )
     require(
         isinstance(issue_url, str)
         and issue_url.startswith("https://")
@@ -222,7 +254,8 @@ def build_payload(
         subscription.get("platform") in {"telegram", "max"}
         and isinstance(subscription.get("chat_id"), str)
         and isinstance(subscription.get("thread_id"), str)
-        and subscription.get("chat_type") in {"group", "thread"},
+        and subscription.get("chat_type") in {"dm", "group", "thread"}
+        and not (subscription.get("chat_type") == "dm" and subscription.get("platform") != "max"),
         "wake_snapshot_insufficient",
     )
 
@@ -271,13 +304,19 @@ def build_payload(
         "wake_id": wake_id,
         "issue_id": issue["id"],
         "issue_key": issue["identifier"],
+        "parent_issue_id": parent_issue_id,
+        "is_root": parent_issue_id is None,
         "workspace_id": workspace_id,
         "project_id": issue["project_id"],
         "transition_seq": transition_seq,
         "profile": profile,
         "origin": {
             "platform": subscription["platform"],
-            "chat_id": subscription["chat_id"],
+            **(
+                {"user_id": subscription["chat_id"]}
+                if subscription["chat_type"] == "dm"
+                else {"chat_id": subscription["chat_id"]}
+            ),
             "thread_id": subscription["thread_id"],
             "chat_type": subscription["chat_type"],
         },

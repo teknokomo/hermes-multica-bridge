@@ -270,3 +270,13 @@ Repository Skill задаёт предпочтительный путь чере
 Целевой `/usr/local/bin/multica` 0.8.2 подтверждён только по version/help и синтаксису используемых команд. Фактические JSON response shapes, service-owned profile и canary workflow не проверялись; прежде чем включать feature flag, требуется отдельная target integration приёмка по матрице в `deploy/runtime-router-0.7.0.md`.
 
 Статический credential anchor может иметь enabled=false и служить только хранилищем PAT; tombstone запрещён. При approval проекты повторно проверяются read-only API Multica до активации маршрута.
+
+## Условное пробуждение и approval-ready 0.7.0
+
+`condition_wake` по умолчанию выключен. Создание родителя фиксирует intent без вызова Multica wakeup; последующий update проверяет принадлежность и полный набор дочерних задач до единственной регистрации. Повторы сверяются read-only и не создают второй parent или wakeup.
+
+Только статус `done` каждого сохранённого ребёнка подтверждает завершение. `closed`, `cancelled`, `failed`, неизвестный статус или неполный список закрывают передачу fail closed. Native wake/run/comment — внутренние триггеры; пользовательское approval-ready сообщение разрешено только через notify после корреляции `parent → wakeup → run`.
+
+Mapping проходит через отдельный `/run/hermes-multica-notify-approval/approval.sock`: фиксированная операция, `SO_PEERCRED`, UID/profile allowlist, ограниченный кадр и отдельный service runtime directory. Этот socket не открывает notify DB или credentials plugin-процессу; readiness IPC остаётся отдельным read-only интерфейсом.
+
+Подавление native-доставки должно быть подтверждено на точной целевой Hermes сборке до включения обоих feature flags. В этой реализации target suppression не проверено; настройки остаются fail closed, и сообщения через native delivery не используются как fallback.

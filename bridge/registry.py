@@ -74,6 +74,7 @@ ROUTE_FIELDS = frozenset(
         "source_platforms",
         "allowed_user_ids",
         "allowed_chat_ids",
+        "allowed_chat_types",
         "allow_groups",
         "allowed_statuses",
         "require_source_attachment",
@@ -106,7 +107,7 @@ ASSIGNEE_TYPES = frozenset({"member", "agent", "squad"})
 ROUTE_GRANT_FIELDS = frozenset({
     "grant_id", "profile", "connection_id", "workspace_key", "workspace_id", "instance_id",
     "allowed_project_ids", "allowed_squad_ids", "allow_all_projects",
-    "allowed_source_platforms", "allowed_chat_ids", "allowed_thread_ids",
+    "allowed_source_platforms", "allowed_chat_ids", "allowed_thread_ids", "allowed_chat_types",
     "allowed_user_ids", "allowed_assignees", "credential_route_id", "max_routes",
     "auto_approve", "expires_at", "enabled",
 })
@@ -239,6 +240,7 @@ class RegistryRoute:
     default_project_id: str = ""
     squad_id: str = ""
     allowed_thread_ids: tuple[str, ...] = ()
+    allowed_chat_types: tuple[str, ...] = ()
     wake_mode: str = "legacy_watcher"
     credential_route_id: str = ""
     dynamic_status: str = ""
@@ -274,6 +276,7 @@ class RouteGrant:
     allowed_source_platforms: tuple[str, ...]
     allowed_chat_ids: tuple[str, ...]
     allowed_thread_ids: tuple[str, ...]
+    allowed_chat_types: tuple[str, ...]
     allowed_user_ids: tuple[str, ...]
     allowed_assignees: tuple[WorkspaceAssignee, ...]
     credential_route_id: str
@@ -440,6 +443,9 @@ class ConnectionRegistry:
                 continue
             if user_id not in route.allowed_user_ids or chat_id not in route.allowed_chat_ids:
                 continue
+            normalized_chat_type = "group" if chat_type == "channel" else chat_type
+            if normalized_chat_type not in route.allowed_chat_types:
+                continue
             if is_group and not route.allow_groups:
                 continue
             thread_id = context.get("thread_id") or ""
@@ -481,6 +487,7 @@ def route_policy_fingerprint(registry: ConnectionRegistry, route: RegistryRoute)
             default_project_id=route.default_project_id,
             squad_id=route.squad_id,
             allowed_thread_ids=list(route.allowed_thread_ids),
+            allowed_chat_types=list(route.allowed_chat_types),
             wake_mode=route.wake_mode,
             credential_route_id=route.credential_route_id,
             dynamic_status=route.dynamic_status,
@@ -679,6 +686,12 @@ def _parse_route(row: Any) -> RegistryRoute:
     allowed_thread_ids = _string_list(
         row.get("allowed_thread_ids"), "route.allowed_thread_ids", IDENTIFIER_RE, maximum=256
     )
+    allowed_chat_types = _parse_chat_types(
+        row.get("allowed_chat_types"),
+        allowed_thread_ids,
+        "route.allowed_chat_types",
+        default=("dm", "group", "thread") if row.get("allow_groups", False) else ("dm",),
+    )
     wake_mode = row.get("wake_mode", "legacy_watcher")
     dynamic_status = row.get("dynamic_status", "")
     grant_id = row.get("grant_id", "")
@@ -871,6 +884,7 @@ def _parse_route(row: Any) -> RegistryRoute:
         default_project_id=default_project_id,
         squad_id=squad_id,
         allowed_thread_ids=allowed_thread_ids,
+        allowed_chat_types=allowed_chat_types,
         wake_mode=wake_mode,
         credential_route_id=credential_route_id,
         dynamic_status=dynamic_status,
@@ -896,6 +910,26 @@ def _parse_workspace_assignee(value: Any, field: str) -> WorkspaceAssignee:
     if not isinstance(label, str) or len(label) > 128:
         raise _fail(f"{field}.label must be a string of at most 128 characters.")
     return WorkspaceAssignee(assignee_id, assignee_type, label.strip())
+
+
+def _parse_chat_types(
+    value: Any,
+    thread_ids: tuple[str, ...],
+    field: str,
+    *,
+    default: tuple[str, ...] = ("dm", "group", "thread"),
+) -> tuple[str, ...]:
+    # Legacy routes retain their prior source visibility. For grants an empty
+    # thread allowlist means any topic; dynamic routes still pin their creating
+    # thread when they are materialized.
+    if value is None:
+        return default
+    parsed = _string_list(
+        value, field, re.compile(r"\A(?:group|thread|dm)\Z"), maximum=3
+    )
+    if not parsed:
+        raise _fail(f"{field} must be non-empty.")
+    return parsed
 
 
 def _parse_grant(row: Any) -> OperatorGrant:
@@ -941,6 +975,14 @@ def _parse_route_grant(row: Any) -> RouteGrant:
     )
     if len({(item.id, item.type) for item in assignees}) != len(assignees):
         raise _fail("route_grant.allowed_assignees contains duplicate identities.")
+    allowed_thread_ids = _string_list(row.get("allowed_thread_ids"), "route_grant.allowed_thread_ids", IDENTIFIER_RE, maximum=256)
+    allowed_chat_types = _parse_chat_types(
+        row.get("allowed_chat_types"),
+        allowed_thread_ids,
+        "route_grant.allowed_chat_types",
+        default=("dm", "group", "thread"),
+    )
+    allowed_source_platforms = _string_list(row.get("allowed_source_platforms"), "route_grant.allowed_source_platforms", PLATFORM_RE, maximum=2)
     return RouteGrant(
         grant_id=_uuid7(row.get("grant_id"), "route_grant.grant_id"),
         profile=profile,
@@ -951,9 +993,10 @@ def _parse_route_grant(row: Any) -> RouteGrant:
         allowed_project_ids=_string_list(row.get("allowed_project_ids"), "route_grant.allowed_project_ids", IDENTIFIER_RE, maximum=256),
         allowed_squad_ids=_string_list(row.get("allowed_squad_ids"), "route_grant.allowed_squad_ids", UUID_RE, maximum=128),
         allow_all_projects=row.get("allow_all_projects", False),
-        allowed_source_platforms=_string_list(row.get("allowed_source_platforms"), "route_grant.allowed_source_platforms", PLATFORM_RE, maximum=2),
+        allowed_source_platforms=allowed_source_platforms,
         allowed_chat_ids=_string_list(row.get("allowed_chat_ids"), "route_grant.allowed_chat_ids", CHAT_ID_RE, maximum=256),
-        allowed_thread_ids=_string_list(row.get("allowed_thread_ids"), "route_grant.allowed_thread_ids", IDENTIFIER_RE, maximum=256),
+        allowed_thread_ids=allowed_thread_ids,
+        allowed_chat_types=allowed_chat_types,
         allowed_user_ids=_string_list(row.get("allowed_user_ids"), "route_grant.allowed_user_ids", IDENTIFIER_RE, maximum=256),
         allowed_assignees=assignees,
         credential_route_id=_uuid7(row.get("credential_route_id"), "route_grant.credential_route_id"),
@@ -1055,6 +1098,7 @@ def registry_from_mapping(value: Any) -> ConnectionRegistry:
             if (not set(route.source_platforms) <= set(grant.allowed_source_platforms)
                     or not set(route.allowed_user_ids) <= set(grant.allowed_user_ids)
                     or not set(route.allowed_chat_ids) <= set(grant.allowed_chat_ids)
+                    or not set(route.allowed_chat_types) <= set(grant.allowed_chat_types)
                     or grant.allowed_thread_ids and (
                         not route.allowed_thread_ids
                         or not set(route.allowed_thread_ids) <= set(grant.allowed_thread_ids)

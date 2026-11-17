@@ -2,3 +2,4 @@
 
 READINESS_PROFILES = frozenset({"default", "om73"})
 READINESS_SOCKET_PATH = "/run/hermes-multica-notify-readiness/readiness.sock"
+APPROVAL_SOCKET_PATH = "/run/hermes-multica-notify-approval/approval.sock"

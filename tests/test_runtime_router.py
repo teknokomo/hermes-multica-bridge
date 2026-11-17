@@ -18,7 +18,13 @@ from unittest.mock import Mock, patch
 from bridge.registry import new_id, registry_from_mapping, route_policy_fingerprint
 from runtime_router.adapter import MulticaCliAdapter, MulticaCliError
 from runtime_router.cli import _check_runtime, _dispatch, _doctor, _parser
-from runtime_router.config import RouterConfig, RouterConfigError, service_cli_home
+from runtime_router.config import (
+    ModelPolicy,
+    ModelRule,
+    RouterConfig,
+    RouterConfigError,
+    service_cli_home,
+)
 from runtime_router.policy import (
     ResolutionError,
     resolve_runtime,
@@ -80,6 +86,7 @@ def source_context(profile: str = "default") -> dict[str, str]:
         "user_id": "user-1",
         "chat_id": "chat-1",
         "thread_id": "thread-1",
+        "chat_type": "thread",
         "message_id": "message-1",
     }
 
@@ -97,7 +104,9 @@ def workspace_router_registry() -> dict:
             "default_project_id": "project-1",
             "allowed_user_ids": ["user-1"],
             "allowed_chat_ids": ["chat-1"],
+            "allowed_chat_types": ["thread"],
             "allowed_thread_ids": ["thread-1"],
+            "allow_groups": True,
             "source_platforms": ["telegram"],
             "runtime_router": {"enabled": True, "agent_ref": "canonical"},
             "allowed_assignees": [{"id": AGENT, "type": "agent", "label": "Canonical"}],
@@ -674,10 +683,182 @@ class RuntimeRouterTests(unittest.TestCase):
         )
         self.assertEqual(without_model_catalog.model, MODEL_A)
 
+    def test_model_policy_priority_selectors_and_equal_priority_conflict(self):
+        common = {
+            "identity": {"principal_id": PRINCIPAL, "status": "active"},
+            "binding": {
+                "principal_id": PRINCIPAL,
+                "instance_id": INSTANCE,
+                "default_runtime_id": RUNTIME_A,
+                "mode": "strict",
+            },
+            "exceptions": [],
+            "context": {"platform": "max", "task_class": "review"},
+            "allowed_runtime_ids": {RUNTIME_A},
+            "runtime_catalog": {
+                RUNTIME_A: {"status": "online", "accessible": True}
+            },
+            "model_by_runtime": {RUNTIME_A: MODEL_A},
+            "allowed_models_by_runtime": {RUNTIME_A: (MODEL_A, MODEL_B)},
+        }
+        policy = ModelPolicy(
+            enabled=True,
+            rules=(
+                ModelRule("low", 10, {"platform": ("max",)}, MODEL_A, (), ()),
+                ModelRule("high", 20, {"task_class": ("review",)}, MODEL_B, (), ()),
+            ),
+        )
+        result = resolve_runtime(**common, model_policy=policy)
+        self.assertEqual(result.model, MODEL_B)
+        self.assertEqual(result.model_rule_id, "high")
+        self.assertEqual(result.model_source, "policy")
+
+        conflict = ModelPolicy(
+            enabled=True,
+            rules=(
+                ModelRule("one", 20, {"platform": ("max",)}, MODEL_A, (), ()),
+                ModelRule("two", 20, {"task_class": ("review",)}, MODEL_B, (), ()),
+            ),
+        )
+        with self.assertRaisesRegex(ResolutionError, "model_policy_conflict"):
+            resolve_runtime(**common, model_policy=conflict)
+
+    def test_model_policy_explicit_allowlist_and_missing_selector_context(self):
+        base = {
+            "identity": {"principal_id": PRINCIPAL, "status": "active"},
+            "binding": {
+                "principal_id": PRINCIPAL,
+                "instance_id": INSTANCE,
+                "default_runtime_id": RUNTIME_A,
+                "mode": "strict",
+            },
+            "exceptions": [],
+            "context": {},
+            "allowed_runtime_ids": {RUNTIME_A},
+            "runtime_catalog": {
+                RUNTIME_A: {"status": "online", "accessible": True}
+            },
+            "model_by_runtime": {},
+            "allowed_models_by_runtime": {RUNTIME_A: (MODEL_A,)},
+        }
+        selector_policy = ModelPolicy(
+            enabled=True,
+            rules=(
+                ModelRule("thread-rule", 10, {"thread_id": ("thread-1",)}, MODEL_A, (), ()),
+            ),
+        )
+        result = resolve_runtime(**base, model_policy=selector_policy)
+        self.assertIsNone(result.model)
+        self.assertEqual(result.model_reason, "empty_agent_model_default")
+        explicit_policy = ModelPolicy(enabled=True, allow_explicit_model=True)
+        allowed = resolve_runtime(
+            **base, model_policy=explicit_policy, explicit_model=MODEL_A
+        )
+        self.assertEqual(allowed.model, MODEL_A)
+        with self.assertRaisesRegex(ResolutionError, "model_not_allowed"):
+            resolve_runtime(
+                **base, model_policy=explicit_policy, explicit_model=MODEL_B
+            )
+        with self.assertRaisesRegex(ResolutionError, "model_not_allowed"):
+            resolve_runtime(
+                **base, model_policy=ModelPolicy(enabled=True), explicit_model=MODEL_A
+            )
+
+    def test_model_policy_operator_catalog_staleness_and_verified_fallback(self):
+        now = datetime(2026, 11, 16, tzinfo=UTC)
+        base = {
+            "identity": {"principal_id": PRINCIPAL, "status": "active"},
+            "binding": {
+                "principal_id": PRINCIPAL,
+                "instance_id": INSTANCE,
+                "default_runtime_id": RUNTIME_A,
+                "mode": "strict",
+            },
+            "exceptions": [],
+            "context": {"task_class": "build"},
+            "allowed_runtime_ids": {RUNTIME_A},
+            "runtime_catalog": {RUNTIME_A: {"status": "online", "accessible": True}},
+            "model_by_runtime": {},
+            "allowed_models_by_runtime": {RUNTIME_A: (MODEL_A, MODEL_B)},
+            "now": now,
+        }
+        stale = ModelPolicy(
+            enabled=True,
+            allow_explicit_model=True,
+            capability_source="operator_catalog",
+            catalog_checked_at=datetime(2026, 11, 15, tzinfo=UTC),
+            catalog_ttl_seconds=3600,
+            catalog_entries={(RUNTIME_A, MODEL_A): "supported"},
+        )
+        with self.assertRaisesRegex(ResolutionError, "model_catalog_stale"):
+            resolve_runtime(**base, model_policy=stale, explicit_model=MODEL_A)
+
+        verified = ModelPolicy(
+            enabled=True,
+            capability_source="operator_catalog",
+            rules=(
+                ModelRule("build", 1, {"task_class": ("build",)}, MODEL_A, (), (MODEL_B,)),
+            ),
+            catalog_checked_at=now,
+            catalog_ttl_seconds=3600,
+            catalog_entries={
+                (RUNTIME_A, MODEL_A): "unsupported",
+                (RUNTIME_A, MODEL_B): "supported",
+            },
+        )
+        result = resolve_runtime(**base, model_policy=verified)
+        self.assertEqual(result.model, MODEL_B)
+        self.assertEqual(result.model_source, "policy")
+        unknown = replace(
+            verified,
+            catalog_entries={(RUNTIME_A, MODEL_B): "supported"},
+        )
+        with self.assertRaisesRegex(ResolutionError, "model_capability_unknown"):
+            resolve_runtime(**base, model_policy=unknown)
+
+    def test_model_config_allowlist_is_independent_and_fallback_requires_capability(self):
+        raw = json.loads(json.dumps(self.raw_config))
+        raw["agents"]["canonical"]["allowed_models_by_runtime"] = {
+            RUNTIME_A: [MODEL_A, MODEL_B]
+        }
+        raw["model_policy"] = {
+            "enabled": True,
+            "rules": [
+                {
+                    "id": "rule-a",
+                    "priority": 1,
+                    "match": {"task_classes": ["review"]},
+                    "model": MODEL_A,
+                }
+            ],
+        }
+        parsed = RouterConfig.parse(raw)
+        self.assertEqual(
+            parsed.agents[0].allowed_models_by_runtime[RUNTIME_A], (MODEL_A, MODEL_B)
+        )
+        raw["model_policy"]["rules"][0]["fallback_models"] = [MODEL_B]
+        with self.assertRaisesRegex(RouterConfigError, "model_fallback_unverified"):
+            RouterConfig.parse(raw)
+        raw["model_policy"]["capability_source"] = "operator_catalog"
+        raw["model_policy"]["catalog"] = {
+            "catalog_version": "canary-1",
+            "checked_at": "2026-11-16T00:00:00Z",
+            "ttl_seconds": 3600,
+            "entries": [
+                {"runtime_id": RUNTIME_A, "model": MODEL_A, "status": "supported"},
+                {"runtime_id": RUNTIME_A, "model": MODEL_B, "status": "unsupported"},
+            ],
+        }
+        parsed_catalog = RouterConfig.parse(raw)
+        self.assertEqual(
+            parsed_catalog.model_policy.catalog_entries[(RUNTIME_A, MODEL_A)],
+            "supported",
+        )
+
     def test_fresh_schema_integrity_and_private_modes(self):
         store = RouterStore(self.db_path)
         result = store.check()
-        self.assertEqual(result["schema"], 4)
+        self.assertEqual(result["schema"], 5)
         self.assertEqual(result["journal_mode"].lower(), "wal")
         self.assertEqual(self.db_path.stat().st_mode & 0o777, 0o600)
 
@@ -686,21 +867,27 @@ class RuntimeRouterTests(unittest.TestCase):
         with sqlite3.connect(self.db_path) as db:
             db.execute("ALTER TABLE router_requests DROP COLUMN cancel_source_state")
             db.execute("ALTER TABLE router_requests DROP COLUMN reconcile_source_state")
+            db.execute("ALTER TABLE router_requests DROP COLUMN target_model_rule_id")
+            db.execute("ALTER TABLE router_requests DROP COLUMN target_model_source")
+            db.execute("ALTER TABLE router_requests DROP COLUMN target_model_reason")
             db.execute("DROP TABLE router_worker_state")
             db.execute("PRAGMA user_version=1")
         migrated = RouterStore(self.db_path)
-        self.assertEqual(migrated.check()["schema"], 4)
-        self.assertEqual(RouterStore(self.db_path).check()["schema"], 4)
+        self.assertEqual(migrated.check()["schema"], 5)
+        self.assertEqual(RouterStore(self.db_path).check()["schema"], 5)
 
     def test_additive_v2_migration_is_idempotent(self):
         RouterStore(self.db_path)
         with sqlite3.connect(self.db_path) as db:
             db.execute("ALTER TABLE router_requests DROP COLUMN cancel_source_state")
             db.execute("ALTER TABLE router_requests DROP COLUMN reconcile_source_state")
+            db.execute("ALTER TABLE router_requests DROP COLUMN target_model_rule_id")
+            db.execute("ALTER TABLE router_requests DROP COLUMN target_model_source")
+            db.execute("ALTER TABLE router_requests DROP COLUMN target_model_reason")
             db.execute("ALTER TABLE router_worker_state DROP COLUMN terminal_sweep_cursor")
             db.execute("PRAGMA user_version=2")
         migrated = RouterStore(self.db_path)
-        self.assertEqual(migrated.check()["schema"], 4)
+        self.assertEqual(migrated.check()["schema"], 5)
         columns = {
             row[1]
             for row in sqlite3.connect(self.db_path).execute(
@@ -709,15 +896,18 @@ class RuntimeRouterTests(unittest.TestCase):
         }
         self.assertIn("cancel_source_state", columns)
         self.assertIn("reconcile_source_state", columns)
-        self.assertEqual(RouterStore(self.db_path).check()["schema"], 4)
+        self.assertEqual(RouterStore(self.db_path).check()["schema"], 5)
 
     def test_additive_v3_migration_and_terminal_sweep_cursor(self):
         RouterStore(self.db_path)
         with sqlite3.connect(self.db_path) as db:
             db.execute("ALTER TABLE router_worker_state DROP COLUMN terminal_sweep_cursor")
+            db.execute("ALTER TABLE router_requests DROP COLUMN target_model_rule_id")
+            db.execute("ALTER TABLE router_requests DROP COLUMN target_model_source")
+            db.execute("ALTER TABLE router_requests DROP COLUMN target_model_reason")
             db.execute("PRAGMA user_version=3")
         migrated = RouterStore(self.db_path)
-        self.assertEqual(migrated.check()["schema"], 4)
+        self.assertEqual(migrated.check()["schema"], 5)
         migrated.record_worker_heartbeat("worker", "running")
         migrated.set_terminal_sweep_cursor("request-cursor")
         self.assertEqual(RouterStore(self.db_path).terminal_sweep_cursor(), "request-cursor")
@@ -753,6 +943,23 @@ class RuntimeRouterTests(unittest.TestCase):
         with self.assertRaisesRegex(RouterConfigError, "schema_unsupported"):
             RouterStore(self.db_path)
         self.assertEqual(hashlib.sha256(self.db_path.read_bytes()).digest(), before)
+
+    def test_additive_v4_model_policy_migration_preserves_existing_requests(self):
+        store = RouterStore(self.db_path)
+        request, created = self.enqueue(store, key="pre-v5-request")
+        self.assertTrue(created)
+        with sqlite3.connect(self.db_path) as db:
+            db.execute("ALTER TABLE router_requests DROP COLUMN target_model_rule_id")
+            db.execute("ALTER TABLE router_requests DROP COLUMN target_model_source")
+            db.execute("ALTER TABLE router_requests DROP COLUMN target_model_reason")
+            db.execute("PRAGMA user_version=4")
+        migrated = RouterStore(self.db_path)
+        self.assertEqual(migrated.check()["schema"], 5)
+        stored = migrated.get(request["request_id"])
+        self.assertEqual(stored["payload_hash"], request["payload_hash"])
+        self.assertIsNone(stored["target_model_rule_id"])
+        self.assertIsNone(stored["target_model_source"])
+        self.assertIsNone(stored["target_model_reason"])
 
     def test_principal_identity_uniqueness_and_binding_scope(self):
         store = self.initialized_store()
@@ -1288,6 +1495,50 @@ class RuntimeRouterTests(unittest.TestCase):
         self.assertEqual(resolution.runtime_id, RUNTIME_A)
         self.assertEqual(resolution.model, MODEL_A)
 
+    def test_worker_uses_origin_profile_model_policy_and_trusted_principal(self):
+        store = self.initialized_store()
+        raw_profile = json.loads(json.dumps(self.raw_config))
+        raw_profile["agents"]["canonical"]["allowed_models_by_runtime"] = {
+            RUNTIME_A: [MODEL_A, MODEL_B],
+            RUNTIME_B: [MODEL_B],
+        }
+        raw_profile["model_policy"] = {
+            "enabled": True,
+            "capability_source": "none",
+            "rules": [{
+                "id": "profile-principal-model",
+                "priority": 10,
+                "match": {"principal_ids": [PRINCIPAL]},
+                "model": MODEL_B,
+                "runtime_ids": [RUNTIME_A],
+            }],
+        }
+        raw_worker_config = json.loads(json.dumps(self.raw_config))
+        raw_worker_config["agents"]["canonical"]["allowed_models_by_runtime"] = {
+            RUNTIME_A: [MODEL_A, MODEL_B],
+            RUNTIME_B: [MODEL_B],
+        }
+        worker_config = RouterConfig.parse(raw_worker_config)
+        request, _created = self.enqueue(store, model=MODEL_B)
+        registry_mapping = workspace_router_registry()
+        self.set_valid_route_policy_hash(store, request, registry_mapping)
+        request = store.get(request["request_id"])
+        payload = json.loads(request["payload_json"])
+        registry = registry_from_mapping(registry_mapping)
+        worker = RouterWorker(worker_config, adapter=FakeAdapter())
+        worker.store = store
+
+        profile_config = worker._profile_model_config(
+            worker.config, {"runtime_router": raw_profile},
+        )
+        resolution = worker._resolution(
+            profile_config, request, registry.routes[0], payload, registry,
+        )
+
+        self.assertTrue(profile_config.model_policy.enabled)
+        self.assertEqual(resolution.model, MODEL_B)
+        self.assertEqual(resolution.model_rule_id, "profile-principal-model")
+
     def test_create_accepts_keep_current_without_persisted_binding(self):
         store = RouterStore(self.db_path)
         store.upsert_connector(CONNECTOR, "default", "telegram", "Test")
@@ -1328,6 +1579,58 @@ class RuntimeRouterTests(unittest.TestCase):
 
         self.assertTrue(result["ok"], result)
         self.assertEqual(store.get(result["request_id"])["state"], "queued")
+
+    def test_create_model_policy_can_select_by_trusted_principal(self):
+        store = self.initialized_store()
+        raw = json.loads(json.dumps(self.raw_config))
+        raw["agents"]["canonical"]["allowed_models_by_runtime"] = {
+            RUNTIME_A: [MODEL_A, MODEL_B],
+            RUNTIME_B: [MODEL_B],
+        }
+        raw["model_policy"] = {
+            "enabled": True,
+            "capability_source": "none",
+            "rules": [{
+                "id": "principal-model",
+                "priority": 10,
+                "match": {"principal_ids": [PRINCIPAL]},
+                "model": MODEL_B,
+                "runtime_ids": [RUNTIME_A],
+            }],
+        }
+        config = RouterConfig.parse(raw)
+        registry = registry_from_mapping(workspace_router_registry())
+        route = registry.routes[0]
+        source = {
+            **{key: value for key, value in source_context().items() if key != "profile"},
+            "thread_id": "123",
+            "chat_type": "thread",
+        }
+        tools = RuntimeRouterTools(SimpleNamespace())
+        tools._context = lambda _tool_context=None: (  # type: ignore[method-assign]
+            source,
+            "default",
+            config,
+            store,
+        )
+
+        with (
+            patch("runtime_router.tools.WorkspaceRuntime._registry", return_value=registry),
+            patch("runtime_router.tools.WorkspaceRuntime._route", return_value=route),
+            patch("runtime_router.tools.MulticaCliAdapter", return_value=FakeAdapter()),
+            patch(
+                "runtime_router.tools._load_hermes_context",
+                return_value=SimpleNamespace(source=source, attachments=[]),
+            ),
+        ):
+            result = json.loads(
+                tools.create({"route_id": ROUTE, "title": "Principal scoped model"})
+            )
+
+        self.assertTrue(result["ok"], result)
+        request = store.get(result["request_id"])
+        self.assertEqual(request["target_model"], MODEL_B)
+        self.assertEqual(request["target_model_rule_id"], "principal-model")
 
     def test_create_enforces_required_attachment_when_context_is_empty(self):
         store = self.initialized_store()

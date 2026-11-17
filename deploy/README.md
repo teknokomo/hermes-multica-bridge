@@ -356,6 +356,8 @@ Wake выключен по умолчанию. Его включение тре�
 
 Hermes webhook route должен иметь точные `events = ["task.completed"]`, профиль-получатель, HMAC, `deliver_only=false`, фиксированные `deliver`/`deliver_extra.chat_id`/`thread_id`, выключенные mirror, script, skills и coalesce, а также route toolsets без Multica tools. Prompt ограничивает агента snapshot и одним финальным ответом. При отсутствии подтверждения темы не направляйте ответ в родительский чат.
 
+Для MAX direct message destination должен точно совпадать с MAX `user_id`, а `thread_id` оставаться пустым; подмена на group/parent chat запрещена. Telegram direct messages не поддерживаются. `completion_filter` принимает `any` (по умолчанию), `root_only` или `explicit_issues`; последний использует только операторский список в приватной конфигурации. При `root_only` отсутствие `parent_issue_id` закрывает wake fail closed.
+
 Одна автоматическая попытка POST не гарантирует exactly-once. `delivery_unknown` не повторяется автоматически. Перед `wake replay ID --confirm` оператор сверяет Hermes journal и целевой тред; тот же wake ID позволяет Hermes дедуплицировать уже принятый запрос, но доставка ответа всё ещё может быть неоднозначной.
 
 Откат: отключить wake-подписки, остановить notify и только затем восстановить согласованные БД/TOML/credential drop-ins. Не удаляйте receipts и сохранённые `delivery_unknown` без записи audit. Gateway restart выполняется только в согласованное окно и после готовности обоих профилей и тестовой цели.
@@ -375,6 +377,18 @@ Completion route обязан иметь `wake_mode=completion` и `watcher_enab
 Отдельный DynamicRouteStore создаётся в приватной директории данных профиля. Не копируйте его между профилями и не редактируйте SQLite вручную. При неизвестной схеме сервис прекращает операцию без миграции или изменения файла. Новые и отозванные маршруты становятся видимыми без рестарта Gateway.
 
 В этой реализации T74 не выполняется: package install, live grants/credentials, wake subscriptions, Gateway/notify/watcher restart, canary, Multica issue, production activation и публикация требуют отдельного разрешения и backup/rollback плана.
+
+## Condition wake и approval-ready 0.7.0
+
+Condition wake остаётся выключенным по умолчанию. Notify config также должен содержать `[approval_ipc]` с `enabled=false`, фиксированным socket `/run/hermes-multica-notify-approval/approval.sock`, `native_delivery_suppressed=false` и пустым `peers`. Unit создаёт отдельный runtime directory; не объединяйте этот mapping socket с read-only readiness socket.
+
+До включения оператор обязан доказать на точной целевой Hermes сборке, что native wake/run/comment не доставляет отдельное сообщение пользователю. Пока доказательства нет, оба флага остаются `false`, а `condition_wake` и approval-ready не используются. Локальные fixtures и успешная регистрация wakeup не подтверждают этот gate.
+
+При авторизованной проверке parent сначала создаётся с локальным intent; следующий Workspace update валидирует полный child tree и stage-план, затем регистрирует один native `children_done` wakeup. Для staged-конфигурации обязательны оба поля: `expected_stage_count` — число разных групп, `stage` — максимальный ordinal; значения могут различаться (например, группы 1 и 3 задаются количеством 2 и максимумом 3). Для unstaged оба поля отсутствуют. Оба значения ограничены 500, ordinal ребёнка должен быть в диапазоне `1..stage`, число разных групп должно совпадать с `expected_stage_count`; пропуски допустимы. Дети должны иметь точные статусы `done`.
+
+Плагин отправляет в mapping socket parent и native wakeup, проверенный notify route ID отдельно от bridge route ID, profile, instruction и expiry, а также зафиксированные child IDs и fingerprint дерева. Notify повторно проверяет scope через read-only Multica API и принимает только однозначную связь parent, wakeup, run и сохранённых детей. Финальный `task.ready_for_approval` создаётся и отправляется только notify; он не закрывает parent и не выполняет human approval. Mapping socket имеет отдельные `SO_PEERCRED` UID/profile allowlist и кадр до 16 KiB, без доступа плагина к notify DB или credentials.
+
+Этот checkout не прошёл target-проверку подавления native-доставки: `native_delivery_suppressed` остаётся `false`. Не включайте функцию и не считайте локальные фикстуры подтверждением целевого поведения. E2E, установка и изменение живых маршрутов остаются отдельным этапом.
 
 ## Runtime Router 0.7.0
 

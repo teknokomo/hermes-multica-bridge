@@ -16,6 +16,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .approval_ipc import ApprovalMappingClient
+from .condition_wake import (
+    ConditionWakeSpec,
+    _valid_epoch,
+    condition_wakeup_matches,
+    parse_condition_wake,
+    validate_child_tree,
+)
 from .dynamic_routes import DynamicRouteStore
 from .errors import BridgeError
 from .notify_readiness import MAX_PROJECTS, NotifyReadinessClient
@@ -418,6 +426,233 @@ class WorkspaceRuntime:
         except BridgeError:
             return None
 
+    def _condition_wake_settings(self) -> dict[str, bool]:
+        raw = self.ctx.get_config("condition_wake", {})
+        if (not isinstance(raw, dict) or set(raw) - {"enabled", "native_delivery_suppressed"}
+                or type(raw.get("enabled", False)) is not bool
+                or type(raw.get("native_delivery_suppressed", False)) is not bool):
+            raise BridgeError("configuration_invalid", "The condition-wake policy is invalid.")
+        return {
+            "enabled": raw.get("enabled", False),
+            "native_delivery_suppressed": raw.get("native_delivery_suppressed", False),
+        }
+
+    def _condition_wake_preflight(
+        self, registry: ConnectionRegistry, route: RegistryRoute, project_id: str,
+    ) -> str:
+        settings = self._condition_wake_settings()
+        if not settings["enabled"]:
+            raise BridgeError("condition_wake_disabled", "Approval-ready wake is disabled for this profile.")
+        if not settings["native_delivery_suppressed"]:
+            raise BridgeError(
+                "approval_ready_delivery_unverified",
+                "Native approval-ready delivery has not been verified as suppressed.",
+            )
+        if route.wake_mode != "completion" or route.watcher_enabled:
+            raise BridgeError("approval_ready_destination_unverified", "This route is not configured for notify completion delivery.")
+        readiness = self._wake_readiness(registry, route, (project_id,))
+        if not readiness or len(readiness) != 1 or not readiness[0].get("wake_ready"):
+            raise BridgeError("approval_ready_destination_unverified", "Notify has no verified completion destination for this project.")
+        wake_route_id = readiness[0].get("wake_route_id")
+        if not isinstance(wake_route_id, str) or not wake_route_id:
+            raise BridgeError("approval_ready_destination_unverified", "Notify did not identify the verified completion route.")
+        return wake_route_id
+
+    @staticmethod
+    def _condition_wake_hash(spec: ConditionWakeSpec) -> str:
+        return hashlib.sha256(_json(spec.canonical()).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _condition_wake_restore_allowed(intent: dict[str, Any] | None) -> bool:
+        if not isinstance(intent, dict) or not _valid_epoch(intent.get("wakeup_expires_at")):
+            return False
+        children_json = intent.get("children_json")
+        fingerprint = intent.get("tree_fingerprint")
+        has_saved_tree = (
+            isinstance(children_json, str)
+            and bool(children_json)
+            and isinstance(fingerprint, str)
+            and re.fullmatch(r"[0-9a-f]{64}", fingerprint) is not None
+        )
+        if intent.get("status") == "registering":
+            return has_saved_tree
+        return (
+            intent.get("status") == "registered"
+            and isinstance(intent.get("wakeup_id"), str)
+            and bool(intent["wakeup_id"])
+            and has_saved_tree
+        )
+
+    def _persist_condition_wake_intent(
+        self, state: WorkspaceState, registry: ConnectionRegistry, route: RegistryRoute,
+        issue_id: str, spec: ConditionWakeSpec,
+    ) -> dict[str, Any]:
+        workspace = registry.workspace(route.workspace_key)
+        return state.put_condition_wake_intent(
+            route_id=route.route_id,
+            connection_id=route.connection_id,
+            workspace_id=workspace.workspace_id,
+            source_profile=self._profile(),
+            parent_issue_id=issue_id,
+            request_hash=self._condition_wake_hash(spec),
+            config=spec.canonical(),
+        )
+
+    def _register_condition_wake(
+        self, *, state: WorkspaceState, registry: ConnectionRegistry, route: RegistryRoute,
+        api: WorkspaceApiClient, issue: dict[str, Any], spec: ConditionWakeSpec,
+    ) -> dict[str, Any]:
+        parent_id = issue.get("id")
+        agent_id = issue.get("assignee_id")
+        if issue.get("assignee_type") != "agent" or not isinstance(agent_id, str):
+            raise BridgeError(
+                "condition_wake_agent_unavailable",
+                "Condition wake requires the parent to be assigned directly to a verified agent.",
+            )
+        workspace = registry.workspace(route.workspace_key)
+        intent = state.condition_wake_intent(
+            connection_id=route.connection_id, workspace_id=workspace.workspace_id,
+            source_profile=self._profile(), parent_issue_id=parent_id,
+        )
+        if intent is None or intent["route_id"] != route.route_id:
+            raise BridgeError("condition_wake_pending", "No matching condition-wake intent exists for this parent.")
+        allow_expired_restore = self._condition_wake_restore_allowed(intent)
+        try:
+            saved_spec = ConditionWakeSpec.from_canonical(
+                json.loads(intent["config_json"]), allow_expired=allow_expired_restore,
+            )
+        except (ValueError, TypeError, RecursionError):
+            raise BridgeError("condition_wake_invalid", "The saved condition-wake request is invalid.") from None
+        if saved_spec.canonical() != spec.canonical():
+            raise BridgeError("operation_conflict", "The condition-wake request differs from the saved intent.")
+        notify_route_id = self._condition_wake_preflight(registry, route, issue.get("project_id"))
+        try:
+            children, fingerprint = validate_child_tree(
+                api.list_issue_children(parent_id), parent_id=parent_id,
+                workspace_id=workspace.workspace_id, project_id=issue["project_id"], spec=spec,
+            )
+        except BridgeError:
+            raise
+        except Exception:  # noqa: BLE001 - read adapter errors are a stable public boundary
+            raise BridgeError("approval_wake_unavailable", "The child plan could not be verified.") from None
+        mapping_preflight = {
+            "version": 1, "op": "approval_mapping.put", "parent_issue_id": parent_id,
+            "wakeup_id": "w" * 128, "route_id": notify_route_id,
+            "bridge_route_id": route.route_id, "source_profile": self._profile(),
+            "instruction": spec.instruction, "expires_at": 253_402_300_799.0,
+            "expected_stage_count": spec.expected_stage_count,
+            "registered_child_ids": [row["id"] for row in children],
+            "registered_tree_fingerprint": fingerprint,
+        }
+        ApprovalMappingClient.encode_request(mapping_preflight)
+        expected_expiry = spec.expires_at or (time.time() + (spec.expires_in_seconds or 0))
+        action = state.begin_condition_wake_registration(
+            intent["intent_key"], children=children, fingerprint=fingerprint,
+            wakeup_expires_at=expected_expiry,
+        )
+        registration_intent = state.condition_wake_intent(
+            connection_id=route.connection_id, workspace_id=workspace.workspace_id,
+            source_profile=self._profile(), parent_issue_id=parent_id,
+        )
+        if (registration_intent is None
+                or not isinstance(registration_intent.get("children_json"), str)
+                or not isinstance(registration_intent.get("tree_fingerprint"), str)):
+            raise BridgeError("approval_wake_unavailable", "The saved child plan could not be verified.")
+        try:
+            registered_children = json.loads(registration_intent["children_json"])
+        except (ValueError, TypeError, RecursionError):
+            raise BridgeError("approval_wake_unavailable", "The saved child plan could not be verified.") from None
+        if (not isinstance(registered_children, list)
+                or any(not isinstance(row, dict) or set(row) != {"id", "stage"}
+                       or not isinstance(row.get("id"), str) for row in registered_children)
+                or [row["id"] for row in registered_children] != [row["id"] for row in children]
+                or registration_intent["tree_fingerprint"] != fingerprint):
+            raise BridgeError("condition_wake_stage_mismatch", "The saved child plan has changed.")
+        registration_expiry = (
+            registration_intent.get("wakeup_expires_at")
+            if registration_intent is not None else None
+        )
+        if not _valid_epoch(registration_expiry):
+            state.finish_condition_wake_registration(
+                intent["intent_key"], status="blocked", detail="approval_wake_invalid",
+            )
+            raise BridgeError("approval_wake_unavailable", "The saved wakeup expiry could not be verified.")
+        created_id = None
+        if action == "claimed":
+            try:
+                created = api.create_issue_wakeup(
+                    parent_id,
+                    spec.api_payload(agent_id=agent_id, expires_at_override=registration_expiry),
+                )
+                created_id = created["id"]
+            except WorkspaceApiFailure as exc:
+                if exc.outcome == "not_sent":
+                    state.release_condition_wake_claim(intent["intent_key"], detail=exc.code)
+                raise BridgeError("approval_wake_unavailable", "Multica did not confirm condition-wake registration.") from None
+            except BridgeError:
+                raise
+            except Exception:  # noqa: BLE001 - ambiguous POST outcomes must never be retried
+                raise BridgeError("approval_wake_unavailable", "Condition-wake registration is uncertain; retry only readback.") from None
+        try:
+            wakeups = api.list_issue_wakeups(parent_id)
+        except Exception:  # noqa: BLE001 - no second POST after an uncertain readback
+            raise BridgeError("approval_wake_unavailable", "Condition-wake readback is unavailable; no second registration was attempted.") from None
+        matches = [
+            row for row in wakeups
+            if condition_wakeup_matches(
+                row, parent_id, spec, agent_id=agent_id,
+                expected_expires_at=registration_expiry,
+            )
+        ]
+        if len(matches) > 1:
+            state.finish_condition_wake_registration(
+                intent["intent_key"], status="blocked", detail="approval_wake_conflict",
+            )
+            raise BridgeError("approval_wake_unavailable", "Multiple matching condition wakeups were found.")
+        if not matches:
+            # Leave 'registering' in place after a possibly accepted POST. A future
+            # update may only reconcile by GET; it must never issue another POST.
+            if action == "registered":
+                state.finish_condition_wake_registration(
+                    intent["intent_key"], status="blocked", detail="approval_wake_missing",
+                )
+            raise BridgeError("approval_wake_unavailable", "The native condition wakeup was not confirmed by readback.")
+        wakeup = matches[0]
+        if ((created_id is not None and wakeup["id"] != created_id)
+                or (action == "registered" and intent.get("wakeup_id") != wakeup["id"])):
+            state.finish_condition_wake_registration(
+                intent["intent_key"], status="blocked", detail="approval_wake_conflict",
+            )
+            raise BridgeError("approval_wake_unavailable", "Condition-wake readback did not match its saved registration.")
+        if action in {"claimed", "reconcile"}:
+            state.finish_condition_wake_registration(
+                intent["intent_key"], status="registered", wakeup_id=wakeup["id"],
+            )
+        current = state.condition_wake_intent(
+            connection_id=route.connection_id, workspace_id=workspace.workspace_id,
+            source_profile=self._profile(), parent_issue_id=parent_id,
+        )
+        request = {
+            "version": 1, "op": "approval_mapping.put", "parent_issue_id": parent_id,
+            "wakeup_id": wakeup["id"], "route_id": notify_route_id,
+            "bridge_route_id": route.route_id,
+            "source_profile": self._profile(), "instruction": spec.instruction,
+            "expires_at": current["wakeup_expires_at"],
+            "expected_stage_count": spec.expected_stage_count,
+            "registered_child_ids": [row["id"] for row in registered_children],
+            "registered_tree_fingerprint": registration_intent["tree_fingerprint"],
+        }
+        try:
+            mapping_status = ApprovalMappingClient().put(request)
+        except BridgeError as exc:
+            if exc.code != "approval_mapping_unavailable":
+                state.finish_condition_wake_mapping(
+                    current["intent_key"], status="blocked", detail=exc.code,
+                )
+            raise
+        state.finish_condition_wake_mapping(current["intent_key"], status="registered")
+        return {"status": "registered", "wakeup_id": wakeup["id"], "mapping_status": mapping_status}
+
     @staticmethod
     def _safe_issue(issue: dict[str, Any]) -> dict[str, Any]:
         fields = ("id", "identifier", "title", "description", "status", "priority", "project_id", "workspace_id",
@@ -798,6 +1033,7 @@ class WorkspaceRuntime:
                 and source["platform"] in grant.allowed_source_platforms
                 and source["user_id"] in grant.allowed_user_ids
                 and source["chat_id"] in grant.allowed_chat_ids
+                and ("group" if source.get("chat_type") == "channel" else source.get("chat_type")) in grant.allowed_chat_types
                 and (not grant.allowed_thread_ids or source.get("thread_id") in grant.allowed_thread_ids)]
             eligible_grants = [grant for grant in contextual_grants if grant.active]
             available_grants = [grant.grant_id for grant in eligible_grants]
@@ -930,6 +1166,7 @@ class WorkspaceRuntime:
 
             status = "active" if grant.auto_approve else "pending"
             source_thread = source.get("thread_id") or ""
+            source_chat_type = "group" if source.get("chat_type") == "channel" else source.get("chat_type")
             route_policy = {
                 "route_id": route_id,
                 "connection_id": grant.connection_id,
@@ -947,6 +1184,7 @@ class WorkspaceRuntime:
                 "allowed_user_ids": [source["user_id"]],
                 "allowed_chat_ids": [source["chat_id"]],
                 "allowed_thread_ids": [source_thread] if source_thread else [],
+                "allowed_chat_types": [source_chat_type],
                 "allow_groups": source["chat_type"] in {"group", "channel", "thread"},
                 "allowed_statuses": list(anchor.allowed_statuses),
                 "allowed_assignees": [{"id": item.id, "type": item.type, "label": item.label} for item in assignees],
@@ -978,7 +1216,7 @@ class WorkspaceRuntime:
                 "instance_id": grant.instance_id,
                 "project_ids": route_policy["project_ids"], "project_selection": project_selection,
                 "squad_id": route_policy["squad_id"], "chat_id": source["chat_id"],
-                "thread_id": source_thread, "name": normalized_name,
+                "thread_id": source_thread, "chat_type": source_chat_type, "name": normalized_name,
             }
             create_key = hashlib.sha256(_json(create_identity).encode()).hexdigest()
             raw_registry = self.ctx.get_config("registry", None)
@@ -1030,7 +1268,7 @@ class WorkspaceRuntime:
                 tool_context = _load_hermes_context(include_attachments=True)
             route_id = self._route_arg(args, {
                 "route_id", "title", "description", "status", "parent_issue_id", "assignee_id",
-                "assignee_type", "allow_unassigned", "related_issue_ids", "project_id",
+                "assignee_type", "allow_unassigned", "related_issue_ids", "project_id", "condition_wake",
             })
             registry = self._registry()
             route = self._route(registry, tool_context, route_id)
@@ -1039,6 +1277,7 @@ class WorkspaceRuntime:
                     "runtime_router_required",
                     "This route queues work through the canonical runtime router.",
                 )
+            condition_spec = parse_condition_wake(args["condition_wake"]) if "condition_wake" in args else None
             title = args.get("title")
             description = args.get("description", "")
             status = args.get("status") or ("todo" if "todo" in route.allowed_statuses else route.allowed_statuses[0])
@@ -1053,8 +1292,12 @@ class WorkspaceRuntime:
             if not isinstance(description, str) or len(description) > 65536:
                 raise BridgeError("invalid_arguments", "Issue description is too long.")
             parent_id = args.get("parent_issue_id")
+            if condition_spec is not None and parent_id is not None:
+                raise BridgeError("condition_wake_invalid", "A condition-wake intent must be attached to a new parent issue.")
             api = self._api(registry, route)
             project_id = self._project_for_send(args, registry, route, api)
+            if condition_spec is not None:
+                self._condition_wake_preflight(registry, route, project_id)
             pseudonym_key = self._metadata_pseudonym_key(route)
             if parent_id is not None:
                 parent = api.get_issue(parent_id)
@@ -1068,7 +1311,8 @@ class WorkspaceRuntime:
                        "parent_issue_id": parent_id, "assignee_id": assignee_id,
                        "assignee_type": assignee_type, "allow_unassigned": args.get("allow_unassigned", False),
                        "related_issue_ids": related_ids,
-                       "attachment_hashes": [item[2] for item in attachments]}
+                       "attachment_hashes": [item[2] for item in attachments],
+                       "condition_wake": condition_spec.canonical() if condition_spec else None}
             issue = self._operation(
                 state, route, tool_context, "create_issue", payload,
                 lambda: api.create_issue(title=title, description=description, project_id=project_id,
@@ -1077,6 +1321,17 @@ class WorkspaceRuntime:
             )
             self._issue_in_route(issue, registry, route, project_id=project_id)
             issue_id = issue["id"]
+            condition_intent = None
+            if condition_spec is not None:
+                try:
+                    condition_intent = self._persist_condition_wake_intent(
+                        state, registry, route, issue_id, condition_spec,
+                    )
+                except BridgeError as exc:
+                    return _json({
+                        "ok": False, "error_code": exc.code, "message": exc.message,
+                        "issue_id": issue_id, "issue": self._safe_issue(issue),
+                    })
             expected = {"title": title.strip(), "description": description, "status": status,
                         "project_id": project_id,
                         "assignee_id": assignee_id, "assignee_type": assignee_type}
@@ -1120,6 +1375,8 @@ class WorkspaceRuntime:
             notification_status = self._notify_unassigned(state, route, readback_issue) if assignment is None else None
             result = {"issue": self._safe_issue(readback_issue), "issue_id": issue_id,
                       "attachments": files, "watcher_mapping": mapping_status, "warnings": metadata_warnings}
+            if condition_intent is not None:
+                result["condition_wake"] = {"status": condition_intent["status"]}
             wake_status = self._wake_readiness(registry, route, (project_id,))
             result["wake_readiness"] = (
                 wake_status[0] if wake_status else
@@ -1190,11 +1447,15 @@ class WorkspaceRuntime:
                 tool_context = _load_hermes_context()
             route_id = self._route_arg(args, {
                 "route_id", "issue_id", "title", "description", "status", "assignee_id",
-                "assignee_type", "related_issue_ids",
+                "assignee_type", "related_issue_ids", "condition_wake",
             })
+            condition_present = "condition_wake" in args
+            condition_request = args.get("condition_wake")
+            condition_spec = None
             registry = self._registry()
             route = self._route(registry, tool_context, route_id)
             issue_id = args.get("issue_id")
+            runtime_request = None
             if route.runtime_router_enabled:
                 if "assignee_id" in args or "assignee_type" in args:
                     raise BridgeError(
@@ -1208,7 +1469,7 @@ class WorkspaceRuntime:
                     router_config = RouterConfig.parse(self.ctx.get_config("runtime_router", {}))
                     if not router_config.enabled:
                         raise BridgeError("runtime_router_disabled", "Runtime routing is disabled for this profile.")
-                    request = RouterStore(router_config.state_path).request_for_issue(issue_id)
+                    runtime_request = RouterStore(router_config.state_path).request_for_issue(issue_id)
                 except BridgeError:
                     raise
                 except (OSError, ValueError, TypeError, sqlite3.Error, AttributeError) as exc:
@@ -1216,8 +1477,8 @@ class WorkspaceRuntime:
                         "runtime_router_state_unavailable",
                         "The runtime request mapping could not be verified.",
                     ) from exc
-                if (request is None or request.get("route_id") != route.route_id
-                        or request.get("instance_id") != route.instance_id):
+                if (runtime_request is None or runtime_request.get("route_id") != route.route_id
+                        or runtime_request.get("instance_id") != route.instance_id):
                     raise BridgeError(
                         "runtime_router_issue_required",
                         "Only an issue created by this runtime route can be updated here.",
@@ -1226,6 +1487,55 @@ class WorkspaceRuntime:
             issue = api.get_issue(issue_id)
             self._verify_issue_scope(api, issue, registry, route)
             state = self._state()
+            condition_intent = None
+            allow_expired_restore = False
+            if condition_present:
+                workspace_id = registry.workspace(route.workspace_key).workspace_id
+                condition_intent = state.condition_wake_intent(
+                    connection_id=route.connection_id,
+                    workspace_id=workspace_id,
+                    source_profile=self._profile(),
+                    parent_issue_id=issue_id,
+                )
+                allow_expired_restore = (
+                    condition_intent is not None
+                    and condition_intent.get("route_id") == route.route_id
+                    and self._condition_wake_restore_allowed(condition_intent)
+                )
+                condition_spec = parse_condition_wake(
+                    condition_request, allow_expired=allow_expired_restore,
+                )
+            if condition_spec is not None:
+                self._condition_wake_preflight(registry, route, issue.get("project_id"))
+                if runtime_request is not None:
+                    try:
+                        runtime_payload = json.loads(runtime_request["payload_json"])
+                        stored_condition = runtime_payload.get("condition_wake") if isinstance(runtime_payload, dict) else None
+                        stored_spec = ConditionWakeSpec.from_canonical(
+                            stored_condition, allow_expired=allow_expired_restore,
+                        )
+                        stored_source = runtime_payload.get("source", {})
+                        if (not isinstance(stored_source, dict)
+                                or stored_source.get("profile") != self._profile()
+                                or stored_spec.canonical() != condition_spec.canonical()):
+                            raise BridgeError("operation_conflict", "The condition-wake plan differs from the queued parent intent.")
+                    except BridgeError:
+                        raise
+                    except (ValueError, TypeError, KeyError, RecursionError):
+                        raise BridgeError("condition_wake_pending", "The runtime task has no valid saved condition-wake intent.") from None
+                    self._persist_condition_wake_intent(state, registry, route, issue_id, stored_spec)
+                else:
+                    intent = condition_intent
+                    if intent is None:
+                        raise BridgeError("condition_wake_pending", "Create this parent with condition_wake before registering its stage plan.")
+                    try:
+                        saved = ConditionWakeSpec.from_canonical(
+                            json.loads(intent["config_json"]), allow_expired=allow_expired_restore,
+                        )
+                    except (ValueError, TypeError, RecursionError):
+                        raise BridgeError("condition_wake_invalid", "The saved condition-wake request is invalid.") from None
+                    if saved.canonical() != condition_spec.canonical():
+                        raise BridgeError("operation_conflict", "The condition-wake plan differs from the saved parent intent.")
             self._retry_watcher_mapping(state, route, issue_id)
             related_requested = "related_issue_ids" in args
             related_ids: list[str] = []
@@ -1237,7 +1547,7 @@ class WorkspaceRuntime:
             if assignment_requested:
                 updates["assignee_id"] = assignment.id if assignment else None
                 updates["assignee_type"] = assignment.type if assignment else None
-            if not updates and not related_requested:
+            if not updates and not related_requested and condition_spec is None:
                 raise BridgeError("invalid_arguments", "At least one supported issue field must be updated.")
             if "status" in updates and updates["status"] not in route.allowed_statuses:
                 raise BridgeError("route_denied", "The requested status is not allowed by this Workspace route.")
@@ -1280,7 +1590,22 @@ class WorkspaceRuntime:
                     self._operation(state, route, tool_context, operation, payload, writer)
                 except BridgeError:
                     metadata_warnings.append("metadata_incomplete")
+            condition_result = None
+            if condition_spec is not None and verification_error is None:
+                try:
+                    condition_result = self._register_condition_wake(
+                        state=state, registry=registry, route=route, api=api,
+                        issue=changed, spec=condition_spec,
+                    )
+                except BridgeError as exc:
+                    return _json({
+                        "ok": False, "error_code": exc.code, "message": exc.message,
+                        "issue": self._safe_issue(changed), "issue_id": issue_id,
+                        "warnings": metadata_warnings,
+                    })
             result = {"issue": self._safe_issue(changed), "issue_id": issue_id, "warnings": metadata_warnings}
+            if condition_result is not None:
+                result["condition_wake"] = condition_result
             if verification_error is not None:
                 return _json({"ok": False, "error_code": verification_error.code,
                               "message": verification_error.message, **result})
@@ -1298,6 +1623,21 @@ def _schema(name: str, description: str, properties: dict[str, Any], required: l
 
 
 ROUTE_PROPERTY = {"route_id": {"type": "string", "description": "Authorized route from multica_list_routes."}}
+CONDITION_WAKE_PROPERTY = {
+    "type": "object",
+    "properties": {
+        "enabled": {"type": "boolean"},
+        "mode": {"type": "string", "enum": ["children_done"]},
+        "instruction": {"type": "string", "maxLength": 2000},
+        "stage": {"type": "integer", "minimum": 1},
+        "expected_stage_count": {"type": "integer", "minimum": 1},
+        "expires_in": {"type": "string", "pattern": "^[1-9][0-9]{0,5}(s|m|h|d)$"},
+        "expires_at": {"type": ["string", "integer"]},
+        "on_timeout": {"type": "string", "enum": ["wake", "end"]},
+    },
+    "required": ["enabled", "instruction"],
+    "additionalProperties": False,
+}
 WORKSPACE_TOOLS = (
     ("multica_workspace_send", "Create an issue in the configured Multica project, using an allowed member, agent, or squad assignment. Current-message attachments are included automatically.",
      {**ROUTE_PROPERTY, "title": {"type": "string"}, "description": {"type": "string"},
@@ -1305,6 +1645,7 @@ WORKSPACE_TOOLS = (
       "status": {"type": "string"}, "parent_issue_id": {"type": "string"},
       "assignee_id": {"type": "string"}, "assignee_type": {"type": "string", "enum": ["member", "agent", "squad"]},
       "allow_unassigned": {"type": "boolean"},
+      "condition_wake": CONDITION_WAKE_PROPERTY,
       "related_issue_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 16, "uniqueItems": True}},
      ["title"], "send"),
     ("multica_workspace_get", "Read an issue only when it belongs to the selected Workspace route.",
@@ -1317,6 +1658,7 @@ WORKSPACE_TOOLS = (
       "description": {"type": "string"}, "status": {"type": "string"},
       "assignee_id": {"type": ["string", "null"]},
       "assignee_type": {"type": ["string", "null"], "enum": ["member", "agent", "squad", None]},
+      "condition_wake": CONDITION_WAKE_PROPERTY,
       "related_issue_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 16, "uniqueItems": True}},
      ["issue_id"], "update"),
 )

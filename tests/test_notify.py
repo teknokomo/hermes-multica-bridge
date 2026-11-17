@@ -85,6 +85,7 @@ def issue(ctx, status="todo", revision=1, at=None, **extra):
         "identifier": "TEST-1",
         "workspace_id": WID,
         "project_id": PROJECT,
+        "parent_issue_id": None,
         "status": status,
         "revision": revision,
         "updated_at": iso(at or ctx.now),

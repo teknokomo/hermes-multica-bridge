@@ -19,13 +19,27 @@
 - Родительский каталог БД должен принадлежать OS user Gateway/worker и иметь режим без group/world доступа. Плагин, worker и SQLite используют один UID.
 - Для каждого CLI profile задайте фиксированные `instance_id`, workspace и HTTPS origin. Модель не передаёт эти значения.
 - `allowed_runtime_ids` — операторское подтверждение доступа canonical agent к runtime. Не выводите их из runtime list автоматически и не добавляйте runtime без согласия владельца.
-- `model_by_runtime` задаёт модель для каждого разрешённого runtime. Отсутствие подтверждённой модели закрывает запрос.
+- `model_by_runtime` задаёт необязательное явное переопределение модели для разрешённого runtime. Без него используется `agent get` model; пустая строка `model=""` означает runtime default и не является ошибкой.
+- `allowed_models_by_runtime` — отдельный операторский allowlist. Не выводите его из model policy. Неуказанная явная модель отклоняется.
+- `model_policy.enabled` по умолчанию `false`; выбор идёт от разрешённой explicit model к единственному правилу с высшим priority, далее к `model_by_runtime` и runtime default. Конфликт одинакового priority закрывает запрос.
+- `capability_source=none` безопасен по умолчанию. Без проверенного каталога fallback запрещён; неизвестную совместимость нельзя считать неподдерживаемой.
 - Привязки `strict` игнорируют exceptions и explicit runtime. В `exceptions` применяется priority, затем число совпавших селекторов; равенство закрывает операцию с `rule_conflict`.
 - `kanban_mirror` оставляйте `false`. В этой версии нет публичного Hermes projection API у отдельного worker; `true` отклоняется, чтобы не создавать молча no-op конфигурацию.
 
 Плагин публикует безопасный snapshot текущей registry-конфигурации в `state_path.parent/profiles/<profile>.json`. Файлы имеют режим `0600`, каталог — `0700`. Некорректная конфигурация заменяет прежний snapshot disabled-маркером; worker не использует устаревшую политику.
 
 CLI использует отдельный HOME `state_path.parent/cli-home`, а не Hermes HOME. Профиль CLI должен быть заранее создан оператором в этом HOME и иметь только необходимые права. Токен не передаётся в argv, environment variables, JSON config, SQLite или журнал. Не используйте `MULTICA_TOKEN` или другую неподтверждённую token env-переменную.
+
+## Condition wake и approval-ready 0.7.0
+
+Condition wake остаётся выключенным по умолчанию. Notify config также должен содержать `[approval_ipc]` с `enabled=false`, фиксированным socket `/run/hermes-multica-notify-approval/approval.sock`, `native_delivery_suppressed=false` и пустым `peers`. Unit создаёт отдельный runtime directory; не объединяйте этот mapping socket с read-only readiness socket.
+
+До включения оператор обязан доказать на точной целевой Hermes сборке, что native wake/run/comment не доставляет отдельное сообщение пользователю. Пока доказательства нет, оба флага остаются `false`, а `condition_wake` и approval-ready не используются. Локальные fixtures и успешная регистрация wakeup не подтверждают этот gate.
+
+При авторизованной проверке parent сначала создаётся с локальным intent; следующий Workspace update валидирует полный child tree и stage-план, затем регистрирует один native `children_done` wakeup. При staged-конфигурации `stage` и `expected_stage_count` задаются парой и совпадают; unstaged не содержит ни одного поля. Дети должны иметь точные статусы `done`.
+Число staged-этапов не превышает 500 — максимальный размер проверяемого дерева; должны присутствовать все номера от 1 до N.
+
+Плагин отправляет в mapping socket только parent/wakeup/route/profile/instruction/expiry. Notify повторно проверяет scope read-only Multica API и принимает только однозначную связь parent, wakeup, run и сохранённых детей. Финальный `task.ready_for_approval` создаётся и отправляется только notify; он не закрывает parent и не выполняет human approval. Mapping socket имеет отдельные `SO_PEERCRED` UID/profile allowlist и кадр до 16 KiB, без доступа плагина к notify DB или credentials.
 
 ## Хранилище и повторное выполнение
 
@@ -75,6 +89,8 @@ systemd-analyze verify deploy/systemd/hermes-multica-router@.service deploy/syst
 Help не подтверждает фактические JSON response shapes или доступ сервиса. Сверка исходников Multica CLI v0.8.2 подтверждает, что `runtime list` возвращает строки `/api/runtimes` без полей `accessible` и `models`. Адаптер сопоставляет пользователя из `auth status` с `user_id` из `workspace member list` и вычисляет доступ по `owner_id`, `visibility` и `shared_with`; неоднозначная или неполная identity закрывается. Каталог моделей CLI 0.8.2 не предоставляет: явная операторская модель проверяется по `agent get` readback, а её фактический запуск остаётся непроверенным до target canary.
 
 На target не выполнялись workspace/project/runtime/agent/issue API reads, runtime switch, issue write, canary или production операция. Поэтому интеграционный контракт остаётся `NOT VERIFIED` для фактических полей:
+
+Condition wake/approval acceptance на target, включая доказательство подавления native-доставки, также остаётся `NOT VERIFIED`; feature должен оставаться выключенным до отдельного разрешения и canary-проверки.
 
 - workspace list: список `workspaces` и ID;
 - project get: `id` и `workspace_id`;

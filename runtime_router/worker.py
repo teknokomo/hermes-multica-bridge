@@ -204,6 +204,16 @@ class RouterWorker:
             route_policy_fingerprint(registry, route), project_id
         )
 
+    @staticmethod
+    def _profile_model_config(
+        config: RouterConfig, snapshot: dict[str, Any],
+    ) -> RouterConfig:
+        """Use the request profile's model policy with the merged service topology."""
+        profile_config = RouterConfig.parse(snapshot.get("runtime_router"))
+        if profile_config.state_path != config.state_path:
+            raise RouterConfigError("profile_router_configuration_inconsistent")
+        return replace(config, model_policy=profile_config.model_policy)
+
     def _resolution(
         self,
         config: RouterConfig,
@@ -292,20 +302,31 @@ class RouterWorker:
             exceptions=exceptions,
             context={
                 **source,
+                "principal_id": identity["principal_id"],
                 "agent_id": agent.agent_id,
                 "workspace_id": workspace.workspace_id,
                 "project_id": project_id,
                 "instance_id": agent.instance_id,
                 "squad_id": route.squad_id,
+                "task_class": payload.get("task_class"),
             },
             allowed_runtime_ids=set(agent.allowed_runtime_ids),
             runtime_catalog=catalog,
             model_by_runtime=agent.model_by_runtime,
+            model_policy=config.model_policy,
+            allowed_models_by_runtime=agent.allowed_models_by_runtime,
+            explicit_model=payload.get("explicit_model"),
             explicit_runtime_id=payload.get("explicit_runtime_id"),
         )
         if (
             resolution.runtime_id != request["target_runtime_id"]
             or resolution.model != request["target_model"]
+            or request.get("target_model_rule_id") is not None
+            and resolution.model_rule_id != request.get("target_model_rule_id")
+            or request.get("target_model_source") is not None
+            and resolution.model_source != request.get("target_model_source")
+            or request.get("target_model_reason") is not None
+            and resolution.model_reason != request.get("target_model_reason")
         ):
             raise RouterConfigError("request_resolution_changed")
         return resolution
@@ -715,8 +736,9 @@ class RouterWorker:
                 "route_policy_hash"
             ):
                 raise RouterConfigError("route_policy_changed")
+            request_config = self._profile_model_config(latest_config, snapshot)
             resolution = self._resolution(
-                latest_config, request, route, payload, registry
+                request_config, request, route, payload, registry
             )
             agent = latest_config.agent(request["agent_ref"])
             instance = latest_config.instance(request["instance_id"])
@@ -784,6 +806,10 @@ class RouterWorker:
                     "rule_id": resolution.rule_id,
                     "reason": resolution.reason,
                     "source": resolution.source,
+                    "model_rule_id": resolution.model_rule_id,
+                    "model_source": resolution.model_source,
+                    "model_reason": resolution.model_reason,
+                    "capability_source": resolution.capability_source,
                 },
                 lease_seconds=latest_config.lease_seconds,
             ):
@@ -797,8 +823,9 @@ class RouterWorker:
             latest_registry, latest_route = self._route(
                 latest_snapshot, request["route_id"], source
             )
+            request_config = self._profile_model_config(latest_config, latest_snapshot)
             self._resolution(
-                latest_config, request, latest_route, payload, latest_registry
+                request_config, request, latest_route, payload, latest_registry
             )
             latest_agent = latest_config.agent(request["agent_ref"])
             latest_instance = latest_config.instance(request["instance_id"])

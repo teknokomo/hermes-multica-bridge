@@ -16,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from bridge.condition_wake import parse_condition_wake
 from bridge.errors import BridgeError
 from bridge.registry import new_id, route_policy_fingerprint
 from bridge.workspace_tools import (
@@ -308,8 +309,11 @@ class RuntimeRouterTools:
                 "project_id",
                 "priority",
                 "explicit_runtime_id",
+                "explicit_model",
+                "task_class",
                 "parent_issue_id",
                 "related_issue_ids",
+                "condition_wake",
             }
             if not isinstance(args, dict) or set(args) - allowed:
                 raise RouterConfigError("invalid_arguments")
@@ -334,11 +338,31 @@ class RuntimeRouterTools:
                 not isinstance(explicit_runtime, str) or not explicit_runtime
             ):
                 raise RouterConfigError("invalid_arguments")
+            explicit_model = args.get("explicit_model")
+            if explicit_model is not None and (
+                not isinstance(explicit_model, str)
+                or not explicit_model
+                or explicit_model != explicit_model.strip()
+                or len(explicit_model) > 128
+            ):
+                raise RouterConfigError("invalid_arguments")
+            task_class = args.get("task_class")
+            if task_class is not None and (
+                not isinstance(task_class, str)
+                or not task_class
+                or task_class != task_class.strip()
+                or len(task_class) > 128
+                or any(ord(char) < 32 for char in task_class)
+            ):
+                raise RouterConfigError("invalid_arguments")
             parent_id = args.get("parent_issue_id")
             if parent_id is not None and (
                 not isinstance(parent_id, str) or not _IDENTIFIER.fullmatch(parent_id)
             ):
                 raise RouterConfigError("invalid_arguments")
+            condition_spec = parse_condition_wake(args["condition_wake"]) if "condition_wake" in args else None
+            if condition_spec is not None and parent_id is not None:
+                raise RouterConfigError("condition_wake_invalid")
             related = args.get("related_issue_ids", [])
             if (
                 not isinstance(related, list)
@@ -401,6 +425,8 @@ class RuntimeRouterTools:
             project = cli.project_get(instance, project_id)
             if project.get("workspace_id") != workspace.workspace_id:
                 raise RouterConfigError("route_project_not_allowed")
+            if condition_spec is not None:
+                WorkspaceRuntime(self.ctx)._condition_wake_preflight(registry, route, project_id)
             if parent_id:
                 parent = cli.issue_get(instance, parent_id)
                 if (
@@ -426,15 +452,20 @@ class RuntimeRouterTools:
                 exceptions=rules,
                 context={
                     **source,
+                    "principal_id": identity["principal_id"],
                     "agent_id": agent.agent_id,
                     "workspace_id": workspace.workspace_id,
                     "project_id": project_id,
                     "instance_id": agent.instance_id,
                     "squad_id": route.squad_id,
+                    "task_class": task_class,
                 },
                 allowed_runtime_ids=set(agent.allowed_runtime_ids),
                 runtime_catalog=runtime_catalog,
                 model_by_runtime=agent.model_by_runtime,
+                model_policy=config.model_policy,
+                allowed_models_by_runtime=agent.allowed_models_by_runtime,
+                explicit_model=explicit_model,
                 explicit_runtime_id=explicit_runtime,
             )
 
@@ -482,8 +513,11 @@ class RuntimeRouterTools:
                     "priority": priority,
                     "parent_issue_id": parent_id,
                     "related_issue_ids": related,
+                    "condition_wake": condition_spec.canonical() if condition_spec else None,
                     "attachments": attachments,
                     "explicit_runtime_id": explicit_runtime,
+                    "explicit_model": explicit_model,
+                    "task_class": task_class,
                     "source": {"profile": profile, **source},
                     "route_policy_hash": route_request_policy_hash(
                         route_policy_fingerprint(registry, route), project_id
@@ -504,12 +538,19 @@ class RuntimeRouterTools:
                         priority=_PRIORITY_RANK[priority],
                         runtime_id=resolution.runtime_id,
                         model=resolution.model,
+                        model_rule_id=resolution.model_rule_id,
+                        model_source=resolution.model_source,
+                        model_reason=resolution.model_reason,
                         resolution={
                             "rule_id": resolution.rule_id,
                             "reason": resolution.reason,
                             "source": resolution.source,
                             "runtime_id": resolution.runtime_id,
                             "model": resolution.model,
+                            "model_rule_id": resolution.model_rule_id,
+                            "model_source": resolution.model_source,
+                            "model_reason": resolution.model_reason,
+                            "capability_source": resolution.capability_source,
                         },
                     )
                 except _SAFE_FAILURES:
@@ -552,6 +593,7 @@ class RuntimeRouterTools:
                         store, request["request_id"]
                     ),
                     "resolved_runtime_id": request["target_runtime_id"],
+                    "resolved_model": request.get("target_model"),
                     "principal_id": identity["principal_id"],
                     "duplicate": not created,
                 }
@@ -858,11 +900,28 @@ def register_tools(ctx: Any) -> None:
                 "project_id": {"type": "string"},
                 "priority": {"type": "string", "enum": list(_PRIORITY_RANK)},
                 "explicit_runtime_id": {"type": "string"},
+                "explicit_model": {"type": "string"},
+                "task_class": {"type": "string"},
                 "parent_issue_id": {"type": "string"},
                 "related_issue_ids": {
                     "type": "array",
                     "items": {"type": "string"},
                     "maxItems": 16,
+                },
+                "condition_wake": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {"type": "boolean"},
+                        "mode": {"type": "string", "enum": ["children_done"]},
+                        "instruction": {"type": "string", "maxLength": 2000},
+                        "stage": {"type": "integer", "minimum": 1},
+                        "expected_stage_count": {"type": "integer", "minimum": 1},
+                        "expires_in": {"type": "string", "pattern": "^[1-9][0-9]{0,5}(s|m|h|d)$"},
+                        "expires_at": {"type": ["string", "integer"]},
+                        "on_timeout": {"type": "string", "enum": ["wake", "end"]},
+                    },
+                    "required": ["enabled", "instruction"],
+                    "additionalProperties": False,
                 },
             },
             ["route_id", "title"],

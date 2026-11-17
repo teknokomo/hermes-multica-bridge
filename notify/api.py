@@ -163,7 +163,7 @@ class Multica:
                 "--direction",
                 "asc",
                 "--fields",
-                "id,identifier,workspace_id,project_id,status,updated_at,revision,assignee_type,assignee_id,labels",
+                "id,identifier,workspace_id,project_id,parent_issue_id,status,updated_at,revision,assignee_type,assignee_id,labels",
             ]
             if project:
                 argv += ["--project", project]
@@ -197,6 +197,21 @@ class Multica:
                 ),
                 "notify_event_invalid",
             )
+            require(
+                all(
+                    "parent_issue_id" in row
+                    and (
+                        row["parent_issue_id"] is None
+                        or (
+                            isinstance(row["parent_issue_id"], str)
+                            and bool(row["parent_issue_id"])
+                            and len(row["parent_issue_id"]) <= 128
+                        )
+                    )
+                    for row in rows
+                ),
+                "notify_event_invalid",
+            )
             fresh = [row for row in rows if row["id"] not in seen]
             for row in fresh:
                 require(
@@ -223,6 +238,7 @@ class Multica:
             "status_entered_at",
             "history_id",
             "project_id",
+            "parent_issue_id",
             "assignee_type",
             "assignee_id",
             "labels",
@@ -232,7 +248,16 @@ class Multica:
         for _ in range(3):
             issue = self.reader.get_issue(issue_id)
             require(
-                issue.get("workspace_id") == self.workspace["workspace_id"],
+                issue.get("workspace_id") == self.workspace["workspace_id"]
+                and "parent_issue_id" in issue
+                and (
+                    issue["parent_issue_id"] is None
+                    or (
+                        isinstance(issue["parent_issue_id"], str)
+                        and bool(issue["parent_issue_id"])
+                        and len(issue["parent_issue_id"]) <= 128
+                    )
+                ),
                 "notify_event_invalid",
             )
             raw_comments = self.reader._request(
@@ -276,7 +301,16 @@ class Multica:
                     raise
             latest = self.reader.get_issue(issue_id)
             require(
-                latest.get("workspace_id") == self.workspace["workspace_id"],
+                latest.get("workspace_id") == self.workspace["workspace_id"]
+                and "parent_issue_id" in latest
+                and (
+                    latest["parent_issue_id"] is None
+                    or (
+                        isinstance(latest["parent_issue_id"], str)
+                        and bool(latest["parent_issue_id"])
+                        and len(latest["parent_issue_id"]) <= 128
+                    )
+                ),
                 "notify_event_invalid",
             )
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import io
+import json
 import sys
 import time
 from pathlib import Path
@@ -168,6 +169,31 @@ def test_cli_response_recursion_is_event_invalid(ctx):
         pytest.raises(NotifyError, match="notify_event_invalid"),
     ):
         list(api.issues(""))
+
+
+def test_issue_listing_requires_explicit_parent_issue_context(ctx):
+    api = Multica.__new__(Multica)
+    api.config, api.workspace, api.env = ctx.config, ctx.config.workspaces["test"], {}
+    page = {
+        "issues": [{"id": "issue-a", "workspace_id": WID, "project_id": "project-a"}],
+        "has_more": False,
+        "offset": 0,
+    }
+    with (
+        patch("notify.api.run_cli", return_value=json.dumps(page).encode()),
+        pytest.raises(NotifyError, match="notify_event_invalid"),
+    ):
+        list(api.issues(""))
+
+
+def test_issue_snapshot_requires_explicit_parent_issue_context(ctx):
+    api = Multica.__new__(Multica)
+    api.workspace = ctx.config.workspaces["test"]
+    api.reader = SimpleNamespace(
+        get_issue=lambda _issue_id: {"id": "issue-a", "workspace_id": WID}
+    )
+    with pytest.raises(NotifyError, match="notify_event_invalid"):
+        api.snapshot("issue-a")
 
 
 def test_actual_dispatch_pacing_after_delayed_first_request(ctx):

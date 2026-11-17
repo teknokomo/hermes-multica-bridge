@@ -52,7 +52,7 @@ SCHEMA = {
     "rate_slots": "key TEXT PRIMARY KEY, next_at REAL NOT NULL",
     "metadata": "key TEXT PRIMARY KEY, value TEXT NOT NULL",
 }
-WAKE_SCHEMA = {
+WAKE_SCHEMA_V2 = {
     "wake_subscriptions": """subscription_id TEXT PRIMARY KEY REFERENCES subscriptions(id),
         profile TEXT NOT NULL CHECK(profile IN ('default','om73')), route TEXT NOT NULL UNIQUE,
         statuses_json TEXT NOT NULL, enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
@@ -66,6 +66,57 @@ WAKE_SCHEMA = {
         last_error TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL, updated_at REAL NOT NULL,
         UNIQUE(subscription_id,event_key)""",
 }
+WAKE_SCHEMA = {
+    "wake_subscriptions": """subscription_id TEXT PRIMARY KEY REFERENCES subscriptions(id),
+        profile TEXT NOT NULL CHECK(profile IN ('default','om73')), route TEXT NOT NULL UNIQUE,
+        statuses_json TEXT NOT NULL, enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+        enabled_since REAL, disabled_reason TEXT NOT NULL DEFAULT '',
+        created_at REAL NOT NULL, updated_at REAL NOT NULL,
+        completion_filter TEXT NOT NULL DEFAULT 'any'""",
+    "wake_jobs": WAKE_SCHEMA_V2["wake_jobs"],
+}
+APPROVAL_SCHEMA_V4 = {
+    "approval_mappings": """mapping_id TEXT PRIMARY KEY,
+        connection_id TEXT NOT NULL, workspace_id TEXT NOT NULL, workspace_key TEXT NOT NULL REFERENCES workspaces(id),
+        source_profile TEXT NOT NULL CHECK(source_profile IN ('default','om73')),
+        parent_issue_id TEXT NOT NULL, wakeup_id TEXT NOT NULL, route_id TEXT NOT NULL,
+        subscription_id TEXT NOT NULL REFERENCES subscriptions(id), instruction TEXT NOT NULL,
+        expires_at REAL, child_ids_json TEXT NOT NULL, tree_fingerprint TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('pending','ready','delivered','delivery_unknown','blocked')),
+        last_run_id TEXT, delivery_status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(delivery_status IN ('pending','delivered','delivery_unknown','dead','blocked')),
+        detail TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL, updated_at REAL NOT NULL,
+        UNIQUE(connection_id,workspace_id,source_profile,parent_issue_id),
+        UNIQUE(connection_id,workspace_id,source_profile,wakeup_id)""",
+    "approval_jobs": """id TEXT PRIMARY KEY, mapping_id TEXT NOT NULL REFERENCES approval_mappings(mapping_id),
+        event_key TEXT NOT NULL, run_id TEXT NOT NULL, payload_json TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('pending','sending','delivered','dead','delivery_unknown')),
+        attempts INTEGER NOT NULL DEFAULT 0, lease_until REAL, lease_token TEXT,
+        last_error TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL, updated_at REAL NOT NULL,
+        UNIQUE(mapping_id,event_key), UNIQUE(mapping_id,run_id)""",
+}
+APPROVAL_SCHEMA = {
+    "approval_mappings": """mapping_id TEXT PRIMARY KEY,
+        connection_id TEXT NOT NULL, workspace_id TEXT NOT NULL, workspace_key TEXT NOT NULL REFERENCES workspaces(id),
+        source_profile TEXT NOT NULL CHECK(source_profile IN ('default','om73')),
+        parent_issue_id TEXT NOT NULL, wakeup_id TEXT NOT NULL, route_id TEXT NOT NULL,
+        subscription_id TEXT NOT NULL REFERENCES subscriptions(id), instruction TEXT NOT NULL,
+        expires_at REAL, child_ids_json TEXT NOT NULL, tree_fingerprint TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('pending','ready','delivered','delivery_unknown','blocked')),
+        last_run_id TEXT, delivery_status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(delivery_status IN ('pending','delivered','delivery_unknown','dead','blocked')),
+        detail TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL, updated_at REAL NOT NULL,
+        agent_id TEXT NOT NULL DEFAULT '', project_id TEXT NOT NULL DEFAULT '', next_check_at REAL,
+        UNIQUE(connection_id,workspace_id,source_profile,parent_issue_id),
+        UNIQUE(connection_id,workspace_id,source_profile,wakeup_id)""",
+    "approval_jobs": """id TEXT PRIMARY KEY, mapping_id TEXT NOT NULL REFERENCES approval_mappings(mapping_id),
+        event_key TEXT NOT NULL, run_id TEXT NOT NULL, payload_json TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('pending','sending','delivered','dead','delivery_unknown')),
+        attempts INTEGER NOT NULL DEFAULT 0, lease_until REAL, lease_token TEXT,
+        last_error TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL, updated_at REAL NOT NULL,
+        next_check_at REAL,
+        UNIQUE(mapping_id,event_key), UNIQUE(mapping_id,run_id)""",
+}
 INDEXES_V1 = {
     "due": "CREATE INDEX due ON notifications(status,next_attempt_at)",
     "subscription_workspace": "CREATE INDEX subscription_workspace ON subscriptions(workspace_id,enabled)",
@@ -74,6 +125,14 @@ INDEXES_V1 = {
 WAKE_INDEXES = {
     "wake_due": "CREATE INDEX wake_due ON wake_jobs(status,next_attempt_at)",
     "wake_subscription_created": "CREATE INDEX wake_subscription_created ON wake_jobs(subscription_id,created_at)",
+}
+APPROVAL_INDEXES_V4 = {
+    "approval_due": "CREATE INDEX approval_due ON approval_jobs(status,created_at)",
+    "approval_workspace": "CREATE INDEX approval_workspace ON approval_mappings(workspace_key,status,updated_at)",
+}
+APPROVAL_INDEXES = {
+    "approval_due": "CREATE INDEX approval_due ON approval_jobs(status,next_check_at,created_at)",
+    "approval_workspace": "CREATE INDEX approval_workspace ON approval_mappings(workspace_key,status,next_check_at)",
 }
 
 
@@ -236,15 +295,25 @@ class State:
                 )
             }
             version = self.db.execute("PRAGMA user_version").fetchone()[0]
+            accepted_schemas = {
+                1: SCHEMA,
+                2: SCHEMA | WAKE_SCHEMA_V2,
+                3: SCHEMA | WAKE_SCHEMA,
+                4: SCHEMA | WAKE_SCHEMA | APPROVAL_SCHEMA_V4,
+                5: SCHEMA | WAKE_SCHEMA | APPROVAL_SCHEMA,
+            }
             require(
                 (not tables and version == 0 and create)
-                or (tables == set(SCHEMA) and version == 1)
-                or (tables == set(SCHEMA) | set(WAKE_SCHEMA) and version == 2),
+                or (version in accepted_schemas and tables == set(accepted_schemas[version])),
                 "notify_migration_failed",
             )
             if tables:
-                schema = SCHEMA if version == 1 else SCHEMA | WAKE_SCHEMA
-                expected_indexes = INDEXES_V1 if version == 1 else INDEXES_V1 | WAKE_INDEXES
+                schema = accepted_schemas[version]
+                expected_indexes = (
+                    INDEXES_V1 if version == 1 else
+                    INDEXES_V1 | WAKE_INDEXES if version in {2, 3} else
+                    INDEXES_V1 | WAKE_INDEXES | (APPROVAL_INDEXES_V4 if version == 4 else APPROVAL_INDEXES)
+                )
                 reference = sqlite3.connect(":memory:")
                 try:
                     for table, columns in schema.items():
@@ -294,20 +363,69 @@ class State:
             self.db.execute("PRAGMA foreign_keys=ON")
             if not tables:
                 with self.transaction():
-                    for table, columns in (SCHEMA | WAKE_SCHEMA).items():
+                    for table, columns in (SCHEMA | WAKE_SCHEMA | APPROVAL_SCHEMA).items():
                         self.db.execute(f"CREATE TABLE {table} ({columns})")
-                    for statement in (INDEXES_V1 | WAKE_INDEXES).values():
+                    for statement in (INDEXES_V1 | WAKE_INDEXES | APPROVAL_INDEXES).values():
                         self.db.execute(statement)
-                    self.db.execute("PRAGMA user_version=2")
+                    self.db.execute("PRAGMA user_version=5")
             elif version == 1:
-                # The only accepted upgrade is the exact shipped 0.4.0 schema.
-                # Validate it above, then add wake storage atomically without touching rows.
+                # Accept only the exact shipped 0.4.0 schema, then apply the
+                # known wake and approval additions atomically.
                 with self.transaction():
-                    for table, columns in WAKE_SCHEMA.items():
+                    for table, columns in WAKE_SCHEMA_V2.items():
                         self.db.execute(f"CREATE TABLE {table} ({columns})")
                     for statement in WAKE_INDEXES.values():
                         self.db.execute(statement)
-                    self.db.execute("PRAGMA user_version=2")
+                    self.db.execute(
+                        "ALTER TABLE wake_subscriptions ADD COLUMN completion_filter TEXT NOT NULL DEFAULT 'any'"
+                    )
+                    for table, columns in APPROVAL_SCHEMA.items():
+                        self.db.execute(f"CREATE TABLE {table} ({columns})")
+                    for statement in APPROVAL_INDEXES.values():
+                        self.db.execute(statement)
+                    self.db.execute("PRAGMA user_version=5")
+            elif version == 2:
+                # Upgrade the exact shipped 0.5.0 wake schema without replacing rows.
+                with self.transaction():
+                    self.db.execute(
+                        "ALTER TABLE wake_subscriptions ADD COLUMN completion_filter TEXT NOT NULL DEFAULT 'any'"
+                    )
+                    for table, columns in APPROVAL_SCHEMA.items():
+                        self.db.execute(f"CREATE TABLE {table} ({columns})")
+                    for statement in APPROVAL_INDEXES.values():
+                        self.db.execute(statement)
+                    self.db.execute("PRAGMA user_version=5")
+            elif version == 3:
+                # Add only approval mapping/outbox storage; existing notify rows remain untouched.
+                with self.transaction():
+                    for table, columns in APPROVAL_SCHEMA.items():
+                        self.db.execute(f"CREATE TABLE {table} ({columns})")
+                    for statement in APPROVAL_INDEXES.values():
+                        self.db.execute(statement)
+                    self.db.execute("PRAGMA user_version=5")
+            elif version == 4:
+                # Preserve v4 approval receipts but block mappings that lack the
+                # agent/project identity required for a safe read-only correlation.
+                with self.transaction():
+                    self.db.execute("DROP INDEX approval_due")
+                    self.db.execute("DROP INDEX approval_workspace")
+                    self.db.execute("ALTER TABLE approval_mappings ADD COLUMN agent_id TEXT NOT NULL DEFAULT ''")
+                    self.db.execute("ALTER TABLE approval_mappings ADD COLUMN project_id TEXT NOT NULL DEFAULT ''")
+                    self.db.execute("ALTER TABLE approval_mappings ADD COLUMN next_check_at REAL")
+                    self.db.execute("ALTER TABLE approval_jobs ADD COLUMN next_check_at REAL")
+                    self.db.execute(
+                        "UPDATE approval_mappings SET status='blocked',delivery_status='blocked',"
+                        "detail='approval_mapping_legacy_unverified',updated_at=? WHERE status IN ('pending','ready')",
+                        (time.time(),),
+                    )
+                    self.db.execute(
+                        "UPDATE approval_jobs SET status='dead',last_error='approval_mapping_legacy_unverified',updated_at=? "
+                        "WHERE status='pending' AND mapping_id IN (SELECT mapping_id FROM approval_mappings WHERE status='blocked')",
+                        (time.time(),),
+                    )
+                    for statement in APPROVAL_INDEXES.values():
+                        self.db.execute(statement)
+                    self.db.execute("PRAGMA user_version=5")
             self.db.execute("PRAGMA journal_mode=WAL")
             os.chmod(path, 0o600)
         except (sqlite3.Error, NotifyError):
@@ -545,7 +663,8 @@ class State:
         by_route = {value["route"]: value for value in routes.values()}
         with self.transaction() as db:
             rows = db.execute(
-                """SELECT ws.subscription_id,ws.route,ws.profile,s.enabled AS source_enabled,
+                """SELECT ws.subscription_id,ws.route,ws.profile,ws.completion_filter,
+                s.enabled AS source_enabled,
                 a.configured AS account_configured,w.configured AS workspace_configured,
                 w.enabled AS workspace_enabled FROM wake_subscriptions ws
                 JOIN subscriptions s ON s.id=ws.subscription_id
@@ -558,6 +677,8 @@ class State:
                     reason = "wake_route_removed"
                 elif route["profile"] != row["profile"]:
                     reason = "wake_route_profile_mismatch"
+                elif route.get("completion_filter", "any") != row["completion_filter"]:
+                    reason = "wake_completion_filter_changed"
                 elif not row["source_enabled"]:
                     reason = "subscription_disabled"
                 elif not row["account_configured"] or not row["workspace_configured"] or not row["workspace_enabled"]:
@@ -578,7 +699,9 @@ class State:
     ) -> str:
         now = now or time.time()
         profile, route = route_config.get("profile"), route_config.get("route")
+        completion_filter = route_config.get("completion_filter", "any")
         require(profile in {"default", "om73"} and isinstance(route, str), "wake_subscription_invalid")
+        require(completion_filter in {"any", "root_only", "explicit_issues"}, "wake_subscription_invalid")
         try:
             with self.transaction() as db:
                 source = db.execute(
@@ -600,16 +723,18 @@ class State:
                 )
                 require(
                     (source["platform"] == "telegram" and source["chat_type"] == "thread" and bool(source["thread_id"]))
-                    or (source["platform"] == "max" and source["chat_type"] == "group" and not source["thread_id"]),
+                    or (source["platform"] == "max" and source["chat_type"] in {"group", "dm"} and not source["thread_id"]),
                     "wake_destination_invalid",
                 )
                 existing = db.execute(
-                    "SELECT profile,route,enabled FROM wake_subscriptions WHERE subscription_id=?",
+                    "SELECT profile,route,enabled,completion_filter FROM wake_subscriptions WHERE subscription_id=?",
                     (subscription_id,),
                 ).fetchone()
                 if existing:
                     require(
-                        existing["profile"] == profile and existing["route"] == route,
+                        existing["profile"] == profile
+                        and existing["route"] == route
+                        and existing["completion_filter"] == completion_filter,
                         "wake_subscription_conflict",
                     )
                     if enabled and not existing["enabled"]:
@@ -624,8 +749,8 @@ class State:
                     return subscription_id
                 db.execute(
                     """INSERT INTO wake_subscriptions
-                    (subscription_id,profile,route,statuses_json,enabled,enabled_since,created_at,updated_at)
-                    VALUES(?,?,?,?,?,?,?,?)""",
+                    (subscription_id,profile,route,statuses_json,enabled,enabled_since,created_at,updated_at,completion_filter)
+                    VALUES(?,?,?,?,?,?,?,?,?)""",
                     (
                         subscription_id,
                         profile,
@@ -635,6 +760,7 @@ class State:
                         now if enabled else None,
                         now,
                         now,
+                        completion_filter,
                     ),
                 )
                 db.execute(
@@ -687,6 +813,7 @@ class State:
     def wake_subscriptions(self) -> list[dict]:
         return self.rows(
             """SELECT ws.subscription_id,ws.profile,ws.route,ws.statuses_json,ws.enabled,
+            ws.completion_filter,
             ws.enabled_since,ws.disabled_reason,ws.created_at,ws.updated_at,s.label,s.workspace_id
             FROM wake_subscriptions ws JOIN subscriptions s ON s.id=ws.subscription_id
             ORDER BY ws.created_at"""
@@ -694,7 +821,7 @@ class State:
 
     def wake_binding(self, subscription_id: str) -> dict:
         rows = self.rows(
-            """SELECT ws.profile,ws.route,s.platform,s.chat_id,s.thread_id,s.chat_type,
+            """SELECT ws.profile,ws.route,ws.completion_filter,s.platform,s.chat_id,s.thread_id,s.chat_type,
             s.workspace_id,s.project_id,s.enabled FROM wake_subscriptions ws
             JOIN subscriptions s ON s.id=ws.subscription_id WHERE ws.subscription_id=?""",
             (subscription_id,),
@@ -1249,6 +1376,325 @@ class State:
                 AND payload_json IS NOT NULL AND updated_at<?""",
                 (now - 30 * 86400,),
             )
+
+    def approval_route(self, profile: str, route: str) -> dict | None:
+        rows = self.rows(
+            """SELECT ws.subscription_id,ws.profile,ws.route,ws.enabled AS wake_enabled,
+                s.*,w.id AS workspace_key,w.origin,w.workspace_id AS external_workspace_id,w.data_json AS workspace_data,
+                w.configured AS workspace_configured,w.enabled AS workspace_enabled,
+                a.configured AS account_configured,a.platform AS account_platform
+                FROM wake_subscriptions ws JOIN subscriptions s ON s.id=ws.subscription_id
+                JOIN workspaces w ON w.id=s.workspace_id JOIN accounts a ON a.name=s.account
+                WHERE ws.profile=? AND ws.route=? LIMIT 2""",
+            (profile, route),
+        )
+        return rows[0] if len(rows) == 1 else None
+
+    def approval_mapping(
+        self, connection_id: str, workspace_id: str, profile: str, parent_issue_id: str,
+    ) -> dict | None:
+        rows = self.rows(
+            """SELECT * FROM approval_mappings WHERE connection_id=? AND workspace_id=?
+            AND source_profile=? AND parent_issue_id=?""",
+            (connection_id, workspace_id, profile, parent_issue_id),
+        )
+        return rows[0] if len(rows) == 1 else None
+
+    def put_approval_mapping(self, mapping: dict[str, Any]) -> tuple[str, bool]:
+        """Insert an immutable, instance-namespaced approval mapping."""
+        identity = (
+            mapping["connection_id"], mapping["workspace_id"], mapping["source_profile"],
+            mapping["parent_issue_id"],
+        )
+        immutable = (
+            mapping["wakeup_id"], mapping["route_id"], mapping["subscription_id"],
+            mapping["instruction"], mapping["agent_id"], mapping["project_id"],
+            mapping.get("expires_at"), mapping["child_ids_json"], mapping["tree_fingerprint"],
+        )
+        mapping_id = hashlib.sha256("\0".join(identity).encode("utf-8")).hexdigest()
+        now = time.time()
+        with self.transaction() as db:
+            row = db.execute(
+                """SELECT * FROM approval_mappings WHERE connection_id=? AND workspace_id=?
+                AND source_profile=? AND parent_issue_id=?""",
+                identity,
+            ).fetchone()
+            if row is not None:
+                current = (
+                    row["wakeup_id"], row["route_id"], row["subscription_id"], row["instruction"],
+                    row["agent_id"], row["project_id"], row["expires_at"],
+                    row["child_ids_json"], row["tree_fingerprint"],
+                )
+                require(current == immutable, "approval_mapping_conflict")
+                return row["mapping_id"], False
+            conflict = db.execute(
+                """SELECT mapping_id FROM approval_mappings WHERE connection_id=? AND workspace_id=?
+                AND source_profile=? AND wakeup_id=?""",
+                (identity[0], identity[1], identity[2], mapping["wakeup_id"]),
+            ).fetchone()
+            require(conflict is None, "approval_mapping_conflict")
+            db.execute(
+                """INSERT INTO approval_mappings(
+                    mapping_id,connection_id,workspace_id,workspace_key,source_profile,parent_issue_id,
+                    wakeup_id,route_id,subscription_id,instruction,expires_at,child_ids_json,tree_fingerprint,
+                    agent_id,project_id,
+                    status,delivery_status,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending','pending',?,?)""",
+                (mapping_id, mapping["connection_id"], mapping["workspace_id"], mapping["workspace_key"],
+                 mapping["source_profile"], mapping["parent_issue_id"], mapping["wakeup_id"],
+                 mapping["route_id"], mapping["subscription_id"], mapping["instruction"],
+                 mapping.get("expires_at"), mapping["child_ids_json"], mapping["tree_fingerprint"],
+                 mapping["agent_id"], mapping["project_id"], now, now),
+            )
+        return mapping_id, True
+
+    def approval_mappings(
+        self, now: float, *, workspace_key: str | None = None, limit: int = 20,
+    ) -> list[dict]:
+        require(type(limit) is int and 1 <= limit <= 100, "approval_mapping_invalid")
+        sql = "SELECT * FROM approval_mappings WHERE status='pending' AND (next_check_at IS NULL OR next_check_at<=?)"
+        params: list[Any] = [now]
+        if workspace_key is not None:
+            sql += " AND workspace_key=?"
+            params.append(workspace_key)
+        sql += " ORDER BY COALESCE(next_check_at,created_at),created_at LIMIT ?"
+        params.append(limit)
+        return self.rows(sql, tuple(params))
+
+    def approval_defer_mapping(self, mapping_id: str, code: str, delay: int = 15) -> None:
+        safe_code = (
+            code
+            if re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code or "")
+            else "approval_source_unavailable"
+        )
+        require(type(delay) is int and 1 <= delay <= 300, "approval_mapping_invalid")
+        now = time.time()
+        with self.transaction() as db:
+            db.execute(
+                "UPDATE approval_mappings SET next_check_at=?,detail=?,updated_at=? WHERE mapping_id=? AND status='pending'",
+                (now + delay, safe_code, now, mapping_id),
+            )
+
+    def approval_block(self, mapping_id: str, code: str) -> None:
+        safe_code = code if re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code or "") else "approval_blocked"
+        with self.transaction() as db:
+            db.execute(
+                "UPDATE approval_mappings SET status='blocked',delivery_status='blocked',detail=?,updated_at=? WHERE mapping_id=? AND status='pending'",
+                (safe_code, time.time(), mapping_id),
+            )
+
+    def approval_defer_unclaimed(self, job_id: str, code: str, delay: int = 15) -> None:
+        safe_code = (
+            code
+            if re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code or "")
+            else "approval_delivery_unavailable"
+        )
+        require(type(delay) is int and 1 <= delay <= 300, "approval_mapping_invalid")
+        now = time.time()
+        with self.transaction() as db:
+            db.execute(
+                "UPDATE approval_jobs SET next_check_at=?,last_error=?,updated_at=? WHERE id=? AND status='pending' AND attempts=0",
+                (now + delay, safe_code, now, job_id),
+            )
+
+    def approval_reject_unclaimed(self, job_id: str, code: str) -> None:
+        safe_code = (
+            code
+            if re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code or "")
+            else "approval_delivery_rejected"
+        )
+        now = time.time()
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT mapping_id FROM approval_jobs WHERE id=? AND status='pending' AND attempts=0",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                return
+            db.execute(
+                "UPDATE approval_jobs SET status='dead',last_error=?,payload_json='',updated_at=? WHERE id=? AND status='pending' AND attempts=0",
+                (safe_code, now, job_id),
+            )
+            db.execute(
+                "UPDATE approval_mappings SET status='blocked',delivery_status='dead',detail=?,updated_at=? WHERE mapping_id=? AND status='ready'",
+                (safe_code, now, row["mapping_id"]),
+            )
+
+    def approval_enqueue(
+        self, mapping_id: str, run_id: str, text: str, child_statuses: list[str],
+    ) -> str | None:
+        if not isinstance(text, str) or not text.strip() or len(text) > 3500:
+            raise NotifyError("approval_payload_invalid")
+        if (not isinstance(child_statuses, list) or not child_statuses or len(child_statuses) > 500
+                or any(not isinstance(value, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", value)
+                       for value in child_statuses)):
+            raise NotifyError("approval_payload_invalid")
+        now = time.time()
+        with self.transaction() as db:
+            mapping = db.execute("SELECT * FROM approval_mappings WHERE mapping_id=?", (mapping_id,)).fetchone()
+            if not mapping or mapping["status"] != "pending":
+                return None
+            existing = db.execute(
+                "SELECT id FROM approval_jobs WHERE mapping_id=? AND run_id=?",
+                (mapping_id, run_id),
+            ).fetchone()
+            if existing:
+                return existing["id"]
+            destination = db.execute(
+                """SELECT s.*,a.configured AS account_configured,w.configured AS workspace_configured,
+                    w.enabled AS workspace_enabled FROM subscriptions s
+                    JOIN accounts a ON a.name=s.account JOIN workspaces w ON w.id=s.workspace_id
+                    JOIN wake_subscriptions ws ON ws.subscription_id=s.id
+                    WHERE s.id=? AND ws.profile=? AND ws.route=? AND ws.enabled=1""",
+                (mapping["subscription_id"], mapping["source_profile"], mapping["route_id"]),
+            ).fetchone()
+            require(
+                destination is not None and destination["enabled"] and destination["account_configured"]
+                and destination["workspace_configured"] and destination["workspace_enabled"],
+                "approval_ready_destination_unverified",
+            )
+            payload = {
+                key: destination[key]
+                for key in ("platform", "account", "chat_id", "thread_id", "chat_type", "anchor_message_id")
+            }
+            payload.update(text=text.strip(), event_type="task.ready_for_approval")
+            payload["approval_audit"] = {
+                "parent_issue_id": mapping["parent_issue_id"],
+                "wakeup_id": mapping["wakeup_id"],
+                "run_id": run_id,
+                "route_id": mapping["route_id"],
+                "child_statuses": list(child_statuses),
+            }
+            payload_json = encoded(payload)
+            require(len(payload_json.encode("utf-8")) <= 16 * 1024, "approval_payload_invalid")
+            job_id = str(uuid.uuid4())
+            event_key = f"approval:{mapping['wakeup_id']}:{run_id}"
+            db.execute(
+                """INSERT INTO approval_jobs(id,mapping_id,event_key,run_id,payload_json,status,created_at,updated_at)
+                VALUES(?,?,?,?,?,'pending',?,?)""",
+                (job_id, mapping_id, event_key, run_id, payload_json, now, now),
+            )
+            db.execute(
+                "UPDATE approval_mappings SET status='ready',last_run_id=?,delivery_status='pending',updated_at=? WHERE mapping_id=? AND status='pending'",
+                (run_id, now, mapping_id),
+            )
+            return job_id
+
+    def approval_due(self, now: float) -> list[dict]:
+        with self.transaction() as db:
+            stale = db.execute(
+                """SELECT mapping_id FROM approval_jobs WHERE status='sending' AND lease_until<=?""",
+                (now,),
+            ).fetchall()
+            db.execute(
+                """UPDATE approval_jobs SET status='delivery_unknown',last_error='process_interrupted',updated_at=?
+                WHERE status='sending' AND lease_until<=?""",
+                (now, now),
+            )
+            for row in stale:
+                db.execute(
+                    "UPDATE approval_mappings SET status='delivery_unknown',delivery_status='delivery_unknown',detail='process_interrupted',updated_at=? WHERE mapping_id=? AND status='ready'",
+                    (now, row["mapping_id"]),
+                )
+            return [dict(row) for row in db.execute(
+                """SELECT j.*,m.route_id,m.source_profile,m.subscription_id FROM approval_jobs j
+                JOIN approval_mappings m ON m.mapping_id=j.mapping_id
+                JOIN subscriptions s ON s.id=m.subscription_id
+                JOIN accounts a ON a.name=s.account JOIN workspaces w ON w.id=s.workspace_id
+                JOIN wake_subscriptions ws ON ws.subscription_id=s.id
+                WHERE j.status='pending' AND (j.next_check_at IS NULL OR j.next_check_at<=?)
+                AND m.status='ready' AND s.enabled=1 AND a.configured=1
+                AND w.configured=1 AND w.enabled=1 AND ws.enabled=1
+                AND ws.route=m.route_id AND ws.profile=m.source_profile
+                ORDER BY j.created_at LIMIT 100""",
+                (now,),
+            )]
+
+    def approval_claim(self, job_id: str, now: float, lease: int = 300) -> dict | None:
+        with self.transaction() as db:
+            row = db.execute(
+                """SELECT j.*,m.status AS mapping_status,m.route_id,m.source_profile,m.subscription_id
+                FROM approval_jobs j JOIN approval_mappings m ON m.mapping_id=j.mapping_id
+                JOIN subscriptions s ON s.id=m.subscription_id
+                JOIN accounts a ON a.name=s.account JOIN workspaces w ON w.id=s.workspace_id
+                JOIN wake_subscriptions ws ON ws.subscription_id=s.id
+                WHERE j.id=? AND j.status='pending' AND j.attempts=0
+                AND (j.next_check_at IS NULL OR j.next_check_at<=?)
+                AND m.status='ready' AND ws.enabled=1
+                AND ws.route=m.route_id AND ws.profile=m.source_profile
+                AND s.enabled=1 AND a.configured=1 AND w.configured=1 AND w.enabled=1""",
+                (job_id, now),
+            ).fetchone()
+            if row is None:
+                return None
+            try:
+                payload = json.loads(row["payload_json"])
+            except (TypeError, ValueError, RecursionError):
+                db.execute(
+                    "UPDATE approval_jobs SET status='dead',last_error='approval_payload_invalid',updated_at=? WHERE id=? AND status='pending'",
+                    (now, job_id),
+                )
+                db.execute(
+                    "UPDATE approval_mappings SET status='blocked',delivery_status='dead',detail='approval_payload_invalid',updated_at=? WHERE mapping_id=? AND status='ready'",
+                    (now, row["mapping_id"]),
+                )
+                return None
+            if not isinstance(payload, dict) or payload.get("event_type") != "task.ready_for_approval":
+                db.execute(
+                    "UPDATE approval_jobs SET status='dead',last_error='approval_payload_invalid',updated_at=? WHERE id=? AND status='pending'",
+                    (now, job_id),
+                )
+                db.execute(
+                    "UPDATE approval_mappings SET status='blocked',delivery_status='dead',detail='approval_payload_invalid',updated_at=? WHERE mapping_id=? AND status='ready'",
+                    (now, row["mapping_id"]),
+                )
+                return None
+            destination = db.execute("SELECT * FROM subscriptions WHERE id=?", (row["subscription_id"],)).fetchone()
+            keys = ("platform", "account", "chat_id", "thread_id", "chat_type", "anchor_message_id")
+            if any(payload.get(key) != destination[key] for key in keys):
+                db.execute(
+                    "UPDATE approval_jobs SET status='dead',last_error='approval_destination_changed',updated_at=? WHERE id=?",
+                    (now, job_id),
+                )
+                db.execute(
+                    "UPDATE approval_mappings SET status='blocked',delivery_status='dead',detail='approval_destination_changed',updated_at=? WHERE mapping_id=?",
+                    (now, row["mapping_id"]),
+                )
+                return None
+            lease_token = str(uuid.uuid4())
+            db.execute(
+                "UPDATE approval_jobs SET status='sending',attempts=attempts+1,lease_token=?,lease_until=?,next_check_at=NULL,updated_at=? WHERE id=? AND status='pending' AND attempts=0",
+                (lease_token, now + lease, now, job_id),
+            )
+            return dict(db.execute("SELECT * FROM approval_jobs WHERE id=?", (job_id,)).fetchone())
+
+    def approval_finish(self, claim: dict, outcome: str, detail: str) -> bool:
+        if outcome not in {"delivered", "dead", "delivery_unknown"}:
+            raise ValueError("invalid approval delivery outcome")
+        now = time.time()
+        with self.transaction() as db:
+            cursor = db.execute(
+                "UPDATE approval_jobs SET status=?,payload_json=CASE WHEN ?='delivered' THEN '' ELSE payload_json END,last_error=?,lease_token=NULL,lease_until=NULL,updated_at=? WHERE id=? AND status='sending' AND lease_token=? AND attempts=?",
+                (outcome, outcome, detail[:128], now, claim["id"], claim["lease_token"], claim["attempts"]),
+            )
+            if cursor.rowcount != 1:
+                return False
+            mapping_state = "delivered" if outcome == "delivered" else "delivery_unknown" if outcome == "delivery_unknown" else "blocked"
+            db.execute(
+                "UPDATE approval_mappings SET status=?,delivery_status=?,detail=?,updated_at=? WHERE mapping_id=? AND status='ready'",
+                (mapping_state, outcome, detail[:128], now, claim["mapping_id"]),
+            )
+            return True
+
+    def approval_status(self) -> dict[str, int]:
+        result = {
+            row["status"]: row["count"]
+            for row in self.rows("SELECT status,COUNT(*) AS count FROM approval_jobs GROUP BY status")
+        }
+        result["mappings_pending"] = self.rows(
+            "SELECT COUNT(*) AS count FROM approval_mappings WHERE status='pending'"
+        )[0]["count"]
+        return result
 
     def status(self) -> dict:
         now = time.time()

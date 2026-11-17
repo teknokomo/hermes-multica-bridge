@@ -19,6 +19,8 @@ from bridge.errors import BridgeError
 from bridge.validation import strict_json_loads
 
 from .api import Multica
+from .approval import reconcile_mapping
+from .approval_ipc import ApprovalMappingServer
 from .config import (
     NotifyError,
     atomic_private,
@@ -31,7 +33,13 @@ from .delivery import Sender
 from .policy import reconcile
 from .readiness_ipc import ReadinessServer
 from .state import State, epoch
-from .wake import MAX_BODY_BYTES, WakeSender, load_webhook_policy
+from .wake import (
+    MAX_BODY_BYTES,
+    WakeSender,
+    load_webhook_policy,
+    verify_configured_route,
+    verify_webhook_policy,
+)
 
 LOG = logging.getLogger("hermes_multica_notify")
 EVENT_TYPES = {
@@ -81,15 +89,20 @@ class Service:
         )
         self.delivery_slots = asyncio.Semaphore(self.config.service["delivery_workers"])
         self.wake_slots = asyncio.Semaphore(self.config.service["delivery_workers"])
+        self.approval_slots = asyncio.Semaphore(self.config.service["delivery_workers"])
         # Dispatch remains serialized through completion: stalled workers cannot bunch
         # previously reserved slots into a burst. Collection runs independently.
         self.dispatch_lock = asyncio.Lock()
         self.scheduled: set[str] = set()
         self.wake_scheduled: set[str] = set()
+        self.approval_scheduled: set[str] = set()
         self.collectors: list[asyncio.Task] = []
         self.deliveries: set[asyncio.Task] = set()
         self.wake_deliveries: set[asyncio.Task] = set()
+        self.approval_deliveries: set[asyncio.Task] = set()
+        self.approval_reconciler_task: asyncio.Task | None = None
         self.readiness_ipc: ReadinessServer | None = None
+        self.approval_ipc: ApprovalMappingServer | None = None
 
     def scan(self, key: str, api: Multica, full: bool) -> None:
         now = time.time()
@@ -530,6 +543,222 @@ class Service:
         finally:
             self.wake_scheduled.discard(row["id"])
 
+    def approval_enabled(self, config=None) -> bool:
+        config = config or self.config
+        return bool(
+            config.approval_ipc.get("enabled") is True
+            and config.approval_ipc.get("native_delivery_suppressed") is True
+            and config.wake.get("enabled") is True
+        )
+
+    async def reconcile_approval_mappings(self) -> None:
+        if not self.approval_enabled():
+            return
+        mappings = await blocking(
+            self.state.approval_mappings, time.time(), limit=20
+        )
+        for mapping in mappings:
+            if self.stop.is_set():
+                return
+            status, job_id = await blocking(
+                reconcile_mapping,
+                self.state,
+                self.config,
+                mapping,
+                api_factory=self.api_factory,
+            )
+            if status in {"pending", "unavailable"}:
+                code = (
+                    "approval_run_pending"
+                    if status == "pending"
+                    else "approval_source_unavailable"
+                )
+                await blocking(
+                    self.state.approval_defer_mapping, mapping["mapping_id"], code
+                )
+            elif status == "ready" and job_id:
+                log("approval_ready_queued")
+            elif status == "blocked":
+                log("approval_mapping_blocked")
+
+    async def approval_reconcile_loop(self) -> None:
+        while not self.stop.is_set():
+            if self.approval_enabled():
+                try:
+                    await self.reconcile_approval_mappings()
+                except (NotifyError, OSError, sqlite3.Error, ValueError, TypeError):
+                    log("approval_reconcile_unavailable")
+            await self.pause(5)
+
+    def _approval_preflight(self, row: dict, config):
+        require(self.approval_enabled(config), "approval_delivery_disabled")
+        try:
+            payload = strict_json_loads(row["payload_json"])
+        except (ValueError, UnicodeError, RecursionError):
+            raise NotifyError("approval_payload_invalid") from None
+        fields = {
+            "platform", "account", "chat_id", "thread_id", "chat_type",
+            "anchor_message_id", "text", "event_type", "approval_audit",
+        }
+        require(isinstance(payload, dict) and set(payload) == fields, "approval_payload_invalid")
+        require(
+            payload.get("event_type") == "task.ready_for_approval"
+            and isinstance(payload.get("text"), str)
+            and bool(payload["text"].strip())
+            and len(payload["text"]) <= 3500
+            and payload.get("platform") in {"telegram", "max"}
+            and isinstance(payload.get("account"), str)
+            and isinstance(payload.get("chat_id"), str)
+            and bool(payload["chat_id"])
+            and isinstance(payload.get("thread_id"), str)
+            and payload.get("chat_type") in {"group", "thread", "dm"}
+            and (payload.get("anchor_message_id") is None or isinstance(payload.get("anchor_message_id"), str)),
+            "approval_payload_invalid",
+        )
+        audit = payload.get("approval_audit")
+        require(
+            isinstance(audit, dict)
+            and set(audit) == {"parent_issue_id", "wakeup_id", "run_id", "route_id", "child_statuses"}
+            and all(isinstance(audit.get(key), str) and audit[key] for key in (
+                "parent_issue_id", "wakeup_id", "run_id", "route_id",
+            ))
+            and audit["route_id"] == row["route_id"]
+            and isinstance(audit.get("child_statuses"), list)
+            and bool(audit["child_statuses"])
+            and all(status == "done" for status in audit["child_statuses"]),
+            "approval_payload_invalid",
+        )
+        verify_configured_route(
+            config.wake.get("routes", {}), row["source_profile"], row["route_id"]
+        )
+        policy = load_webhook_policy(Path(config.wake["webhook_policy_file"]))
+        verify_webhook_policy(
+            policy,
+            row["source_profile"],
+            row["route_id"],
+            {
+                "platform": payload["platform"],
+                "chat_id": payload["chat_id"],
+                "thread_id": payload["thread_id"],
+                "chat_type": payload["chat_type"],
+            },
+        )
+        account = config.accounts.get(payload["account"])
+        require(
+            account is not None and account["platform"] == payload["platform"],
+            "approval_ready_destination_unverified",
+        )
+        return payload, credential(account["token_credential"])
+
+    async def deliver_approval(self, row: dict) -> None:
+        claim = None
+        try:
+            async with self.approval_slots, self.dispatch_lock:
+                if self.stop.is_set():
+                    return
+                try:
+                    payload, _token = await blocking(
+                        self._approval_preflight, row, self.config
+                    )
+                except NotifyError as exc:
+                    await blocking(
+                        self.state.approval_defer_unclaimed, row["id"], exc.code
+                    )
+                    log("approval_delivery_deferred", code=exc.code)
+                    return
+                slot = await blocking(self.state.reserve, payload, time.time())
+                await self.pause(max(0, slot - time.time()))
+                if self.stop.is_set():
+                    return
+                try:
+                    payload, token = await blocking(
+                        self._approval_preflight, row, self.config
+                    )
+                except NotifyError as exc:
+                    await blocking(
+                        self.state.approval_defer_unclaimed, row["id"], exc.code
+                    )
+                    log("approval_delivery_deferred", code=exc.code)
+                    return
+                claim = await blocking(self.state.approval_claim, row["id"], time.time())
+                if claim is None:
+                    return
+                if self.stop.is_set():
+                    await blocking(
+                        self.state.approval_finish,
+                        claim,
+                        "dead",
+                        "approval_stopped_before_post",
+                    )
+                    return
+                try:
+                    result = await blocking(self.sender.send, payload, token)
+                    result_outcome = getattr(result, "outcome", None)
+                    result_code = getattr(result, "code", None)
+                except Exception:  # noqa: BLE001 - after claim, transport outcome may be uncertain
+                    await blocking(
+                        self.state.approval_finish,
+                        claim,
+                        "delivery_unknown",
+                        "approval_transport_uncertain",
+                    )
+                    log("approval_delivery_unknown", code="approval_transport_uncertain")
+                    return
+                finally:
+                    await blocking(
+                        self.state.reserve, payload, time.time(), completed=True
+                    )
+                outcome = (
+                    "delivered" if result_outcome == "delivered"
+                    else "dead" if result_outcome in {"terminal", "anchor"}
+                    else "delivery_unknown"
+                )
+                detail = (
+                    result_code
+                    if isinstance(result_code, str)
+                    and len(result_code) <= 128
+                    and result_code.isascii()
+                    and result_code.replace("_", "").isalnum()
+                    else "approval_result_invalid"
+                )
+                if outcome == "delivery_unknown":
+                    detail = "approval_transport_uncertain"
+                finished = await blocking(
+                    self.state.approval_finish, claim, outcome, detail
+                )
+                if finished:
+                    log(
+                        {
+                            "delivered": "approval_ready_delivered",
+                            "dead": "approval_ready_dead",
+                            "delivery_unknown": "approval_ready_unknown",
+                        }[outcome],
+                        code=detail,
+                    )
+        except (NotifyError, OSError, sqlite3.Error, ValueError, TypeError, KeyError):
+            if claim is not None:
+                try:
+                    await blocking(
+                        self.state.approval_finish,
+                        claim,
+                        "delivery_unknown",
+                        "approval_worker_uncertain",
+                    )
+                except Exception:  # noqa: BLE001 - preserve at-most-once after claim
+                    log("approval_finalize_uncertain", code="approval_worker_uncertain")
+            else:
+                try:
+                    await blocking(
+                        self.state.approval_defer_unclaimed,
+                        row["id"],
+                        "approval_worker_unavailable",
+                    )
+                except Exception:  # noqa: BLE001 - no transport attempt was claimed
+                    log("approval_defer_unavailable", code="approval_worker_unavailable")
+            log("approval_delivery_unavailable")
+        finally:
+            self.approval_scheduled.discard(row["id"])
+
     async def pause(self, delay: float) -> None:
         try:
             await asyncio.wait_for(self.stop.wait(), timeout=max(0.001, delay))
@@ -578,18 +807,31 @@ class Service:
                 for key in sorted(self.locks):
                     await stack.enter_async_context(self.locks[key])
                 next_ipc = self.readiness_ipc
+                next_approval_ipc = self.approval_ipc
                 started_ipc = False
+                started_approval_ipc = False
                 if candidate.readiness_ipc.get("enabled"):  # noqa: SIM102 - retain explicit reload staging branch
                     if next_ipc is None:
                         next_ipc = ReadinessServer(candidate, self.state)
                         await next_ipc.start(policy=candidate_policy)
                         started_ipc = True
                 try:
+                    if candidate.approval_ipc.get("enabled") and next_approval_ipc is None:
+                        next_approval_ipc = ApprovalMappingServer(candidate, self.state)
+                        await next_approval_ipc.start()
+                        started_approval_ipc = True
+                except Exception:
+                    if started_ipc and next_ipc is not None:
+                        await next_ipc.close()
+                    raise
+                try:
                     self.state.project(candidate)
                     self.state.project_wake_routes(candidate.wake.get("routes", {}))
                 except Exception:
                     if started_ipc and next_ipc is not None:
                         await next_ipc.close()
+                    if started_approval_ipc and next_approval_ipc is not None:
+                        await next_approval_ipc.close()
                     raise
                 if candidate.readiness_ipc.get("enabled"):
                     if not started_ipc and next_ipc is not None:
@@ -597,6 +839,12 @@ class Service:
                 elif next_ipc is not None:
                     await next_ipc.close()
                     next_ipc = None
+                if candidate.approval_ipc.get("enabled"):
+                    if not started_approval_ipc and next_approval_ipc is not None:
+                        await next_approval_ipc.refresh(candidate)
+                elif next_approval_ipc is not None:
+                    await next_approval_ipc.close()
+                    next_approval_ipc = None
                 for task in self.collectors:
                     task.cancel()
                 await asyncio.gather(*self.collectors, return_exceptions=True)
@@ -605,6 +853,7 @@ class Service:
                     db.execute("UPDATE cursors SET ws_connected=0")
                 self.config = candidate
                 self.readiness_ipc = next_ipc
+                self.approval_ipc = next_approval_ipc
                 self.full_slots = asyncio.Semaphore(
                     candidate.service["full_reconcile_parallelism"]
                 )
@@ -632,6 +881,9 @@ class Service:
             if self.config.readiness_ipc.get("enabled"):
                 self.readiness_ipc = ReadinessServer(self.config, self.state)
                 await self.readiness_ipc.start()
+            if self.config.approval_ipc.get("enabled"):
+                self.approval_ipc = ApprovalMappingServer(self.config, self.state)
+                await self.approval_ipc.start()
             with self.state.transaction() as db:
                 db.execute("UPDATE cursors SET ws_connected=0")
             start = Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[19]
@@ -646,9 +898,13 @@ class Service:
             for sig in (signal.SIGTERM, signal.SIGINT):
                 loop.add_signal_handler(sig, self.stop.set)
             self.start_collectors()
+            self.approval_reconciler_task = asyncio.create_task(
+                self.approval_reconcile_loop()
+            )
             last_prune = 0
             last_heartbeat = 0
             last_wake_expire = 0
+            last_approval_dispatch = 0
             while not self.stop.is_set():
                 if time.time() - last_heartbeat >= 1:
                     with self.state.transaction() as db:
@@ -677,6 +933,14 @@ class Service:
                             task = asyncio.create_task(self.deliver_wake(row))
                             self.wake_deliveries.add(task)
                             task.add_done_callback(self.wake_deliveries.discard)
+                if self.approval_enabled() and now - last_approval_dispatch >= 1:
+                    for row in self.state.approval_due(now):
+                        if row["id"] not in self.approval_scheduled:
+                            self.approval_scheduled.add(row["id"])
+                            task = asyncio.create_task(self.deliver_approval(row))
+                            self.approval_deliveries.add(task)
+                            task.add_done_callback(self.approval_deliveries.discard)
+                    last_approval_dispatch = now
                 if time.time() - last_prune > 60:
                     self.state.prune(self.config)
                     self.state.prune_wake()
@@ -687,12 +951,19 @@ class Service:
             if self.readiness_ipc is not None:
                 await self.readiness_ipc.close()
                 self.readiness_ipc = None
+            if self.approval_ipc is not None:
+                await self.approval_ipc.close()
+                self.approval_ipc = None
             for task in self.collectors:
                 task.cancel()
+            if self.approval_reconciler_task is not None:
+                self.approval_reconciler_task.cancel()
             await asyncio.gather(
                 *self.collectors,
                 *self.deliveries,
                 *self.wake_deliveries,
+                *self.approval_deliveries,
+                *((self.approval_reconciler_task,) if self.approval_reconciler_task is not None else ()),
                 return_exceptions=True,
             )
             if owns_lock:
