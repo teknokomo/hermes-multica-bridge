@@ -439,7 +439,7 @@ class WorkspaceRuntime:
 
     def _condition_wake_preflight(
         self, registry: ConnectionRegistry, route: RegistryRoute, project_id: str,
-    ) -> None:
+    ) -> str:
         settings = self._condition_wake_settings()
         if not settings["enabled"]:
             raise BridgeError("condition_wake_disabled", "Approval-ready wake is disabled for this profile.")
@@ -453,6 +453,10 @@ class WorkspaceRuntime:
         readiness = self._wake_readiness(registry, route, (project_id,))
         if not readiness or len(readiness) != 1 or not readiness[0].get("wake_ready"):
             raise BridgeError("approval_ready_destination_unverified", "Notify has no verified completion destination for this project.")
+        wake_route_id = readiness[0].get("wake_route_id")
+        if not isinstance(wake_route_id, str) or not wake_route_id:
+            raise BridgeError("approval_ready_destination_unverified", "Notify did not identify the verified completion route.")
+        return wake_route_id
 
     @staticmethod
     def _condition_wake_hash(spec: ConditionWakeSpec) -> str:
@@ -491,13 +495,19 @@ class WorkspaceRuntime:
         )
         if intent is None or intent["route_id"] != route.route_id:
             raise BridgeError("condition_wake_pending", "No matching condition-wake intent exists for this parent.")
+        allow_expired_restore = (
+            intent.get("status") == "registered" and isinstance(intent.get("wakeup_id"), str)
+            and bool(intent.get("wakeup_id"))
+        )
         try:
-            saved_spec = ConditionWakeSpec.from_canonical(json.loads(intent["config_json"]))
+            saved_spec = ConditionWakeSpec.from_canonical(
+                json.loads(intent["config_json"]), allow_expired=allow_expired_restore,
+            )
         except (ValueError, TypeError, RecursionError):
             raise BridgeError("condition_wake_invalid", "The saved condition-wake request is invalid.") from None
         if saved_spec.canonical() != spec.canonical():
             raise BridgeError("operation_conflict", "The condition-wake request differs from the saved intent.")
-        self._condition_wake_preflight(registry, route, issue.get("project_id"))
+        notify_route_id = self._condition_wake_preflight(registry, route, issue.get("project_id"))
         try:
             children, fingerprint = validate_child_tree(
                 api.list_issue_children(parent_id), parent_id=parent_id,
@@ -507,6 +517,15 @@ class WorkspaceRuntime:
             raise
         except Exception:  # noqa: BLE001 - read adapter errors are a stable public boundary
             raise BridgeError("approval_wake_unavailable", "The child plan could not be verified.") from None
+        mapping_preflight = {
+            "version": 1, "op": "approval_mapping.put", "parent_issue_id": parent_id,
+            "wakeup_id": "w" * 128, "route_id": notify_route_id,
+            "bridge_route_id": route.route_id, "source_profile": self._profile(),
+            "instruction": spec.instruction, "expires_at": 253_402_300_799.0,
+            "registered_child_ids": [row["id"] for row in children],
+            "registered_tree_fingerprint": fingerprint,
+        }
+        ApprovalMappingClient.encode_request(mapping_preflight)
         expected_expiry = spec.expires_at or (time.time() + (spec.expires_in_seconds or 0))
         action = state.begin_condition_wake_registration(
             intent["intent_key"], children=children, fingerprint=fingerprint,
@@ -516,6 +535,20 @@ class WorkspaceRuntime:
             connection_id=route.connection_id, workspace_id=workspace.workspace_id,
             source_profile=self._profile(), parent_issue_id=parent_id,
         )
+        if (registration_intent is None
+                or not isinstance(registration_intent.get("children_json"), str)
+                or not isinstance(registration_intent.get("tree_fingerprint"), str)):
+            raise BridgeError("approval_wake_unavailable", "The saved child plan could not be verified.")
+        try:
+            registered_children = json.loads(registration_intent["children_json"])
+        except (ValueError, TypeError, RecursionError):
+            raise BridgeError("approval_wake_unavailable", "The saved child plan could not be verified.") from None
+        if (not isinstance(registered_children, list)
+                or any(not isinstance(row, dict) or set(row) != {"id", "stage"}
+                       or not isinstance(row.get("id"), str) for row in registered_children)
+                or [row["id"] for row in registered_children] != [row["id"] for row in children]
+                or registration_intent["tree_fingerprint"] != fingerprint):
+            raise BridgeError("condition_wake_stage_mismatch", "The saved child plan has changed.")
         registration_expiry = (
             registration_intent.get("wakeup_expires_at")
             if registration_intent is not None else None
@@ -582,9 +615,12 @@ class WorkspaceRuntime:
         )
         request = {
             "version": 1, "op": "approval_mapping.put", "parent_issue_id": parent_id,
-            "wakeup_id": wakeup["id"], "route_id": route.route_id,
+            "wakeup_id": wakeup["id"], "route_id": notify_route_id,
+            "bridge_route_id": route.route_id,
             "source_profile": self._profile(), "instruction": spec.instruction,
             "expires_at": current["wakeup_expires_at"],
+            "registered_child_ids": [row["id"] for row in registered_children],
+            "registered_tree_fingerprint": registration_intent["tree_fingerprint"],
         }
         try:
             mapping_status = ApprovalMappingClient().put(request)
@@ -1393,7 +1429,9 @@ class WorkspaceRuntime:
                 "route_id", "issue_id", "title", "description", "status", "assignee_id",
                 "assignee_type", "related_issue_ids", "condition_wake",
             })
-            condition_spec = parse_condition_wake(args["condition_wake"]) if "condition_wake" in args else None
+            condition_present = "condition_wake" in args
+            condition_request = args.get("condition_wake")
+            condition_spec = None
             registry = self._registry()
             route = self._route(registry, tool_context, route_id)
             issue_id = args.get("issue_id")
@@ -1429,13 +1467,35 @@ class WorkspaceRuntime:
             issue = api.get_issue(issue_id)
             self._verify_issue_scope(api, issue, registry, route)
             state = self._state()
+            condition_intent = None
+            allow_expired_restore = False
+            if condition_present:
+                workspace_id = registry.workspace(route.workspace_key).workspace_id
+                condition_intent = state.condition_wake_intent(
+                    connection_id=route.connection_id,
+                    workspace_id=workspace_id,
+                    source_profile=self._profile(),
+                    parent_issue_id=issue_id,
+                )
+                allow_expired_restore = (
+                    condition_intent is not None
+                    and condition_intent.get("route_id") == route.route_id
+                    and condition_intent.get("status") == "registered"
+                    and isinstance(condition_intent.get("wakeup_id"), str)
+                    and bool(condition_intent.get("wakeup_id"))
+                )
+                condition_spec = parse_condition_wake(
+                    condition_request, allow_expired=allow_expired_restore,
+                )
             if condition_spec is not None:
                 self._condition_wake_preflight(registry, route, issue.get("project_id"))
                 if runtime_request is not None:
                     try:
                         runtime_payload = json.loads(runtime_request["payload_json"])
                         stored_condition = runtime_payload.get("condition_wake") if isinstance(runtime_payload, dict) else None
-                        stored_spec = ConditionWakeSpec.from_canonical(stored_condition)
+                        stored_spec = ConditionWakeSpec.from_canonical(
+                            stored_condition, allow_expired=allow_expired_restore,
+                        )
                         stored_source = runtime_payload.get("source", {})
                         if (not isinstance(stored_source, dict)
                                 or stored_source.get("profile") != self._profile()
@@ -1447,15 +1507,13 @@ class WorkspaceRuntime:
                         raise BridgeError("condition_wake_pending", "The runtime task has no valid saved condition-wake intent.") from None
                     self._persist_condition_wake_intent(state, registry, route, issue_id, stored_spec)
                 else:
-                    intent = state.condition_wake_intent(
-                        connection_id=route.connection_id,
-                        workspace_id=registry.workspace(route.workspace_key).workspace_id,
-                        source_profile=self._profile(), parent_issue_id=issue_id,
-                    )
+                    intent = condition_intent
                     if intent is None:
                         raise BridgeError("condition_wake_pending", "Create this parent with condition_wake before registering its stage plan.")
                     try:
-                        saved = ConditionWakeSpec.from_canonical(json.loads(intent["config_json"]))
+                        saved = ConditionWakeSpec.from_canonical(
+                            json.loads(intent["config_json"]), allow_expired=allow_expired_restore,
+                        )
                     except (ValueError, TypeError, RecursionError):
                         raise BridgeError("condition_wake_invalid", "The saved condition-wake request is invalid.") from None
                     if saved.canonical() != condition_spec.canonical():

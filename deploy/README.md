@@ -358,8 +358,6 @@ Hermes webhook route должен иметь точные `events = ["task.compl
 
 Для MAX direct message destination должен точно совпадать с MAX `user_id`, а `thread_id` оставаться пустым; подмена на group/parent chat запрещена. Telegram direct messages не поддерживаются. `completion_filter` принимает `any` (по умолчанию), `root_only` или `explicit_issues`; последний использует только операторский список в приватной конфигурации. При `root_only` отсутствие `parent_issue_id` закрывает wake fail closed.
 
-Для MAX direct message destination должен точно совпадать с MAX `user_id`, а `thread_id` оставаться пустым; подмена на group/parent chat запрещена. Telegram direct messages не поддерживаются. `completion_filter` принимает `any` (по умолчанию), `root_only` или `explicit_issues`; последний использует только операторский список в приватной конфигурации. При `root_only` отсутствие `parent_issue_id` закрывает wake fail closed.
-
 Одна автоматическая попытка POST не гарантирует exactly-once. `delivery_unknown` не повторяется автоматически. Перед `wake replay ID --confirm` оператор сверяет Hermes journal и целевой тред; тот же wake ID позволяет Hermes дедуплицировать уже принятый запрос, но доставка ответа всё ещё может быть неоднозначной.
 
 Откат: отключить wake-подписки, остановить notify и только затем восстановить согласованные БД/TOML/credential drop-ins. Не удаляйте receipts и сохранённые `delivery_unknown` без записи audit. Gateway restart выполняется только в согласованное окно и после готовности обоих профилей и тестовой цели.
@@ -388,19 +386,7 @@ Condition wake остаётся выключенным по умолчанию. 
 
 При авторизованной проверке parent сначала создаётся с локальным intent; следующий Workspace update валидирует полный child tree и stage-план, затем регистрирует один native `children_done` wakeup. При staged-конфигурации `stage` и `expected_stage_count` задаются парой и совпадают; unstaged не содержит ни одного поля. Число этапов ограничено 500, все номера от 1 до N должны присутствовать, дети должны иметь точные статусы `done`.
 
-Плагин отправляет в mapping socket только parent/wakeup/route/profile/instruction/expiry. Notify повторно проверяет scope read-only Multica API и принимает только однозначную связь parent, wakeup, run и сохранённых детей. Финальный `task.ready_for_approval` создаётся и отправляется только notify; он не закрывает parent и не выполняет human approval. Mapping socket имеет отдельные `SO_PEERCRED` UID/profile allowlist и кадр до 16 KiB, без доступа плагина к notify DB или credentials.
-
-Этот checkout не прошёл target-проверку подавления native-доставки: `native_delivery_suppressed` остаётся `false`. Не включайте функцию и не считайте локальные фикстуры подтверждением целевого поведения. E2E, установка и изменение живых маршрутов остаются отдельным этапом.
-
-## Condition wake и approval-ready 0.7.0
-
-Condition wake остаётся выключенным по умолчанию. Notify config также должен содержать `[approval_ipc]` с `enabled=false`, фиксированным socket `/run/hermes-multica-notify-approval/approval.sock`, `native_delivery_suppressed=false` и пустым `peers`. Unit создаёт отдельный runtime directory; не объединяйте этот mapping socket с read-only readiness socket.
-
-До включения оператор обязан доказать на точной целевой Hermes сборке, что native wake/run/comment не доставляет отдельное сообщение пользователю. Пока доказательства нет, оба флага остаются `false`, а `condition_wake` и approval-ready не используются. Локальные fixtures и успешная регистрация wakeup не подтверждают этот gate.
-
-При авторизованной проверке parent сначала создаётся с локальным intent; следующий Workspace update валидирует полный child tree и stage-план, затем регистрирует один native `children_done` wakeup. При staged-конфигурации `stage` и `expected_stage_count` задаются парой и совпадают; unstaged не содержит ни одного поля. Число этапов ограничено 500, все номера от 1 до N должны присутствовать, дети должны иметь точные статусы `done`.
-
-Плагин отправляет в mapping socket только parent/wakeup/route/profile/instruction/expiry. Notify повторно проверяет scope read-only Multica API и принимает только однозначную связь parent, wakeup, run и сохранённых детей. Финальный `task.ready_for_approval` создаётся и отправляется только notify; он не закрывает parent и не выполняет human approval. Mapping socket имеет отдельные `SO_PEERCRED` UID/profile allowlist и кадр до 16 KiB, без доступа плагина к notify DB или credentials.
+Плагин отправляет в mapping socket parent и native wakeup, проверенный notify route ID отдельно от bridge route ID, profile, instruction и expiry, а также зафиксированные child IDs и fingerprint дерева. Notify повторно проверяет scope через read-only Multica API и принимает только однозначную связь parent, wakeup, run и сохранённых детей. Финальный `task.ready_for_approval` создаётся и отправляется только notify; он не закрывает parent и не выполняет human approval. Mapping socket имеет отдельные `SO_PEERCRED` UID/profile allowlist и кадр до 16 KiB, без доступа плагина к notify DB или credentials.
 
 Этот checkout не прошёл target-проверку подавления native-доставки: `native_delivery_suppressed` остаётся `false`. Не включайте функцию и не считайте локальные фикстуры подтверждением целевого поведения. E2E, установка и изменение живых маршрутов остаются отдельным этапом.
 

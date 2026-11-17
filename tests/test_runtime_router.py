@@ -1495,6 +1495,50 @@ class RuntimeRouterTests(unittest.TestCase):
         self.assertEqual(resolution.runtime_id, RUNTIME_A)
         self.assertEqual(resolution.model, MODEL_A)
 
+    def test_worker_uses_origin_profile_model_policy_and_trusted_principal(self):
+        store = self.initialized_store()
+        raw_profile = json.loads(json.dumps(self.raw_config))
+        raw_profile["agents"]["canonical"]["allowed_models_by_runtime"] = {
+            RUNTIME_A: [MODEL_A, MODEL_B],
+            RUNTIME_B: [MODEL_B],
+        }
+        raw_profile["model_policy"] = {
+            "enabled": True,
+            "capability_source": "none",
+            "rules": [{
+                "id": "profile-principal-model",
+                "priority": 10,
+                "match": {"principal_ids": [PRINCIPAL]},
+                "model": MODEL_B,
+                "runtime_ids": [RUNTIME_A],
+            }],
+        }
+        raw_worker_config = json.loads(json.dumps(self.raw_config))
+        raw_worker_config["agents"]["canonical"]["allowed_models_by_runtime"] = {
+            RUNTIME_A: [MODEL_A, MODEL_B],
+            RUNTIME_B: [MODEL_B],
+        }
+        worker_config = RouterConfig.parse(raw_worker_config)
+        request, _created = self.enqueue(store, model=MODEL_B)
+        registry_mapping = workspace_router_registry()
+        self.set_valid_route_policy_hash(store, request, registry_mapping)
+        request = store.get(request["request_id"])
+        payload = json.loads(request["payload_json"])
+        registry = registry_from_mapping(registry_mapping)
+        worker = RouterWorker(worker_config, adapter=FakeAdapter())
+        worker.store = store
+
+        profile_config = worker._profile_model_config(
+            worker.config, {"runtime_router": raw_profile},
+        )
+        resolution = worker._resolution(
+            profile_config, request, registry.routes[0], payload, registry,
+        )
+
+        self.assertTrue(profile_config.model_policy.enabled)
+        self.assertEqual(resolution.model, MODEL_B)
+        self.assertEqual(resolution.model_rule_id, "profile-principal-model")
+
     def test_create_accepts_keep_current_without_persisted_binding(self):
         store = RouterStore(self.db_path)
         store.upsert_connector(CONNECTOR, "default", "telegram", "Test")
@@ -1535,6 +1579,58 @@ class RuntimeRouterTests(unittest.TestCase):
 
         self.assertTrue(result["ok"], result)
         self.assertEqual(store.get(result["request_id"])["state"], "queued")
+
+    def test_create_model_policy_can_select_by_trusted_principal(self):
+        store = self.initialized_store()
+        raw = json.loads(json.dumps(self.raw_config))
+        raw["agents"]["canonical"]["allowed_models_by_runtime"] = {
+            RUNTIME_A: [MODEL_A, MODEL_B],
+            RUNTIME_B: [MODEL_B],
+        }
+        raw["model_policy"] = {
+            "enabled": True,
+            "capability_source": "none",
+            "rules": [{
+                "id": "principal-model",
+                "priority": 10,
+                "match": {"principal_ids": [PRINCIPAL]},
+                "model": MODEL_B,
+                "runtime_ids": [RUNTIME_A],
+            }],
+        }
+        config = RouterConfig.parse(raw)
+        registry = registry_from_mapping(workspace_router_registry())
+        route = registry.routes[0]
+        source = {
+            **{key: value for key, value in source_context().items() if key != "profile"},
+            "thread_id": "123",
+            "chat_type": "thread",
+        }
+        tools = RuntimeRouterTools(SimpleNamespace())
+        tools._context = lambda _tool_context=None: (  # type: ignore[method-assign]
+            source,
+            "default",
+            config,
+            store,
+        )
+
+        with (
+            patch("runtime_router.tools.WorkspaceRuntime._registry", return_value=registry),
+            patch("runtime_router.tools.WorkspaceRuntime._route", return_value=route),
+            patch("runtime_router.tools.MulticaCliAdapter", return_value=FakeAdapter()),
+            patch(
+                "runtime_router.tools._load_hermes_context",
+                return_value=SimpleNamespace(source=source, attachments=[]),
+            ),
+        ):
+            result = json.loads(
+                tools.create({"route_id": ROUTE, "title": "Principal scoped model"})
+            )
+
+        self.assertTrue(result["ok"], result)
+        request = store.get(result["request_id"])
+        self.assertEqual(request["target_model"], MODEL_B)
+        self.assertEqual(request["target_model_rule_id"], "principal-model")
 
     def test_create_enforces_required_attachment_when_context_is_empty(self):
         store = self.initialized_store()

@@ -452,6 +452,7 @@ class RuntimeRouterTools:
                 exceptions=rules,
                 context={
                     **source,
+                    "principal_id": identity["principal_id"],
                     "agent_id": agent.agent_id,
                     "workspace_id": workspace.workspace_id,
                     "project_id": project_id,

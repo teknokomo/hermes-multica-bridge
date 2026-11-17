@@ -647,13 +647,22 @@ def test_schema_v4_migration_blocks_unverifiable_approval_mappings(ctx):
     for statement in (INDEXES_V1 | WAKE_INDEXES | APPROVAL_INDEXES_V4).values():
         db.execute(statement)
     now = time.time()
+    for mapping_id, status in (("pending-mapping", "pending"), ("ready-mapping", "ready")):
+        db.execute(
+            """INSERT INTO approval_mappings(
+                mapping_id,connection_id,workspace_id,workspace_key,source_profile,parent_issue_id,
+                wakeup_id,route_id,subscription_id,instruction,child_ids_json,tree_fingerprint,
+                status,created_at,updated_at)
+                VALUES(?,?,?,?,? ,? ,? ,? ,'subscription','instruction','[]','fingerprint',?,?,?)""",
+            (
+                mapping_id, "connection", "workspace", "workspace-key", "default",
+                f"parent-{mapping_id}", f"wakeup-{mapping_id}", "route", status, now, now,
+            ),
+        )
     db.execute(
-        """INSERT INTO approval_mappings(
-            mapping_id,connection_id,workspace_id,workspace_key,source_profile,parent_issue_id,
-            wakeup_id,route_id,subscription_id,instruction,child_ids_json,tree_fingerprint,
-            status,created_at,updated_at)
-            VALUES('mapping','connection','workspace','workspace-key','default','parent','wakeup',
-            'route','subscription','instruction','[]','fingerprint','pending',?,?)""",
+        """INSERT INTO approval_jobs(
+            id,mapping_id,event_key,run_id,payload_json,status,created_at,updated_at)
+            VALUES('ready-job','ready-mapping','event','run','{}','pending',?,?)""",
         (now, now),
     )
     db.execute("PRAGMA user_version=4")
@@ -662,13 +671,26 @@ def test_schema_v4_migration_blocks_unverifiable_approval_mappings(ctx):
     legacy.chmod(0o600)
 
     migrated = State(legacy)
-    row = migrated.rows("SELECT status,detail,agent_id,project_id FROM approval_mappings")[0]
-    assert row == {
-        "status": "blocked",
-        "detail": "approval_mapping_legacy_unverified",
-        "agent_id": "",
-        "project_id": "",
-    }
+    rows = migrated.rows(
+        "SELECT status,detail,agent_id,project_id FROM approval_mappings ORDER BY mapping_id"
+    )
+    assert rows == [
+        {
+            "status": "blocked",
+            "detail": "approval_mapping_legacy_unverified",
+            "agent_id": "",
+            "project_id": "",
+        },
+        {
+            "status": "blocked",
+            "detail": "approval_mapping_legacy_unverified",
+            "agent_id": "",
+            "project_id": "",
+        },
+    ]
+    assert migrated.rows("SELECT status,last_error FROM approval_jobs") == [
+        {"status": "dead", "last_error": "approval_mapping_legacy_unverified"}
+    ]
     assert migrated.db.execute("PRAGMA user_version").fetchone()[0] == 5
     migrated.db.close()
 

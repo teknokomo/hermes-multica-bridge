@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 import socket
 import struct
@@ -14,6 +15,7 @@ from unittest.mock import patch
 
 import pytest
 
+from bridge.errors import BridgeError
 from notify.approval import reconcile_mapping
 from notify.approval_ipc import ApprovalMappingServer
 from notify.config import NotifyError, parse_config
@@ -151,6 +153,82 @@ def _api_factory_for(reader):
 
 def _mapping(ctx, mapping_id):
     return ctx.state.rows("SELECT * FROM approval_mappings WHERE mapping_id=?", (mapping_id,))[0]
+
+
+def _tree_fingerprint(child_ids=(CHILD_ID,)):
+    immutable = [{"id": child_id, "stage": None} for child_id in sorted(child_ids)]
+    return hashlib.sha256(
+        json.dumps(immutable, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _ipc_request(*, parent_id=PARENT_ID, wakeup_id=WAKEUP_ID, expiry=None, child_ids=(CHILD_ID,)):
+    ordered_ids = sorted(child_ids)
+    return {
+        "version": 1,
+        "op": "approval_mapping.put",
+        "parent_issue_id": parent_id,
+        "wakeup_id": wakeup_id,
+        "route_id": "approval-route",
+        "bridge_route_id": "bridge-route",
+        "source_profile": "default",
+        "instruction": "Review the completed stages.",
+        "expires_at": time.time() + 60 if expiry is None else expiry,
+        "registered_child_ids": ordered_ids,
+        "registered_tree_fingerprint": _tree_fingerprint(ordered_ids),
+    }
+
+
+def test_approval_due_skips_disabled_wake_jobs_before_applying_limit(ctx):
+    _config, active_mapping_id, active_mapping, _expiry = approval_context(ctx)
+    disabled_subscription = add(
+        ctx, chat_id="998", chat_type="thread", thread_id="998", project_id=PROJECT,
+        label="disabled-wake",
+    )
+    ctx.state.add_wake_subscription(
+        disabled_subscription, {"profile": "default", "route": "disabled-route"},
+        enabled=False,
+    )
+    now = time.time()
+    with ctx.state.transaction() as db:
+        db.execute(
+            "UPDATE approval_mappings SET status='ready' WHERE mapping_id=?",
+            (active_mapping_id,),
+        )
+        db.execute(
+            """INSERT INTO approval_jobs(
+                id,mapping_id,event_key,run_id,payload_json,status,created_at,updated_at)
+                VALUES('eligible-job',?,'eligible-event','eligible-run','{}','pending',?,?)""",
+            (active_mapping_id, now, now),
+        )
+    for index in range(101):
+        mapping = {
+            **active_mapping,
+            "parent_issue_id": f"disabled-parent-{index}",
+            "wakeup_id": f"disabled-wakeup-{index}",
+            "route_id": "disabled-route",
+            "subscription_id": disabled_subscription,
+        }
+        mapping_id, created = ctx.state.put_approval_mapping(mapping)
+        assert created
+        created_at = now - 1000 + index
+        with ctx.state.transaction() as db:
+            db.execute(
+                "UPDATE approval_mappings SET status='ready' WHERE mapping_id=?",
+                (mapping_id,),
+            )
+            db.execute(
+                """INSERT INTO approval_jobs(
+                    id,mapping_id,event_key,run_id,payload_json,status,created_at,updated_at)
+                    VALUES(?,?,?,'disabled-run','{}','pending',?,?)""",
+                (
+                    f"disabled-job-{index}", mapping_id,
+                    f"disabled-event-{index}", created_at, created_at,
+                ),
+            )
+
+    due = ctx.state.approval_due(now)
+    assert [row["id"] for row in due] == ["eligible-job"]
 
 
 @pytest.mark.parametrize("run_status,child_status,expected", [
@@ -329,16 +407,7 @@ def test_approval_unexpected_sender_result_is_unknown_without_retry(ctx, sender_
 
 
 def test_approval_ipc_request_is_fixed_schema_and_rejects_boolean_expiry():
-    base = {
-        "version": 1,
-        "op": "approval_mapping.put",
-        "parent_issue_id": PARENT_ID,
-        "wakeup_id": WAKEUP_ID,
-        "route_id": "approval-route",
-        "source_profile": "default",
-        "instruction": "Review the completed stages.",
-        "expires_at": time.time() + 60,
-    }
+    base = _ipc_request()
     assert ApprovalMappingServer._valid_request(base)
     assert not ApprovalMappingServer._valid_request(base | {"extra": "rejected"})
     assert not ApprovalMappingServer._valid_request(base | {"expires_at": True})
@@ -353,16 +422,7 @@ def test_approval_mapping_client_rejects_malformed_profile_and_expiry_before_con
     from bridge.errors import BridgeError
 
     client = ApprovalMappingClient(str(tmp_path / "missing.sock"))
-    base = {
-        "version": 1,
-        "op": "approval_mapping.put",
-        "parent_issue_id": PARENT_ID,
-        "wakeup_id": WAKEUP_ID,
-        "route_id": "approval-route",
-        "source_profile": "default",
-        "instruction": "Review the completed stages.",
-        "expires_at": time.time() + 60,
-    }
+    base = _ipc_request()
     for change in (
         {"source_profile": []},
         {"expires_at": None},
@@ -374,11 +434,28 @@ def test_approval_mapping_client_rejects_malformed_profile_and_expiry_before_con
             client.put(base | change)
 
 
+def test_approval_mapping_client_encodes_unicode_within_utf8_frame():
+    from bridge.approval_ipc import MAX_FRAME, ApprovalMappingClient
+
+    request = _ipc_request() | {"instruction": "🙂" * 2000}
+    body = ApprovalMappingClient.encode_request(request)
+    assert len(body) <= MAX_FRAME
+    assert json.loads(body)["instruction"] == request["instruction"]
+
+    long_children = tuple(f"child-{index:03d}-{'x' * 100}" for index in range(500))
+    oversized = _ipc_request(child_ids=long_children)
+    with pytest.raises(BridgeError) as caught:
+        ApprovalMappingClient.encode_request(oversized)
+    assert caught.value.code == "approval_mapping_too_large"
+
+
 class _MappingReader:
-    def __init__(self, parent_id, wakeup_id, expiry):
+    def __init__(self, parent_id, wakeup_id, expiry, *, child_id=CHILD_ID, last_task_id=None):
         self.parent_id = parent_id
         self.wakeup_id = wakeup_id
         self.expiry = expiry
+        self.child_id = child_id
+        self.last_task_id = last_task_id
         self.calls = []
 
     def get_issue(self, issue_id):
@@ -401,8 +478,8 @@ class _MappingReader:
             "mode": "once",
             "instruction": "Review the completed stages.",
             "condition": {"type": "children_done"},
-            "enabled": True,
-            "last_task_id": None,
+            "enabled": self.last_task_id is None,
+            "last_task_id": self.last_task_id,
             "expires_at": datetime.fromtimestamp(self.expiry, UTC).isoformat(),
             "timed_out_at": None,
         }]
@@ -410,7 +487,7 @@ class _MappingReader:
     def list_issue_children(self, issue_id):
         self.calls.append(("children", issue_id))
         return [{
-            "id": CHILD_ID,
+            "id": self.child_id,
             "workspace_id": WID,
             "project_id": PROJECT,
             "parent_issue_id": self.parent_id,
@@ -430,16 +507,7 @@ def test_approval_mapping_put_validates_route_and_is_idempotent(ctx):
         ctx.state,
         api_factory=lambda *_args: SimpleNamespace(reader=reader),
     )
-    request = {
-        "version": 1,
-        "op": "approval_mapping.put",
-        "parent_issue_id": parent_id,
-        "wakeup_id": wakeup_id,
-        "route_id": "approval-route",
-        "source_profile": "default",
-        "instruction": "Review the completed stages.",
-        "expires_at": expiry,
-    }
+    request = _ipc_request(parent_id=parent_id, wakeup_id=wakeup_id, expiry=expiry)
 
     with (
         patch("notify.approval_ipc.load_webhook_policy", return_value={}),
@@ -454,6 +522,56 @@ def test_approval_mapping_put_validates_route_and_is_idempotent(ctx):
     assert reader.calls.count(("issue", parent_id)) == 2
 
 
+def test_approval_mapping_put_rejects_changed_child_tree(ctx):
+    config, _mapping_id, _saved, _old_expiry = approval_context(ctx)
+    parent_id = "66666666-6666-4666-8666-666666666666"
+    wakeup_id = "77777777-7777-4777-8777-777777777777"
+    expiry = time.time() + 3600
+    reader = _MappingReader(parent_id, wakeup_id, expiry, child_id="replacement-child")
+    server = ApprovalMappingServer(
+        config,
+        ctx.state,
+        api_factory=lambda *_args: SimpleNamespace(reader=reader),
+    )
+    request = _ipc_request(parent_id=parent_id, wakeup_id=wakeup_id, expiry=expiry)
+
+    with (
+        patch("notify.approval_ipc.load_webhook_policy", return_value={}),
+        patch("notify.approval_ipc.verify_webhook_policy"),
+        pytest.raises(NotifyError, match="approval_mapping_tree_changed"),
+    ):
+        server._put(request)
+
+    assert ctx.state.approval_mapping(CONNECTION_ID, WID, "default", parent_id) is None
+
+
+@pytest.mark.parametrize("last_task_id,expected", [(None, "rejected"), (RUN_ID, "accepted")])
+def test_expired_wakeup_mapping_requires_evidence_wakeup_fired(ctx, last_task_id, expected):
+    config, _mapping_id, _saved, _old_expiry = approval_context(ctx)
+    parent_id = "66666666-6666-4666-8666-666666666666"
+    wakeup_id = "77777777-7777-4777-8777-777777777777"
+    expiry = time.time() - 60
+    reader = _MappingReader(parent_id, wakeup_id, expiry, last_task_id=last_task_id)
+    server = ApprovalMappingServer(
+        config,
+        ctx.state,
+        api_factory=lambda *_args: SimpleNamespace(reader=reader),
+    )
+    request = _ipc_request(parent_id=parent_id, wakeup_id=wakeup_id, expiry=expiry)
+
+    with (
+        patch("notify.approval_ipc.load_webhook_policy", return_value={}),
+        patch("notify.approval_ipc.verify_webhook_policy"),
+    ):
+        if expected == "rejected":
+            with pytest.raises(NotifyError, match="approval_mapping_invalid"):
+                server._put(request)
+        else:
+            assert server._put(request) == "accepted"
+    mapping = ctx.state.approval_mapping(CONNECTION_ID, WID, "default", parent_id)
+    assert (mapping is not None) is (expected == "accepted")
+
+
 def test_approval_mapping_put_rejects_wakeup_with_different_expiry(ctx):
     config, _mapping_id, _saved, _old_expiry = approval_context(ctx)
     parent_id = "66666666-6666-4666-8666-666666666666"
@@ -465,16 +583,7 @@ def test_approval_mapping_put_rejects_wakeup_with_different_expiry(ctx):
         ctx.state,
         api_factory=lambda *_args: SimpleNamespace(reader=reader),
     )
-    request = {
-        "version": 1,
-        "op": "approval_mapping.put",
-        "parent_issue_id": parent_id,
-        "wakeup_id": wakeup_id,
-        "route_id": "approval-route",
-        "source_profile": "default",
-        "instruction": "Review the completed stages.",
-        "expires_at": requested_expiry,
-    }
+    request = _ipc_request(parent_id=parent_id, wakeup_id=wakeup_id, expiry=requested_expiry)
 
     with (
         patch("notify.approval_ipc.load_webhook_policy", return_value={}),
@@ -499,16 +608,7 @@ def test_approval_mapping_put_rejects_wakeup_with_different_saved_expiry(ctx):
         ctx.state,
         api_factory=lambda *_args: SimpleNamespace(reader=reader),
     )
-    request = {
-        "version": 1,
-        "op": "approval_mapping.put",
-        "parent_issue_id": parent_id,
-        "wakeup_id": wakeup_id,
-        "route_id": "approval-route",
-        "source_profile": "default",
-        "instruction": "Review the completed stages.",
-        "expires_at": requested_expiry,
-    }
+    request = _ipc_request(parent_id=parent_id, wakeup_id=wakeup_id, expiry=requested_expiry)
 
     with (
         patch("notify.approval_ipc.load_webhook_policy", return_value={}),
@@ -526,16 +626,11 @@ def test_approval_mapping_put_fails_closed_without_native_suppression(ctx):
     config, _mapping_id, _saved, _expiry = approval_context(ctx)
     config.approval_ipc["native_delivery_suppressed"] = False
     server = ApprovalMappingServer(config, ctx.state)
-    request = {
-        "version": 1,
-        "op": "approval_mapping.put",
-        "parent_issue_id": "66666666-6666-4666-8666-666666666666",
-        "wakeup_id": "77777777-7777-4777-8777-777777777777",
-        "route_id": "approval-route",
-        "source_profile": "default",
-        "instruction": "Review the completed stages.",
-        "expires_at": time.time() + 3600,
-    }
+    request = _ipc_request(
+        parent_id="66666666-6666-4666-8666-666666666666",
+        wakeup_id="77777777-7777-4777-8777-777777777777",
+        expiry=time.time() + 3600,
+    )
 
     with pytest.raises(NotifyError, match="approval_ready_delivery_unverified"):
         server._put(request)

@@ -415,7 +415,7 @@ class State:
                     self.db.execute("ALTER TABLE approval_jobs ADD COLUMN next_check_at REAL")
                     self.db.execute(
                         "UPDATE approval_mappings SET status='blocked',delivery_status='blocked',"
-                        "detail='approval_mapping_legacy_unverified',updated_at=? WHERE status='pending'",
+                        "detail='approval_mapping_legacy_unverified',updated_at=? WHERE status IN ('pending','ready')",
                         (time.time(),),
                     )
                     self.db.execute(
@@ -1601,9 +1601,12 @@ class State:
                 JOIN approval_mappings m ON m.mapping_id=j.mapping_id
                 JOIN subscriptions s ON s.id=m.subscription_id
                 JOIN accounts a ON a.name=s.account JOIN workspaces w ON w.id=s.workspace_id
+                JOIN wake_subscriptions ws ON ws.subscription_id=s.id
                 WHERE j.status='pending' AND (j.next_check_at IS NULL OR j.next_check_at<=?)
                 AND m.status='ready' AND s.enabled=1 AND a.configured=1
-                AND w.configured=1 AND w.enabled=1 ORDER BY j.created_at LIMIT 100""",
+                AND w.configured=1 AND w.enabled=1 AND ws.enabled=1
+                AND ws.route=m.route_id AND ws.profile=m.source_profile
+                ORDER BY j.created_at LIMIT 100""",
                 (now,),
             )]
 

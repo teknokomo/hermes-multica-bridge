@@ -57,7 +57,7 @@ class ConditionWakeSpec:
         }
 
     @classmethod
-    def from_canonical(cls, value: Any) -> ConditionWakeSpec:
+    def from_canonical(cls, value: Any, *, allow_expired: bool = False) -> ConditionWakeSpec:
         """Load the sanitized immutable form stored by the runtime router."""
         fields = {
             "mode", "instruction", "stage", "expected_stage_count",
@@ -73,7 +73,12 @@ class ConditionWakeSpec:
             raise BridgeError("condition_wake_invalid", "The saved condition-wake expiry is invalid.")
         if seconds is not None and (type(seconds) is not int or not 60 <= seconds <= 90 * 86400):
             raise BridgeError("condition_wake_invalid", "The saved condition-wake expiry is invalid.")
-        if expiry is not None and (type(expiry) is not int or not int(time.time()) < expiry <= int(time.time()) + 90 * 86400):
+        now = int(time.time())
+        if expiry is not None and (
+            type(expiry) is not int
+            or not 0 < expiry <= now + 90 * 86400
+            or (not allow_expired and expiry <= now)
+        ):
             raise BridgeError("condition_wake_invalid", "The saved condition-wake expiry is invalid.")
         instruction = value.get("instruction")
         on_timeout = value.get("on_timeout")
@@ -116,7 +121,7 @@ class ConditionWakeSpec:
         return payload
 
 
-def parse_condition_wake(value: Any) -> ConditionWakeSpec:
+def parse_condition_wake(value: Any, *, allow_expired: bool = False) -> ConditionWakeSpec:
     """Parse the public condition_wake argument without guessing defaults."""
     allowed = {
         "enabled", "mode", "instruction", "stage", "expected_stage_count",
@@ -167,7 +172,9 @@ def parse_condition_wake(value: Any) -> ConditionWakeSpec:
         else:
             raise BridgeError("condition_wake_invalid", "expires_at must be an RFC3339 timestamp or epoch seconds.")
         now = int(time.time())
-        if expires_at is None or not now < expires_at <= now + 90 * 86400:
+        if expires_at is None or not 0 < expires_at <= now + 90 * 86400 or (
+            not allow_expired and expires_at <= now
+        ):
             raise BridgeError("condition_wake_invalid", "expires_at must be in the next 90 days.")
     else:
         raise BridgeError("condition_wake_invalid", "An explicit condition-wake expiry is required.")

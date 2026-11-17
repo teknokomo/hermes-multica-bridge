@@ -38,7 +38,6 @@ Use Runtime Router only when `multica_list_routes` shows `runtime_router.enabled
 - The tool response is a queued request, not proof that an issue was created or work completed. Use `multica_runtime_status` for its state. Report completion only when status is terminal and the result is confirmed.
 - Do not select or switch a runtime unless the user requests it and `multica_runtime_binding_set` permits the exact allowed runtime. In `strict` mode, the binding wins; do not try exceptions or explicit runtime to bypass it. In `exceptions` mode, use only the authorized runtime IDs.
 - Do not invent a model. An empty agent model (`model=""`) means the Multica runtime default; operator model rules and `allowed_models_by_runtime` are configuration, not user-controlled tool arguments.
-- Do not invent a model. An empty agent model (`model=""`) means the Multica runtime default; operator model rules and `allowed_models_by_runtime` are configuration, not user-controlled tool arguments.
 - Bindings and exceptions belong to the trusted principal and Multica instance. Never link identities, change another principal's binding, or infer identity from a display name. An unresolved identity or binding is a stop condition.
 - The worker never runs in the plugin thread. Do not trigger repeated create calls to make it run sooner. The source-message idempotency key prevents duplicate requests, and an uncertain issue-create result is reconciled rather than blindly retried.
 - Use `multica_runtime_cancel` only for a request the current principal may cancel. Cancellation may be pending while an active Multica run stops; do not claim it is cancelled until status confirms.
@@ -50,7 +49,7 @@ Use Runtime Router only when `multica_list_routes` shows `runtime_router.enabled
 - Use `condition_wake` only when the user asks for a parent task to wait for its child work. It supports `children_done`; create the parent first, then register the wake through the normal Workspace update after the direct-child plan is present.
 - For a staged plan, supply both matching positive `stage` and `expected_stage_count`; for an unstaged plan, omit both. Never invent or repair stage values to make validation pass.
 - The stage count is capped at 500 to match the bounded child tree; every stage from 1 through N must exist.
-- Native wake/run/comments are internal triggers, not user-facing progress messages. Notify alone sends the final approval-ready message after it verifies the parent, wakeup, run, and every saved child as exactly `done`.
+- Native wake/run/comments are internal triggers, not user-facing progress messages. Notify alone sends the final approval-ready message after correlating the parent and wakeup, confirming the run status is `completed`, and verifying every saved child has status exactly `done`.
 - A closed or cancelled child is not complete. Do not claim approval readiness, close the parent, or approve the human review yourself.
 - If condition wake is disabled, notify readiness is missing, or target native-message suppression is unverified, stop and report the exact gate. Do not fall back to direct native delivery, Multica API, CLI, or SQL.
 - MAX direct-message completion delivery is pinned to the exact configured `user_id` with no thread; never substitute a group or parent chat. Telegram direct-message delivery is unsupported.

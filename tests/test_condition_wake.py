@@ -119,6 +119,24 @@ def test_condition_wakeup_payload_pins_kind_and_agent():
         _spec().api_payload(agent_id="not-an-agent-uuid")
 
 
+def test_expired_condition_wake_is_only_parseable_for_registered_restore():
+    expired = {
+        "enabled": True,
+        "mode": "children_done",
+        "instruction": "Reconcile the registered wakeup.",
+        "expires_at": int(datetime.now(UTC).timestamp()) - 60,
+    }
+    with pytest.raises(BridgeError, match="expires_at"):
+        parse_condition_wake(expired)
+
+    restored = parse_condition_wake(expired, allow_expired=True)
+    with pytest.raises(BridgeError, match="expiry"):
+        ConditionWakeSpec.from_canonical(restored.canonical())
+    assert ConditionWakeSpec.from_canonical(
+        restored.canonical(), allow_expired=True,
+    ) == restored
+
+
 def test_readiness_requires_every_saved_child_exactly_done():
     expected = [{"id": CHILD_A, "stage": None}, {"id": CHILD_B, "stage": None}]
     done = [_child(CHILD_A, None, "done"), _child(CHILD_B, None, "done")]

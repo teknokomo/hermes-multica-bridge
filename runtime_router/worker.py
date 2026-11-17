@@ -204,6 +204,16 @@ class RouterWorker:
             route_policy_fingerprint(registry, route), project_id
         )
 
+    @staticmethod
+    def _profile_model_config(
+        config: RouterConfig, snapshot: dict[str, Any],
+    ) -> RouterConfig:
+        """Use the request profile's model policy with the merged service topology."""
+        profile_config = RouterConfig.parse(snapshot.get("runtime_router"))
+        if profile_config.state_path != config.state_path:
+            raise RouterConfigError("profile_router_configuration_inconsistent")
+        return replace(config, model_policy=profile_config.model_policy)
+
     def _resolution(
         self,
         config: RouterConfig,
@@ -292,6 +302,7 @@ class RouterWorker:
             exceptions=exceptions,
             context={
                 **source,
+                "principal_id": identity["principal_id"],
                 "agent_id": agent.agent_id,
                 "workspace_id": workspace.workspace_id,
                 "project_id": project_id,
@@ -725,8 +736,9 @@ class RouterWorker:
                 "route_policy_hash"
             ):
                 raise RouterConfigError("route_policy_changed")
+            request_config = self._profile_model_config(latest_config, snapshot)
             resolution = self._resolution(
-                latest_config, request, route, payload, registry
+                request_config, request, route, payload, registry
             )
             agent = latest_config.agent(request["agent_ref"])
             instance = latest_config.instance(request["instance_id"])
@@ -811,8 +823,9 @@ class RouterWorker:
             latest_registry, latest_route = self._route(
                 latest_snapshot, request["route_id"], source
             )
+            request_config = self._profile_model_config(latest_config, latest_snapshot)
             self._resolution(
-                latest_config, request, latest_route, payload, latest_registry
+                request_config, request, latest_route, payload, latest_registry
             )
             latest_agent = latest_config.agent(request["agent_ref"])
             latest_instance = latest_config.instance(request["instance_id"])

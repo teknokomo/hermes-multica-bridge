@@ -18,6 +18,8 @@ from .validation import strict_json_loads
 
 MAX_FRAME = 16 * 1024
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_TREE_FINGERPRINT = re.compile(r"[0-9a-f]{64}\Z")
+_MAX_CHILDREN = 500
 
 
 class ApprovalMappingClient:
@@ -27,30 +29,43 @@ class ApprovalMappingClient:
         self.path = path
         self.timeout = timeout
 
-    def put(self, mapping: dict[str, Any]) -> str:
+    @staticmethod
+    def encode_request(mapping: dict[str, Any]) -> bytes:
+        """Validate and encode a bounded request before any native wake POST."""
         required = {
             "version", "op", "parent_issue_id", "wakeup_id", "route_id",
-            "source_profile", "instruction", "expires_at",
+            "bridge_route_id", "source_profile", "instruction", "expires_at",
+            "registered_child_ids", "registered_tree_fingerprint",
         }
+        child_ids = mapping.get("registered_child_ids") if isinstance(mapping, dict) else None
         if (not isinstance(mapping, dict) or set(mapping) != required
                 or type(mapping.get("version")) is not int or mapping.get("version") != 1
                 or mapping.get("op") != "approval_mapping.put"
                 or not isinstance(mapping.get("source_profile"), str)
                 or mapping.get("source_profile") not in READINESS_PROFILES
                 or any(not isinstance(mapping.get(key), str) or not _SAFE_ID.fullmatch(mapping[key])
-                       for key in ("parent_issue_id", "wakeup_id", "route_id"))
+                       for key in ("parent_issue_id", "wakeup_id", "route_id", "bridge_route_id"))
                 or not isinstance(mapping.get("instruction"), str)
                 or not mapping["instruction"].strip() or len(mapping["instruction"]) > 2000
                 or type(mapping.get("expires_at")) not in {int, float}
-                or not ApprovalMappingClient._valid_expiry(mapping["expires_at"])):
+                or not ApprovalMappingClient._valid_expiry(mapping["expires_at"])
+                or not isinstance(child_ids, list) or not 1 <= len(child_ids) <= _MAX_CHILDREN
+                or any(not isinstance(value, str) or not _SAFE_ID.fullmatch(value) for value in child_ids)
+                or child_ids != sorted(set(child_ids))
+                or not isinstance(mapping.get("registered_tree_fingerprint"), str)
+                or not _TREE_FINGERPRINT.fullmatch(mapping["registered_tree_fingerprint"])):
             raise BridgeError("approval_mapping_invalid", "The approval mapping request is invalid.")
+        body = json.dumps(mapping, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(body) > MAX_FRAME:
+            raise BridgeError("approval_mapping_too_large", "The saved child plan exceeds the approval mapping frame limit.")
+        return body
+
+    def put(self, mapping: dict[str, Any]) -> str:
+        body = self.encode_request(mapping)
         try:
             info = Path(self.path).lstat()
             if not stat.S_ISSOCK(info.st_mode):
                 raise OSError("not a socket")
-            body = json.dumps(mapping, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
-            if len(body) > MAX_FRAME:
-                raise OSError("request too large")
             deadline = time.monotonic() + self.timeout
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                 self._set_timeout(client, deadline)

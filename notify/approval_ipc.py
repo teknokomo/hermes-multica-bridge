@@ -28,6 +28,8 @@ MAX_FRAME = 16 * 1024
 _PROFILE_SET = frozenset({"default", "om73"})
 _ROUTE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 _TEXT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_TREE_FINGERPRINT = re.compile(r"[0-9a-f]{64}\Z")
+_MAX_CHILDREN = 500
 
 
 def _frame(value: dict[str, Any]) -> bytes:
@@ -154,7 +156,8 @@ class ApprovalMappingServer:
             isinstance(request, dict)
             and set(request) == {
                 "version", "op", "parent_issue_id", "wakeup_id", "route_id",
-                "source_profile", "instruction", "expires_at",
+                "bridge_route_id", "source_profile", "instruction", "expires_at",
+                "registered_child_ids", "registered_tree_fingerprint",
             }
             and type(request.get("version")) is int and request["version"] == 1
             and request.get("op") == "approval_mapping.put"
@@ -163,8 +166,16 @@ class ApprovalMappingServer:
             and all(isinstance(request.get(key), str) and _TEXT_RE.fullmatch(request[key])
                     for key in ("parent_issue_id", "wakeup_id"))
             and isinstance(request.get("route_id"), str) and _ROUTE_RE.fullmatch(request["route_id"])
+            and isinstance(request.get("bridge_route_id"), str) and _TEXT_RE.fullmatch(request["bridge_route_id"])
             and isinstance(request.get("instruction"), str)
             and bool(request["instruction"].strip()) and len(request["instruction"]) <= 2000
+            and isinstance(request.get("registered_child_ids"), list)
+            and 1 <= len(request["registered_child_ids"]) <= _MAX_CHILDREN
+            and all(isinstance(value, str) and _TEXT_RE.fullmatch(value)
+                    for value in request["registered_child_ids"])
+            and request["registered_child_ids"] == sorted(set(request["registered_child_ids"]))
+            and isinstance(request.get("registered_tree_fingerprint"), str)
+            and _TREE_FINGERPRINT.fullmatch(request["registered_tree_fingerprint"])
             and type(request["expires_at"]) in {int, float}
             and ((type(request["expires_at"]) is int
                   and 0 < request["expires_at"] <= 253_402_300_799)
@@ -260,15 +271,18 @@ class ApprovalMappingServer:
                 raise NotifyError("approval_mapping_invalid")
             actual_expiry = self._expiry_epoch(wakeup.get("expires_at"))
             requested_expiry = float(request["expires_at"])
+            last_task_id = wakeup.get("last_task_id")
             existing = self.state.approval_mapping(
                 connection_id, destination["external_workspace_id"], profile, parent_id,
             )
             if (actual_expiry is None
                     or abs(actual_expiry - requested_expiry) > 1
-                    or (existing is None and actual_expiry <= time.time())
+                    or (last_task_id is not None and (
+                        not isinstance(last_task_id, str) or not last_task_id
+                        or not _TEXT_RE.fullmatch(last_task_id)
+                    ))
+                    or (existing is None and actual_expiry <= time.time() and not last_task_id)
                     or (existing is None and not wakeup.get("enabled") and not wakeup.get("last_task_id"))
-                    or (wakeup.get("last_task_id") is not None
-                        and not isinstance(wakeup.get("last_task_id"), str))
                     or (existing is None and wakeup.get("timed_out_at") is not None)):
                 raise NotifyError("approval_mapping_invalid")
             stage = condition.get("stage")
@@ -280,6 +294,10 @@ class ApprovalMappingServer:
                 api.reader.list_issue_children(parent_id), parent_id=parent_id,
                 workspace_id=destination["external_workspace_id"], project_id=parent["project_id"], spec=spec,
             )
+            current_child_ids = [row["id"] for row in children]
+            if (current_child_ids != request["registered_child_ids"]
+                    or fingerprint != request["registered_tree_fingerprint"]):
+                raise NotifyError("approval_mapping_tree_changed")
         except NotifyError:
             raise
         except Exception:  # noqa: BLE001 - stable internal API boundary
