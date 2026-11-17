@@ -157,7 +157,7 @@ class ApprovalMappingServer:
             and set(request) == {
                 "version", "op", "parent_issue_id", "wakeup_id", "route_id",
                 "bridge_route_id", "source_profile", "instruction", "expires_at",
-                "registered_child_ids", "registered_tree_fingerprint",
+                "expected_stage_count", "registered_child_ids", "registered_tree_fingerprint",
             }
             and type(request.get("version")) is int and request["version"] == 1
             and request.get("op") == "approval_mapping.put"
@@ -169,6 +169,13 @@ class ApprovalMappingServer:
             and isinstance(request.get("bridge_route_id"), str) and _TEXT_RE.fullmatch(request["bridge_route_id"])
             and isinstance(request.get("instruction"), str)
             and bool(request["instruction"].strip()) and len(request["instruction"]) <= 2000
+            and (
+                request.get("expected_stage_count") is None
+                or (
+                    type(request["expected_stage_count"]) is int
+                    and 1 <= request["expected_stage_count"] <= 500
+                )
+            )
             and isinstance(request.get("registered_child_ids"), list)
             and 1 <= len(request["registered_child_ids"]) <= _MAX_CHILDREN
             and all(isinstance(value, str) and _TEXT_RE.fullmatch(value)
@@ -286,8 +293,19 @@ class ApprovalMappingServer:
                     or (existing is None and wakeup.get("timed_out_at") is not None)):
                 raise NotifyError("approval_mapping_invalid")
             stage = condition.get("stage")
+            expected_stage_count = request["expected_stage_count"]
+            if (
+                (stage is None) != (expected_stage_count is None)
+                or (
+                    stage is not None
+                    and expected_stage_count is not None
+                    and expected_stage_count > stage
+                )
+            ):
+                raise NotifyError("approval_mapping_invalid")
             spec = ConditionWakeSpec(
-                instruction=request["instruction"], stage=stage, expected_stage_count=stage,
+                instruction=request["instruction"], stage=stage,
+                expected_stage_count=expected_stage_count,
                 expires_in_seconds=None, expires_at=None, on_timeout="end",
             )
             children, fingerprint = validate_child_tree(

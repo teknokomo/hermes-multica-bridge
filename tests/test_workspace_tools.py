@@ -276,7 +276,7 @@ class WorkspaceToolsTests(unittest.TestCase):
                 mapping_requests.append(dict(request))
                 return "accepted"
 
-        with patch("bridge.workspace_tools.ApprovalMappingClient", return_value=MappingClient()):
+        with patch("bridge.workspace_tools.ApprovalMappingClient", new=MappingClient):
             with self.assertRaises(BridgeError) as first:
                 self.runtime._register_condition_wake(
                     state=self.state, registry=registry, route=route, api=api, issue=parent, spec=spec,
@@ -308,6 +308,7 @@ class WorkspaceToolsTests(unittest.TestCase):
         self.assertEqual(mapping_requests[0]["bridge_route_id"], route.route_id)
         self.assertEqual(mapping_requests[0]["wakeup_id"], "wakeup-1")
         self.assertEqual(mapping_requests[0]["registered_child_ids"], ["child-1"])
+        self.assertIsNone(mapping_requests[0]["expected_stage_count"])
         self.assertEqual(mapping_requests[0]["registered_tree_fingerprint"], intent["tree_fingerprint"])
         completed = self.state.condition_wake_intent(
             connection_id=route.connection_id,
@@ -340,7 +341,7 @@ class WorkspaceToolsTests(unittest.TestCase):
                     raise BridgeError("approval_mapping_unavailable", "Notify is unavailable.")
                 return "accepted"
 
-        with patch("bridge.workspace_tools.ApprovalMappingClient", return_value=MappingClient()):
+        with patch("bridge.workspace_tools.ApprovalMappingClient", new=MappingClient):
             with self.assertRaises(BridgeError):
                 self.runtime._register_condition_wake(
                     state=self.state, registry=registry, route=route, api=api, issue=parent, spec=spec,
@@ -374,6 +375,72 @@ class WorkspaceToolsTests(unittest.TestCase):
         self.assertEqual(len(mapping_attempts), 2)
         self.assertEqual(mapping_attempts[1]["wakeup_id"], "wakeup-1")
         self.assertEqual(mapping_attempts[1]["expires_at"], expiry)
+
+    def test_condition_wake_registering_intent_reconciles_after_expiry_without_second_post(self):
+        expiry = int(time.time()) + 60
+        spec = parse_condition_wake({
+            "enabled": True,
+            "instruction": "Check every child before approval.",
+            "expires_at": expiry,
+        })
+        api = _ConditionWakeApi(accept_then_timeout=True)
+        registry, route, parent, api = self._condition_wake_context(spec, api)
+        mapping_requests = []
+
+        class MappingClient:
+            @staticmethod
+            def encode_request(request):
+                return ApprovalMappingClient.encode_request(request)
+
+            def put(self, request):
+                mapping_requests.append(dict(request))
+                return "accepted"
+
+        with patch("bridge.workspace_tools.ApprovalMappingClient", new=MappingClient):
+            with self.assertRaises(BridgeError) as first:
+                self.runtime._register_condition_wake(
+                    state=self.state, registry=registry, route=route, api=api, issue=parent, spec=spec,
+                )
+            self.assertEqual(first.exception.code, "approval_wake_unavailable")
+            intent = self.state.condition_wake_intent(
+                connection_id=route.connection_id,
+                workspace_id="workspace-1",
+                source_profile="om73",
+                parent_issue_id="parent-1",
+            )
+            self.assertEqual(intent["status"], "registering")
+            self.assertEqual(intent["wakeup_expires_at"], expiry)
+            self.assertTrue(intent["children_json"])
+            self.assertTrue(intent["tree_fingerprint"])
+
+            # The POST may have succeeded before its response was lost. Model the
+            # native event firing before expiry, then reconcile its readback later.
+            api.wakeups[0]["last_task_id"] = "completed-run"
+            api.wakeups[0]["enabled"] = False
+            self.runtime._api = lambda *_args: api
+            with patch("bridge.workspace_tools.time.time", return_value=expiry + 120):
+                result = json.loads(self.runtime.update({
+                    "route_id": route.route_id,
+                    "issue_id": "parent-1",
+                    "condition_wake": {
+                        "enabled": True,
+                        "instruction": spec.instruction,
+                        "expires_at": expiry,
+                    },
+                }, tool_context=self.source))
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(api.posts, 1)
+        self.assertEqual(len(mapping_requests), 1)
+        self.assertEqual(mapping_requests[0]["wakeup_id"], "wakeup-1")
+        self.assertEqual(mapping_requests[0]["expires_at"], expiry)
+        completed = self.state.condition_wake_intent(
+            connection_id=route.connection_id,
+            workspace_id="workspace-1",
+            source_profile="om73",
+            parent_issue_id="parent-1",
+        )
+        self.assertEqual(completed["status"], "registered")
 
     def test_condition_wake_reconcile_does_not_adopt_old_wakeup_with_different_expiry(self):
         expiry = int(time.time()) + 3600

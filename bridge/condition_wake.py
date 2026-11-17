@@ -30,7 +30,7 @@ def _valid_epoch(value: Any) -> bool:
 
 def _valid_stage_pair(stage: Any, count: Any) -> bool:
     return (stage is None and count is None) or (
-        type(stage) is int and type(count) is int and 1 <= stage == count <= _MAX_CHILDREN
+        type(stage) is int and type(count) is int and 1 <= count <= stage <= _MAX_CHILDREN
     )
 
 
@@ -143,7 +143,7 @@ def parse_condition_wake(value: Any, *, allow_expired: bool = False) -> Conditio
     if stage_present and (stage is None or not _valid_stage_pair(stage, count)):
         raise BridgeError(
             "condition_wake_stage_mismatch",
-            "A staged plan must use matching stage and count values between 1 and 500.",
+            "A staged plan needs a maximum stage ordinal and distinct-stage count between 1 and 500.",
         )
     if "expires_in" in value and "expires_at" in value:
         raise BridgeError("condition_wake_invalid", "Use expires_in or expires_at, not both.")
@@ -232,8 +232,12 @@ def validate_child_tree(
         normalized.append({"id": issue_id, "stage": child_stage, "status": status})
     if spec.stage is not None:
         expected_count = spec.expected_stage_count
-        if expected_count > len(children) or len(stage_values) != expected_count:
-            raise BridgeError("condition_wake_stage_mismatch", "The child tree does not contain every declared stage.")
+        if (expected_count > len(children) or len(stage_values) != expected_count
+                or max(stage_values, default=0) != spec.stage):
+            raise BridgeError(
+                "condition_wake_stage_mismatch",
+                "The child tree does not match the declared stage count and maximum ordinal.",
+            )
     normalized.sort(key=lambda item: item["id"])
     immutable = [{"id": row["id"], "stage": row["stage"]} for row in normalized]
     fingerprint = hashlib.sha256(

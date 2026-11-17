@@ -386,8 +386,8 @@ The product version is 0.7.0. The new queue leaves ordinary 0.6.0 routes unchang
 ## Conditional completion and approval 0.7.0
 
 `condition_wake` is opt-in and supports only `children_done`. A new parent issue stores a local intent first; `multica_workspace_update` later validates the full child plan before registering one native wakeup.
-The stage fields are optional as a pair: staged plans require matching positive `stage` and `expected_stage_count`; unstaged plans omit both. Partial or mixed child stages are rejected.
-The declared stage count is capped at 500, matching the maximum child tree; every stage from 1 through N must be present.
+The stage fields are optional only as a pair: staged plans require positive `stage` and `expected_stage_count`; the latter counts distinct child stage groups, while `stage` is their maximum ordinal (for example, groups 1 and 3 use count 2 and maximum 3). Unstaged plans omit both, and partial or mixed plans are rejected.
+The group count and maximum ordinal are each capped at 500, with `expected_stage_count <= stage`; child ordinals must be positive and no greater than `stage`, and the tree must contain exactly the declared number of distinct groups. Gaps between ordinals are allowed.
 Native wake, run, and comments are internal triggers only. Notify uses a separate read-only adapter to correlate the parent, wakeup, run, and saved children; every expected child must be exactly `done`.
 Only notify sends `task.ready_for_approval` to the configured completion destination. It does not close the parent or approve the human review. A closed, cancelled, failed, unknown, or missing child never means success.
 The native Hermes message must be demonstrably suppressed on the exact target build before enabling the feature. Both defaults remain disabled here; target delivery suppression is NOT VERIFIED, and no native-delivery fallback is provided.

@@ -102,6 +102,27 @@ def test_unstaged_and_sequential_staged_child_sets_are_valid():
     assert {row["stage"] for row in children} == {1, 2}
 
 
+def test_staged_child_groups_can_have_gaps_below_the_maximum_ordinal():
+    staged = _spec(stage=3, expected_stage_count=2)
+    children, _ = validate_child_tree(
+        [_child(CHILD_A, 1), _child(CHILD_B, 3)],
+        parent_id=PARENT,
+        workspace_id=WORKSPACE,
+        project_id=PROJECT,
+        spec=staged,
+    )
+    assert {row["stage"] for row in children} == {1, 3}
+
+    with pytest.raises(BridgeError, match="stage"):
+        validate_child_tree(
+            [_child(CHILD_A, 1), _child(CHILD_B, 2)],
+            parent_id=PARENT,
+            workspace_id=WORKSPACE,
+            project_id=PROJECT,
+            spec=staged,
+        )
+
+
 def test_condition_wakeup_payload_pins_kind_and_agent():
     payload = _spec().api_payload(agent_id=AGENT)
     assert payload["kind"] == "event"
@@ -119,7 +140,7 @@ def test_condition_wakeup_payload_pins_kind_and_agent():
         _spec().api_payload(agent_id="not-an-agent-uuid")
 
 
-def test_expired_condition_wake_is_only_parseable_for_registered_restore():
+def test_expired_condition_wake_requires_explicit_restore_context():
     expired = {
         "enabled": True,
         "mode": "children_done",

@@ -160,6 +160,8 @@ def test_new_done_transition_creates_one_wake_and_suppresses_all_regular_notices
     body = json.loads(jobs[0]["payload_json"])
     assert body["event"] == body["event_type"] == body["type"] == "task.completed"
     assert body["wake_id"] == jobs[0]["id"]
+    assert body["parent_issue_id"] is None
+    assert body["is_root"] is True
     assert body["profile"] == "default"
     assert body["origin"] == {
         "platform": "telegram",
@@ -200,7 +202,7 @@ def _configure_completion_filter(ctx, *, mode, explicit_issue_ids=()):
     return sid
 
 
-def test_root_only_completion_filter_suppresses_children_and_fails_closed_if_parent_missing(ctx):
+def test_root_only_completion_filter_suppresses_children_and_rejects_missing_parent(ctx):
     _configure_completion_filter(ctx, mode="root_only")
     run(ctx, issue(ctx, "todo", at=ctx.now, parent_issue_id="parent-1"))
     run(ctx, issue(ctx, "done", 2, at=ctx.now + 1, parent_issue_id="parent-1"))
@@ -211,10 +213,18 @@ def test_root_only_completion_filter_suppresses_children_and_fails_closed_if_par
     run(ctx, issue(ctx, "done", 4, at=ctx.now + 3, parent_issue_id=None, title="Root issue"))
     assert len(ctx.state.rows("SELECT * FROM wake_jobs")) == 1
 
-    run(ctx, issue(ctx, "todo", 1, at=ctx.now + 4, id="missing-parent"))
-    run(ctx, issue(ctx, "done", 2, at=ctx.now + 5, id="missing-parent"))
+    malformed = issue(ctx, "done", 2, at=ctx.now + 5, id="missing-parent")
+    malformed.pop("parent_issue_id")
+    with pytest.raises(NotifyError, match="notify_event_invalid"):
+        run(ctx, malformed)
     assert len(ctx.state.rows("SELECT * FROM wake_jobs")) == 1
-    assert ctx.state.rows("SELECT value FROM metadata WHERE key='metric:wake_filter_context_missing'")[0]["value"] == "1"
+
+
+def test_notify_rejects_issue_without_parent_context_before_reconciliation(ctx):
+    malformed = issue(ctx, "done")
+    malformed.pop("parent_issue_id")
+    with pytest.raises(NotifyError, match="notify_event_invalid"):
+        run(ctx, malformed)
 
 
 def test_explicit_issue_completion_filter_admits_only_configured_issue_id(ctx):
@@ -311,7 +321,7 @@ def test_max_dm_payload_identifies_user_not_group(ctx):
         profile="default",
         subscription=sub,
         issue={"id": "issue-a", "identifier": "TEST-1", "title": "Done", "status": "done",
-                "description": "", "project_id": PROJECT},
+                "description": "", "project_id": PROJECT, "parent_issue_id": "parent-1"},
         comments=[],
         issue_url="https://multica.example.invalid/test/issues/TEST-1",
         workspace_id="workspace-test",
@@ -320,6 +330,31 @@ def test_max_dm_payload_identifies_user_not_group(ctx):
     assert json.loads(raw)["origin"] == {
         "platform": "max", "user_id": "10001", "thread_id": "", "chat_type": "dm"
     }
+    assert json.loads(raw)["parent_issue_id"] == "parent-1"
+    assert json.loads(raw)["is_root"] is False
+
+
+def test_completion_payload_rejects_missing_parent_context(ctx):
+    sub = {"platform": "telegram", "chat_id": "100", "thread_id": "999", "chat_type": "thread"}
+    issue_row = {
+        "id": "issue-a",
+        "identifier": "TEST-1",
+        "title": "Done",
+        "status": "done",
+        "description": "",
+        "project_id": PROJECT,
+    }
+    with pytest.raises(NotifyError, match="notify_event_invalid"):
+        build_payload(
+            wake_id="6b2d7c11-90bd-4e2d-a9ce-48079b92ff53",
+            profile="default",
+            subscription=sub,
+            issue=issue_row,
+            comments=[],
+            issue_url="https://multica.example.invalid/test/issues/TEST-1",
+            workspace_id="workspace-test",
+            transition_seq=1,
+        )
 
 
 @pytest.mark.parametrize(
@@ -524,6 +559,7 @@ def test_snapshot_is_utf8_bounded_and_truncates_old_comments():
         "status": "done",
         "description": "x" * 2000,
         "project_id": PROJECT,
+        "parent_issue_id": None,
     }
     comments = [
         {
@@ -574,6 +610,7 @@ def test_snapshot_accepts_empty_multica_description_and_missing_author_type():
             "status": "done",
             "description": None,
             "project_id": PROJECT,
+            "parent_issue_id": None,
         },
         comments=[
             {

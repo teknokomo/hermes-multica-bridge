@@ -35,7 +35,7 @@ class ApprovalMappingClient:
         required = {
             "version", "op", "parent_issue_id", "wakeup_id", "route_id",
             "bridge_route_id", "source_profile", "instruction", "expires_at",
-            "registered_child_ids", "registered_tree_fingerprint",
+            "expected_stage_count", "registered_child_ids", "registered_tree_fingerprint",
         }
         child_ids = mapping.get("registered_child_ids") if isinstance(mapping, dict) else None
         if (not isinstance(mapping, dict) or set(mapping) != required
@@ -49,6 +49,13 @@ class ApprovalMappingClient:
                 or not mapping["instruction"].strip() or len(mapping["instruction"]) > 2000
                 or type(mapping.get("expires_at")) not in {int, float}
                 or not ApprovalMappingClient._valid_expiry(mapping["expires_at"])
+                or (
+                    mapping.get("expected_stage_count") is not None
+                    and (
+                        type(mapping["expected_stage_count"]) is not int
+                        or not 1 <= mapping["expected_stage_count"] <= 500
+                    )
+                )
                 or not isinstance(child_ids, list) or not 1 <= len(child_ids) <= _MAX_CHILDREN
                 or any(not isinstance(value, str) or not _SAFE_ID.fullmatch(value) for value in child_ids)
                 or child_ids != sorted(set(child_ids))

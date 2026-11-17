@@ -462,6 +462,27 @@ class WorkspaceRuntime:
     def _condition_wake_hash(spec: ConditionWakeSpec) -> str:
         return hashlib.sha256(_json(spec.canonical()).encode("utf-8")).hexdigest()
 
+    @staticmethod
+    def _condition_wake_restore_allowed(intent: dict[str, Any] | None) -> bool:
+        if not isinstance(intent, dict) or not _valid_epoch(intent.get("wakeup_expires_at")):
+            return False
+        children_json = intent.get("children_json")
+        fingerprint = intent.get("tree_fingerprint")
+        has_saved_tree = (
+            isinstance(children_json, str)
+            and bool(children_json)
+            and isinstance(fingerprint, str)
+            and re.fullmatch(r"[0-9a-f]{64}", fingerprint) is not None
+        )
+        if intent.get("status") == "registering":
+            return has_saved_tree
+        return (
+            intent.get("status") == "registered"
+            and isinstance(intent.get("wakeup_id"), str)
+            and bool(intent["wakeup_id"])
+            and has_saved_tree
+        )
+
     def _persist_condition_wake_intent(
         self, state: WorkspaceState, registry: ConnectionRegistry, route: RegistryRoute,
         issue_id: str, spec: ConditionWakeSpec,
@@ -495,10 +516,7 @@ class WorkspaceRuntime:
         )
         if intent is None or intent["route_id"] != route.route_id:
             raise BridgeError("condition_wake_pending", "No matching condition-wake intent exists for this parent.")
-        allow_expired_restore = (
-            intent.get("status") == "registered" and isinstance(intent.get("wakeup_id"), str)
-            and bool(intent.get("wakeup_id"))
-        )
+        allow_expired_restore = self._condition_wake_restore_allowed(intent)
         try:
             saved_spec = ConditionWakeSpec.from_canonical(
                 json.loads(intent["config_json"]), allow_expired=allow_expired_restore,
@@ -522,6 +540,7 @@ class WorkspaceRuntime:
             "wakeup_id": "w" * 128, "route_id": notify_route_id,
             "bridge_route_id": route.route_id, "source_profile": self._profile(),
             "instruction": spec.instruction, "expires_at": 253_402_300_799.0,
+            "expected_stage_count": spec.expected_stage_count,
             "registered_child_ids": [row["id"] for row in children],
             "registered_tree_fingerprint": fingerprint,
         }
@@ -619,6 +638,7 @@ class WorkspaceRuntime:
             "bridge_route_id": route.route_id,
             "source_profile": self._profile(), "instruction": spec.instruction,
             "expires_at": current["wakeup_expires_at"],
+            "expected_stage_count": spec.expected_stage_count,
             "registered_child_ids": [row["id"] for row in registered_children],
             "registered_tree_fingerprint": registration_intent["tree_fingerprint"],
         }
@@ -1480,9 +1500,7 @@ class WorkspaceRuntime:
                 allow_expired_restore = (
                     condition_intent is not None
                     and condition_intent.get("route_id") == route.route_id
-                    and condition_intent.get("status") == "registered"
-                    and isinstance(condition_intent.get("wakeup_id"), str)
-                    and bool(condition_intent.get("wakeup_id"))
+                    and self._condition_wake_restore_allowed(condition_intent)
                 )
                 condition_spec = parse_condition_wake(
                     condition_request, allow_expired=allow_expired_restore,

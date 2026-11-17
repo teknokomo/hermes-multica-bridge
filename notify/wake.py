@@ -227,6 +227,19 @@ def build_payload(
         ),
         "wake_snapshot_insufficient",
     )
+    parent_issue_id = issue.get("parent_issue_id")
+    require(
+        "parent_issue_id" in issue
+        and (
+            parent_issue_id is None
+            or (
+                isinstance(parent_issue_id, str)
+                and bool(parent_issue_id)
+                and len(parent_issue_id) <= 128
+            )
+        ),
+        "notify_event_invalid",
+    )
     require(
         isinstance(issue_url, str)
         and issue_url.startswith("https://")
@@ -291,6 +304,8 @@ def build_payload(
         "wake_id": wake_id,
         "issue_id": issue["id"],
         "issue_key": issue["identifier"],
+        "parent_issue_id": parent_issue_id,
+        "is_root": parent_issue_id is None,
         "workspace_id": workspace_id,
         "project_id": issue["project_id"],
         "transition_seq": transition_seq,

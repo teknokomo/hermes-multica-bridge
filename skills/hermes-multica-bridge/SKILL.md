@@ -47,8 +47,8 @@ Use Runtime Router only when `multica_list_routes` shows `runtime_router.enabled
 ## Conditional completion and approval
 
 - Use `condition_wake` only when the user asks for a parent task to wait for its child work. It supports `children_done`; create the parent first, then register the wake through the normal Workspace update after the direct-child plan is present.
-- For a staged plan, supply both matching positive `stage` and `expected_stage_count`; for an unstaged plan, omit both. Never invent or repair stage values to make validation pass.
-- The stage count is capped at 500 to match the bounded child tree; every stage from 1 through N must exist.
+- For a staged plan, supply positive `stage` and `expected_stage_count`: the count is the number of distinct child stage groups, while `stage` is their maximum ordinal. The count cannot exceed the maximum; for an unstaged plan, omit both. Never invent or repair stage values to make validation pass.
+- Both values are capped at 500. Child ordinals must be positive and no greater than `stage`; the tree must contain exactly `expected_stage_count` distinct groups. Gaps between ordinals are allowed.
 - Native wake/run/comments are internal triggers, not user-facing progress messages. Notify alone sends the final approval-ready message after correlating the parent and wakeup, confirming the run status is `completed`, and verifying every saved child has status exactly `done`.
 - A closed or cancelled child is not complete. Do not claim approval readiness, close the parent, or approve the human review yourself.
 - If condition wake is disabled, notify readiness is missing, or target native-message suppression is unverified, stop and report the exact gate. Do not fall back to direct native delivery, Multica API, CLI, or SQL.

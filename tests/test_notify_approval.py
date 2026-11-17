@@ -155,14 +155,21 @@ def _mapping(ctx, mapping_id):
     return ctx.state.rows("SELECT * FROM approval_mappings WHERE mapping_id=?", (mapping_id,))[0]
 
 
-def _tree_fingerprint(child_ids=(CHILD_ID,)):
-    immutable = [{"id": child_id, "stage": None} for child_id in sorted(child_ids)]
+def _tree_fingerprint(child_ids=(CHILD_ID,), *, stages=None):
+    stage_by_id = stages or {}
+    immutable = [
+        {"id": child_id, "stage": stage_by_id.get(child_id)}
+        for child_id in sorted(child_ids)
+    ]
     return hashlib.sha256(
         json.dumps(immutable, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
 
 
-def _ipc_request(*, parent_id=PARENT_ID, wakeup_id=WAKEUP_ID, expiry=None, child_ids=(CHILD_ID,)):
+def _ipc_request(
+    *, parent_id=PARENT_ID, wakeup_id=WAKEUP_ID, expiry=None,
+    child_ids=(CHILD_ID,), expected_stage_count=None, stages=None,
+):
     ordered_ids = sorted(child_ids)
     return {
         "version": 1,
@@ -174,8 +181,9 @@ def _ipc_request(*, parent_id=PARENT_ID, wakeup_id=WAKEUP_ID, expiry=None, child
         "source_profile": "default",
         "instruction": "Review the completed stages.",
         "expires_at": time.time() + 60 if expiry is None else expiry,
+        "expected_stage_count": expected_stage_count,
         "registered_child_ids": ordered_ids,
-        "registered_tree_fingerprint": _tree_fingerprint(ordered_ids),
+        "registered_tree_fingerprint": _tree_fingerprint(ordered_ids, stages=stages),
     }
 
 
@@ -428,6 +436,7 @@ def test_approval_mapping_client_rejects_malformed_profile_and_expiry_before_con
         {"expires_at": None},
         {"expires_at": float("inf")},
         {"expires_at": 10**400},
+        {"expected_stage_count": True},
         {"version": True},
     ):
         with pytest.raises(BridgeError, match="invalid"):
@@ -450,12 +459,17 @@ def test_approval_mapping_client_encodes_unicode_within_utf8_frame():
 
 
 class _MappingReader:
-    def __init__(self, parent_id, wakeup_id, expiry, *, child_id=CHILD_ID, last_task_id=None):
+    def __init__(
+        self, parent_id, wakeup_id, expiry, *, child_id=CHILD_ID,
+        last_task_id=None, stage=None, children=None,
+    ):
         self.parent_id = parent_id
         self.wakeup_id = wakeup_id
         self.expiry = expiry
         self.child_id = child_id
         self.last_task_id = last_task_id
+        self.stage = stage
+        self.children = children
         self.calls = []
 
     def get_issue(self, issue_id):
@@ -477,7 +491,9 @@ class _MappingReader:
             "kind": "event",
             "mode": "once",
             "instruction": "Review the completed stages.",
-            "condition": {"type": "children_done"},
+            "condition": ({"type": "children_done"} if self.stage is None else {
+                "type": "children_done", "stage": self.stage,
+            }),
             "enabled": self.last_task_id is None,
             "last_task_id": self.last_task_id,
             "expires_at": datetime.fromtimestamp(self.expiry, UTC).isoformat(),
@@ -486,14 +502,17 @@ class _MappingReader:
 
     def list_issue_children(self, issue_id):
         self.calls.append(("children", issue_id))
-        return [{
-            "id": self.child_id,
-            "workspace_id": WID,
-            "project_id": PROJECT,
-            "parent_issue_id": self.parent_id,
-            "status": "todo",
-            "stage": None,
-        }]
+        child_rows = self.children or [{"id": self.child_id, "stage": None}]
+        return [
+            {
+                **row,
+                "workspace_id": WID,
+                "project_id": PROJECT,
+                "parent_issue_id": self.parent_id,
+                "status": "todo",
+            }
+            for row in child_rows
+        ]
 
 
 def test_approval_mapping_put_validates_route_and_is_idempotent(ctx):
@@ -520,6 +539,69 @@ def test_approval_mapping_put_validates_route_and_is_idempotent(ctx):
         "SELECT * FROM approval_mappings WHERE parent_issue_id=?", (parent_id,)
     )) == 1
     assert reader.calls.count(("issue", parent_id)) == 2
+
+
+def test_approval_mapping_accepts_distinct_stage_count_below_maximum_ordinal(ctx):
+    config, _mapping_id, _saved, _old_expiry = approval_context(ctx)
+    parent_id = "66666666-6666-4666-8666-666666666666"
+    wakeup_id = "77777777-7777-4777-8777-777777777777"
+    expiry = time.time() + 3600
+    children = [
+        {"id": "child-1", "stage": 1},
+        {"id": "child-2", "stage": 3},
+    ]
+    stages = {row["id"]: row["stage"] for row in children}
+    reader = _MappingReader(
+        parent_id, wakeup_id, expiry, stage=3, children=children,
+    )
+    server = ApprovalMappingServer(
+        config,
+        ctx.state,
+        api_factory=lambda *_args: SimpleNamespace(reader=reader),
+    )
+    request = _ipc_request(
+        parent_id=parent_id,
+        wakeup_id=wakeup_id,
+        expiry=expiry,
+        child_ids=tuple(row["id"] for row in children),
+        expected_stage_count=2,
+        stages=stages,
+    )
+
+    with (
+        patch("notify.approval_ipc.load_webhook_policy", return_value={}),
+        patch("notify.approval_ipc.verify_webhook_policy"),
+    ):
+        assert server._put(request) == "accepted"
+
+    stored = ctx.state.approval_mapping(CONNECTION_ID, WID, "default", parent_id)
+    assert json.loads(stored["child_ids_json"]) == children
+
+
+def test_approval_mapping_rejects_distinct_stage_count_above_maximum_ordinal(ctx):
+    config, _mapping_id, _saved, _old_expiry = approval_context(ctx)
+    parent_id = "66666666-6666-4666-8666-666666666666"
+    wakeup_id = "77777777-7777-4777-8777-777777777777"
+    expiry = time.time() + 3600
+    reader = _MappingReader(parent_id, wakeup_id, expiry, stage=3)
+    server = ApprovalMappingServer(
+        config,
+        ctx.state,
+        api_factory=lambda *_args: SimpleNamespace(reader=reader),
+    )
+    request = _ipc_request(
+        parent_id=parent_id,
+        wakeup_id=wakeup_id,
+        expiry=expiry,
+        expected_stage_count=4,
+    )
+
+    with (
+        patch("notify.approval_ipc.load_webhook_policy", return_value={}),
+        patch("notify.approval_ipc.verify_webhook_policy"),
+        pytest.raises(NotifyError, match="approval_mapping_invalid"),
+    ):
+        server._put(request)
 
 
 def test_approval_mapping_put_rejects_changed_child_tree(ctx):

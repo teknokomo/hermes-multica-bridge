@@ -112,6 +112,19 @@ def reconcile(
         ),
         "notify_event_invalid",
     )
+    parent_issue_id = issue.get("parent_issue_id")
+    require(
+        "parent_issue_id" in issue
+        and (
+            parent_issue_id is None
+            or (
+                isinstance(parent_issue_id, str)
+                and bool(parent_issue_id)
+                and len(parent_issue_id) <= 128
+            )
+        ),
+        "notify_event_invalid",
+    )
     require(
         issue["workspace_id"] == config.workspaces[workspace]["workspace_id"],
         "notify_event_invalid",
@@ -364,9 +377,6 @@ def reconcile(
                     continue
                 completion_filter = route.get("completion_filter", "any")
                 if completion_filter == "root_only":
-                    if "parent_issue_id" not in issue:
-                        state._wake_metric(db, "wake_filter_context_missing")
-                        continue
                     if issue.get("parent_issue_id") not in (None, ""):
                         state._wake_metric(db, "wake_filtered_child")
                         continue
